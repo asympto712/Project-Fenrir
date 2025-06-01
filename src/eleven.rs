@@ -1,4 +1,5 @@
 use core::num;
+use rand::prelude::*;
 use std::{fmt::{format, Display}, ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not}};
 use crate::Direction;
 
@@ -8,6 +9,8 @@ use bitflags::{bitflags, bitflags_match};
 pub const BOARDELEVENPART1: usize = 48;
 pub const BOARDELEVENPART2: usize = 96;
 pub const BOARDELEVENPART3: usize = 132;
+
+// These denote the number of bits that blocks occupy INCLUDING the padding
 pub const BLOCKLEN: [u8;3] = [BLOCK1LEN, BLOCK2LEN, BLOCK3LEN];
 pub const BLOCK1LEN: u8 = 48;
 pub const BLOCK2LEN: u8 = 48;
@@ -22,6 +25,8 @@ pub const PRESETX_EMPTY: [u64;3] = [0x000000000000, 0x000000000000, 0x000000000]
 pub const PRESETX_BACKGROUND: [u64;3] = [0x7ff7ff7ff7ff, 0x7ff7ff7ff7ff, 0x7ff7ff7ff];
 
 pub const BLACKMASK: BoardEleven = BoardEleven{par1: 0x7ff7ff7ff7ff, par2: 0x7ff7ff7ff7ff, par3: 0x7ff7ff7ff};
+pub const ONLY_PAD: BoardEleven = BoardEleven{par1: 0xffff_800_800_800_800, par2: 0xffff_800_800_800_800, par3: 0xfffffff_800_800_800};
+pub const ONLY_EDGES: BoardEleven = BoardEleven{par1: 0x401_401_401_7ff, par2: 0x401_401_401_401, par3: 0x7ff_401_401};
 
 pub const fn num_to_alphabet(n: u8) -> char{
     match n{
@@ -57,11 +62,13 @@ pub struct BoardEleven {
 //     All(usize),
 // }
 
+// The least significant 2 digits encodes the index of board partition. The remaining 6 digits (2^6 = 64) encodes the position 
+// on the specified partition.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ElevenBoardPositionalEncoding(u8);
+pub struct ElevenBoardPositionalEncoding(pub u8);
 
 impl ElevenBoardPositionalEncoding{
-    fn new(x: u8,y: u8) -> Self{
+    pub fn new(x: u8,y: u8) -> Self{
         let block: u8 = match y{
             0..4 => 0,
             4..8 => 1,
@@ -143,32 +150,46 @@ impl TryFrom<String> for ElevenBoardPositionalEncoding{
         Self::try_from(&chars[..])
     }
 }
+
+impl std::fmt::Display for ElevenBoardPositionalEncoding{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let block = self.0 & 0b11 ;
+        let position = self.0 >> 2;
+        let (x,y): (u8,u8) = if block < 3{
+            (position % 12, position / 12 + 4 * block)
+        } else { panic!("invalid block index encountered")};
+        write!(f, "{}{}", num_to_alphabet(x), y+1)?;
+        Ok(())
+    }
+}
 // represent a piece move by its starting point and the end point. First two bits specifies which partition the position is in, and the latter
 // 6 bits (2^6 = 64) specifies the location of the target bit
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoveOnBoardEleven {
-    start: ElevenBoardPositionalEncoding, 
-    dst: ElevenBoardPositionalEncoding,
+    pub start: ElevenBoardPositionalEncoding, 
+    pub dst: ElevenBoardPositionalEncoding,
 }
 
 impl Display for MoveOnBoardEleven{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fn position_to_str(u:u8) -> Result<String, String>{
-            let block: u8 = u & 3;
-            let offset: u8 = match block{
-                0 => 0,
-                1 => BOARDELEVENPART1 as u8,
-                2 => BOARDELEVENPART2 as u8,
-                _ => { return Err("error occured.".to_owned())}
-            };
-            let address: u8 = (u >> 2) + offset; //Don't forget the parenthesis!!
-            let coordinate: (u8,u8) = (address % 12, address / 12);
-            let s = format(format_args!("{}{}", num_to_alphabet(coordinate.0), 11 - coordinate.1));
-            Ok(s)
-        }
-        let s1 = position_to_str(self.start.0).map_err(|_| std::fmt::Error)?;
-        let s2 = position_to_str(self.dst.0).map_err(|_| std::fmt::Error)?;
-        write!(f, "{}{}", s1,s2)?;
+        // fn position_to_str(u:u8) -> Result<String, String>{
+        //     let block: u8 = u & 3;
+        //     let offset: u8 = match block{
+        //         0 => 0,
+        //         1 => BOARDELEVENPART1 as u8,
+        //         2 => BOARDELEVENPART2 as u8,
+        //         _ => { return Err("error occured.".to_owned())}
+        //     };
+        //     let address: u8 = (u >> 2) + offset; //Don't forget the parenthesis!!
+        //     let coordinate: (u8,u8) = (address % 12, address / 12);
+        //     let s = format(format_args!("{}{}", num_to_alphabet(coordinate.0), 11 - coordinate.1));
+        //     Ok(s)
+        // }
+        // let s1 = position_to_str(self.start.0).map_err(|_| std::fmt::Error)?;
+        // let s2 = position_to_str(self.dst.0).map_err(|_| std::fmt::Error)?;
+        // write!(f, "{}{}", s1,s2)?;
+        // Ok(())
+        write!(f, "{}{}", self.start, self.dst)?;
         Ok(())
     }
 }
@@ -207,6 +228,17 @@ impl TryFrom<String> for MoveOnBoardEleven{
 impl BoardEleven {
     pub fn new() -> Self {
         Self { par1: 0, par2: 0, par3: 0 }
+    }
+
+    pub fn random<T>(rng: &mut T) -> Self 
+    where T: Rng
+    {
+        let tmp = Self{
+            par1: rng.random::<u64>(),
+            par2: rng.random::<u64>(),
+            par3: rng.random::<u64>(),
+        };
+        tmp.reset_padding()
     }
 }
 
@@ -396,7 +428,8 @@ impl TryFrom<String> for BoardEleven{
     }
 }
 
-// This operation will flip all the bits ON THE BOARD. extra paddings are all reset to 0 (as they should be at all times)
+// This operation will flip all the bits, including the paddings. Only use this when you are sure that you don't want padding-reset.
+// For flipping bits on the board only, use self.complement() instead. 
 impl Not for BoardEleven{
     type Output = Self;
     fn not(self) -> Self::Output {
@@ -405,8 +438,9 @@ impl Not for BoardEleven{
             par2: !self.par2,
             par3: !self.par3,
         };
-        let mask: BoardEleven = BoardEleven::mask_board();
-        c & mask
+        // let mask: BoardEleven = BoardEleven::mask_board();
+        // c & mask
+        c
     }
 }
 impl BoardEleven{
@@ -414,10 +448,15 @@ impl BoardEleven{
     pub const fn mask_board() -> Self{
         BLACKMASK  
     }
+    // This generates the empty board with all the padding bits set to 1.
+    pub const fn only_pad() -> Self{
+        ONLY_PAD
+    }
     #[inline]
     pub fn reset_padding(&self) -> Self{
-        let mask = BoardEleven::mask_board();
-        *self & mask
+        // let mask = BoardEleven::mask_board();
+        // *self & mask
+        *self & BLACKMASK
     }
     
     #[inline]
@@ -427,6 +466,8 @@ impl BoardEleven{
         else {false}
     }
 
+    // flip the bits on the board, but keep the paddings to zero. Make sure to only use this to boards whose padding are reset.
+    // Otherwise it might cause unexpected behavior. When in doubt, .reset_padding()
     #[inline]
     pub fn complement(&self) -> Self{
         *self ^ BoardEleven::mask_board()
@@ -593,6 +634,49 @@ impl Shift for BoardEleven{
 
 impl BoardEleven{
 
+    #[inline]
+    fn shift_e_without_padding_reset(&self) -> Self {
+        Self { par1: self.par1 << 1, par2: self.par2 << 1, par3: self.par3 << 1}
+    }
+
+    #[inline]
+    fn shift_w_without_padding_reset(&self) -> Self {
+        Self { par1: self.par1 >> 1, par2: self.par2 >> 1, par3: self.par3 >> 1 }
+    }
+
+    #[inline] 
+    pub fn shift_e_with_step(&self, step: u8) -> Self {
+        let mut tmp = self.clone();
+        for _ in 0..step{
+            tmp = tmp.shift_e();
+        }
+        tmp
+    }
+    #[inline] 
+    pub fn shift_w_with_step(&self, step: u8) -> Self {
+        let mut tmp = self.clone();
+        for _ in 0..step{
+            tmp = tmp.shift_w();
+        }
+        tmp
+    }
+    #[inline] 
+    pub fn shift_n_with_step(&self, step: u8) -> Self {
+        let mut tmp = self.clone();
+        for _ in 0..step{
+            tmp = tmp.shift_n();
+        }
+        tmp
+    }
+    #[inline] 
+    pub fn shift_s_with_step(&self, step: u8) -> Self {
+        let mut tmp = self.clone();
+        for _ in 0..step{
+            tmp = tmp.shift_s();
+        }
+        tmp
+    }
+
     pub fn get_ones(&self) -> [Vec<u8>;3] {
         let mut result: [Vec<u8>;3] = [Vec::with_capacity(64), Vec::with_capacity(64), Vec::with_capacity(64)];
         
@@ -609,6 +693,155 @@ impl BoardEleven{
         result
     }
 
+    pub fn locate_ones(&self) -> Vec<ElevenBoardPositionalEncoding> {
+        let mut value: Vec<ElevenBoardPositionalEncoding> = Vec::new();
+        fn traverse_and_keep_ones(
+        value: &mut Vec<ElevenBoardPositionalEncoding>,
+        target: &u64,
+        len: u8,
+        skip_every: u8,
+        block: u8){
+            
+            for i in 0..len{
+                let tmp = target >> i;
+                if (i + 1) % skip_every == 0{ continue }
+                if tmp & 1 == 1 {
+                    let position: u8 = block + (i << 2);
+                    value.push(ElevenBoardPositionalEncoding(position));
+                }
+            }
+        }
+        traverse_and_keep_ones(&mut value, &self.par1, BLOCK1LEN, 12, 0);
+        traverse_and_keep_ones(&mut value, &self.par2, BLOCK2LEN, 12, 1);
+        traverse_and_keep_ones(&mut value, &self.par3, BLOCK3LEN, 12, 2);
+        value
+    }
+
+    pub fn neighber_of(location: &ElevenBoardPositionalEncoding) -> Self{
+        let address = location.0 >> 2;
+        let tmp = match location.0 & 3{
+            0 => {
+                Self {par1: 1 << address, par2: 0, par3: 0}
+            },
+            1 => { 
+                Self {par1: 0, par2: 1 << address, par3: 0} 
+            },
+            2 => {
+                Self {par1: 0, par2: 0, par3: 1 << address}
+            },
+            _ => panic!("Invalid positional encoding")
+        };
+        tmp | tmp.shift_e() | tmp.shift_w() | tmp.shift_s() | tmp.shift_n()
+    }
+
+    pub fn list_moves_east(&self, mask: &Self, barricade: &Self, movelen_lim: u8) -> Vec<MoveOnBoardEleven>{
+
+        let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
+
+        let mut tmp = self.clone();
+        for step in 1..=movelen_lim{
+            // If a path starting from a certain position is blocked at some point, there is no going further.
+            // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
+            let blocked = tmp.shift_e() & *barricade;
+            let masked = blocked & *mask;
+            if masked.is_nonzero(){
+
+                let dst_positions = masked.locate_ones();
+                let start_positions = masked.shift_w_with_step(step).locate_ones();
+                assert_eq!(dst_positions.len(), start_positions.len());
+                for (start, dst) in start_positions.into_iter().zip(dst_positions){
+                    move_list.push(MoveOnBoardEleven{
+                        start, dst
+                    })
+                }
+            }
+            tmp = blocked;
+        }
+        move_list
+
+    }
+
+    pub fn list_moves_west(&self, mask: &Self, barricade: &Self, movelen_lim: u8) -> Vec<MoveOnBoardEleven>{
+
+        let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
+
+        let mut tmp = self.clone();
+        for step in 1..=movelen_lim{
+            // If a path starting from a certain position is blocked at some point, there is no going further.
+            // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
+            let blocked = tmp.shift_w() & *barricade;
+            let masked = blocked & *mask;
+            if masked.is_nonzero(){
+
+                let dst_positions = masked.locate_ones();
+                let start_positions = masked.shift_e_with_step(step).locate_ones();
+                assert_eq!(dst_positions.len(), start_positions.len());
+                for (start, dst) in start_positions.into_iter().zip(dst_positions){
+                    move_list.push(MoveOnBoardEleven{
+                        start, dst
+                    })
+                }
+            }
+            tmp = blocked;
+        }
+        move_list
+
+    }
+    pub fn list_moves_south(&self, mask: &Self, barricade: &Self, movelen_lim: u8) -> Vec<MoveOnBoardEleven>{
+
+        let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
+
+        let mut tmp = self.clone();
+        for step in 1..=movelen_lim{
+            // If a path starting from a certain position is blocked at some point, there is no going further.
+            // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
+            let blocked = tmp.shift_s() & *barricade;
+            let masked = blocked & *mask;
+            if masked.is_nonzero(){
+
+                let dst_positions = masked.locate_ones();
+                let start_positions = masked.shift_n_with_step(step).locate_ones();
+                assert_eq!(dst_positions.len(), start_positions.len());
+                for (start, dst) in start_positions.into_iter().zip(dst_positions){
+                    move_list.push(MoveOnBoardEleven{
+                        start, dst
+                    })
+                }
+            }
+            tmp = blocked;
+        }
+        move_list
+
+    }
+    pub fn list_moves_north(&self, mask: &Self, barricade: &Self, movelen_lim: u8) -> Vec<MoveOnBoardEleven>{
+
+        let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
+
+        let mut tmp = self.clone();
+        for step in 1..=movelen_lim{
+            // If a path starting from a certain position is blocked at some point, there is no going further.
+            // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
+            let blocked = tmp.shift_n() & *barricade;
+            let masked = blocked & *mask;
+            if masked.is_nonzero(){
+
+                let dst_positions = masked.locate_ones();
+                let start_positions = masked.shift_s_with_step(step).locate_ones();
+                assert_eq!(dst_positions.len(), start_positions.len());
+                for (start, dst) in start_positions.into_iter().zip(dst_positions){
+                    move_list.push(MoveOnBoardEleven{
+                        start, dst
+                    })
+                }
+            }
+            tmp = blocked;
+        }
+        move_list
+
+    }
+
+
+    // Older implementation of a function that lists legal moves. "list_moves_{direction}" is more recommended.
     pub fn generate_action(&self, mask: &Self) -> Vec<MoveOnBoardEleven>{
 
         #[inline]
@@ -728,7 +961,62 @@ impl BoardEleven{
         moves
     }
 
-    fn flip_target_bit(&mut self, position: ElevenBoardPositionalEncoding){
+    #[inline]
+    pub fn flip_target_bit(&self, position: &ElevenBoardPositionalEncoding) -> Self{
+        let block = position.0 & 3;
+        let address = position.0 >> 2;
+        match block {
+            0 => {
+                Self {par1: self.par1 ^ (1 << address), par2: self.par2, par3: self.par3 }
+            },
+            1 => {
+                Self {par1: self.par1, par2: self.par2 ^ (1 << address), par3: self.par3 }
+            },
+            2 => {
+                Self {par1: self.par1, par2: self.par2, par3: self.par3 ^ (1 << address) }
+            },
+            _ => panic!("specified position encode is invalid. Non-existent block was specified!")
+        }
+    }
+
+    #[inline]
+    pub fn force_move(&self, movement: &MoveOnBoardEleven) -> Self {
+        let blocks = (movement.start.0 & 3, movement.dst.0 & 3);
+        let addresses = (movement.start.0 >> 2, movement.dst.0 >> 2);
+        match blocks{
+            (0,0) => {
+                Self {par1: self.par1 ^ (1 << addresses.0 + 1 << addresses.1), par2: self.par2, par3: self.par3}
+            },
+            (0,1) => {
+                Self {par1: self.par1 ^ (1 << addresses.0), par2: self.par2 ^ (1 << addresses.1), par3: self.par3}
+            },
+            (0,2) => {
+                Self {par1: self.par1 ^ (1 << addresses.0), par2: self.par2, par3: self.par3 ^ (1 << addresses.1)}
+            },
+            (1,0) => {
+                Self {par1: self.par1 ^ (1 << addresses.1), par2: self.par2 ^ (1 << addresses.0), par3: self.par3}
+            },
+            (1,1) => {
+                Self {par1: self.par1, par2: self.par2 ^ (1 << addresses.0 + 1 << addresses.1), par3: self.par3}
+            },
+            (1,2) => {
+                Self {par1: self.par1, par2: self.par2 ^ (1 << addresses.0), par3: self.par3 ^ (1 << addresses.1)}
+            },
+            (2,0) => {
+                Self {par1: self.par1 ^ (1 << addresses.1), par2: self.par2, par3: self.par3 ^ (1 << addresses.0)}
+            },
+            (2,1) => {
+                Self {par1: self.par1, par2: self.par2 ^ (1 << addresses.1) , par3: self.par3 ^ (1 << addresses.0)}
+            },
+            (2,2) => {
+                Self {par1: self.par1, par2: self.par2, par3: self.par3 ^ (1 << addresses.0 + 1 << addresses.1)}
+            },
+            _ => { panic!("specified position encode is invalid. Non-existent block was specified!")}
+        }
+
+    }
+
+    pub fn flip_target_bit_mut(&mut self, position: &ElevenBoardPositionalEncoding){
         match position.0 & 3{
             0 => self.par1 ^= 1 << (position.0 >> 2),
             1 => self.par2 ^= 1 << (position.0 >> 2),
@@ -736,11 +1024,58 @@ impl BoardEleven{
             _ => {} 
         }
     }
-    fn force_move(&mut self, movement: MoveOnBoardEleven){
-        self.flip_target_bit(movement.start);
-        self.flip_target_bit(movement.dst);
+    pub fn force_move_mut(&mut self, movement: &MoveOnBoardEleven){
+        self.flip_target_bit_mut(&movement.start);
+        self.flip_target_bit_mut(&movement.dst);
+    }
+
+    pub fn list_horizontal_pincer(&self, barricade: &Self) -> Vec<ElevenBoardPositionalEncoding> {
+        // Make sure the barricade is padding-reset
+        let shifted_e = self.shift_e() & *barricade;
+        let surviver_e = shifted_e.shift_w();
+        let shifted_w = self.shift_w() & *barricade;
+        let surviver_w = shifted_w.shift_e();
+        (surviver_e & surviver_w).locate_ones()
+
+    }
+
+    pub fn list_vertical_pincer(&self, barricade: &Self) -> Vec<ElevenBoardPositionalEncoding> {
+
+        // let block3_offset: u64 = self.par3 & 0b111_111_111_11 << (2 * 12);
+        let shifted_s = self.shift_s() & *barricade;
+        let surviver_s = shifted_s.shift_n();
+        // surviver_s.par3 |= block3_offset;
+
+        // let block1_offset: u64 = self.par1 & 0b111_111_111_11;
+        let shifted_n = self.shift_n() & *barricade;
+        let surviver_n = shifted_n.shift_s();
+        // surviver_n.par1 |= block1_offset;
+
+        (surviver_n & surviver_s).locate_ones()
+    }
+
+    pub fn list_besieged(&self, barricade: &Self) -> Vec<ElevenBoardPositionalEncoding> {
+        // let mask = barricade.reset_padding().not();
+
+        // let block3_offset: u64 = self.par3 & 0b111_111_111_11 << (2 * 12);
+        let shifted_s = self.shift_s() & *barricade;
+        let surviver_s = shifted_s.shift_n();
+        // surviver_s.par3 |= block3_offset;
+
+        // let block1_offset: u64 = self.par1 & 0b111_111_111_11;
+        let shifted_n = self.shift_n() & *barricade;
+        let surviver_n = shifted_n.shift_s();
+        // surviver_n.par1 |= block1_offset;
+
+        let shifted_e = self.shift_e() & *barricade;
+        let surviver_e = shifted_e.shift_w();
+        let shifted_w = self.shift_w() & *barricade;
+        let surviver_w = shifted_w.shift_e();
+
+        (surviver_s & surviver_n & surviver_w & surviver_e).locate_ones()
     }
 }
+
 
 
 // fn main() {
@@ -857,6 +1192,62 @@ fn move_piece_works() {
     let mut b: BoardEleven = BoardEleven::try_from(PRESET1.to_string()).unwrap();
     println!("{}", b);
     let movement = MoveOnBoardEleven::try_from("F6F9".to_string()).unwrap();
-    b.force_move(movement);
+    b.force_move_mut(&movement);
     println!("{}", b);
+}
+
+#[test] 
+fn locate_ones_works(){
+    let b = BoardEleven::try_from(PRESETX1).unwrap();
+    let ones = b.locate_ones();
+    println!("{}", b);
+    print!("raw positional encoding: ");
+    for position in ones.iter(){
+        print!("{} ", position.0);
+    }
+    println!();
+    print!("In a1 coordinate system: ");
+    for position in ones.iter(){
+        print!("{} ", position);
+    }
+
+    let mask = BoardEleven::mask_board();
+    assert_eq!(mask.locate_ones().len(), 121);
+
+    let empty = BoardEleven::try_from(PRESETX_EMPTY).unwrap();
+    assert_eq!(empty.locate_ones().len(), 0);
+
+}
+
+#[test] 
+fn list_moves_works(){
+    let b = BoardEleven::try_from(PRESETX1).unwrap();
+    println!("{}", b);
+    let moves = b.list_moves_east(&BLACKMASK, &b.complement(), 10);
+    assert_eq!(moves.len(), 20);
+    print!("Moves to the east: ");
+    for m in moves{
+        print!("{} ", m);
+    }
+    println!();
+    let moves = b.list_moves_west(&BLACKMASK, &b.complement(), 10);
+    assert_eq!(moves.len(), 21);
+    print!("Moves to the west: ");
+    for m in moves{
+        print!("{} ", m);
+    }
+    println!();
+    let moves = b.list_moves_south(&BLACKMASK, &b.complement(), 10);
+    assert_eq!(moves.len(), 28);
+    print!("Moves to the south: ");
+    for m in moves{
+        print!("{} ", m);
+    }
+    println!();
+    let moves = b.list_moves_north(&BLACKMASK, &b.complement(), 10);
+    assert_eq!(moves.len(), 33);
+    print!("Moves to the north: ");
+    for m in moves{
+        print!("{} ", m);
+    }
 }
