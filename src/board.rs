@@ -10,10 +10,10 @@ pub const ELEVENBOARDPRESET_STD_KING: [u64;3] = [0x000_000_000_000, 0x000_000_02
 pub const ELEVENBOARDPRESET_STD_HOS: [u64;3] = [0x000_000_000_401, 0x000_000_020_000, 0x401_000_000];
 
 pub struct TaflBoardEleven{
-    bit_att: BoardEleven,
-    bit_def: BoardEleven,
-    bit_king: BoardEleven,
-    hostile: BoardEleven
+    pub bit_att: BoardEleven,
+    pub bit_def: BoardEleven,
+    pub bit_king: BoardEleven,
+    pub hostile: BoardEleven
 }
 
 impl TaflBoardEleven{
