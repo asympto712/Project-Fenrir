@@ -4,6 +4,8 @@ use std::{fmt::Display};
 use bitboard::eleven::{self, BoardEleven, ElevenBoardPositionalEncoding, MoveOnBoardEleven, Shift, PRESETX1, BLACKMASK, ONLY_EDGES};
 use bitflags::{bitflags, bitflags_match};
 
+use crate::game::{PieceType, Side, InvalidActionError};
+
 pub const ELEVENBOARDPRESET_STD_ATT: [u64;3] = [0x401_000_020_0F8, 0x401_401_603_401, 0x0F8_020_000];
 pub const ELEVENBOARDPRESET_STD_DEF: [u64;3] = [0x020_000_000_000, 0x020_070_0D8_070, 0x000_000_000];
 pub const ELEVENBOARDPRESET_STD_KING: [u64;3] = [0x000_000_000_000, 0x000_000_020_000, 0x000_000_000];
@@ -288,8 +290,27 @@ impl TaflBoardEleven{
         true
     }
 
+    pub fn determine_action_piecetype(&self, side: Side, action: &MoveOnBoardEleven) -> Result<PieceType, InvalidActionError> {
+        match side{
+            Side::Att => {
+                if !self.bit_att.tile_is_empty_at(&action.start) {
+                    Ok(PieceType::AttSoldier)
+                } else { Err(InvalidActionError::NO_PIECE_AT_STARTINGPOS) }
+            },
+            Side::Def => {
+                let def_has_piece_there: bool = !self.bit_def.tile_is_empty_at(&action.start);
+                let king_has_piece_there: bool = !self.bit_king.tile_is_empty_at(&action.start);
+                if def_has_piece_there && !king_has_piece_there { Ok(PieceType::DefSoldier) }
+                else if !def_has_piece_there && king_has_piece_there { Ok(PieceType::King) }
+                else if !def_has_piece_there && !king_has_piece_there { Err(InvalidActionError::NO_PIECE_AT_STARTINGPOS) }
+                else { panic!("Defender soldiers and king has an overlap!")}
+            }
+        }
+    }
+
     // returns the defender pieces that are captured by the movement from the attacker pieces.
     // To actually update the board, simply take the XOR of the output with self.bit_def 
+    // NOTE!: Call this function on the board BEFORE the action is applied to
     pub fn def_capture(&self, action: &MoveOnBoardEleven) -> BoardEleven{
         let dst_neighbor = BoardEleven::neighbor_of(&action.dst);
         let restricted_def = self.bit_def & dst_neighbor;
@@ -305,6 +326,7 @@ impl TaflBoardEleven{
     }
     // returns the attacker pieces that are captured by the movement from the defender pieces.
     // To actually update the board, simply take the XOR of the output with self.bit_att 
+    // NOTE!: Call this function on the board BEFORE the action is applied to
     pub fn att_capture(&self, action: &MoveOnBoardEleven) -> BoardEleven{
         let dst_neighbor = BoardEleven::neighbor_of(&action.dst);
         let restricted_att = self.bit_att & dst_neighbor;
@@ -320,6 +342,7 @@ impl TaflBoardEleven{
     }
     // returns the king pieces that are captured by the movement from the attacker pieces.
     // To actually update the board, simply take the XOR of the output with self.bit_king 
+    // NOTE!: Call this function on the board BEFORE the action is applied to
     pub fn king_capture(&self, action: &MoveOnBoardEleven) -> BoardEleven{
         let dst_neighbor = BoardEleven::neighbor_of(&action.dst);
         let restricted_king = self.bit_king & dst_neighbor;

@@ -1,13 +1,16 @@
 use std::fmt::Display;
+use std::io::ErrorKind;
 
 use crate::board::*;
+use crate::board::TaflBoardEleven;
 use bitboard::eleven::*;
 use bitboard::Direction;
 
 use bitflags::{bitflags, bitflags_match, Flag, Flags};
 use arraydeque::{ArrayDeque, Wrapping};
 
-pub enum Side { Att, Def}
+#[derive(Debug, Copy, Clone)]
+pub enum Side { Att, Def }
 
 impl Display for Side {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -17,6 +20,8 @@ impl Display for Side {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy)]
 pub enum PieceType { AttSoldier, DefSoldier, King}
 
 impl PieceType{
@@ -28,10 +33,36 @@ impl PieceType{
         }
     }
 }
+
+#[derive(Debug)]
+pub enum ReasonForTermination {
+    KingCaptured,
+    KingEscaped,
+    NoAttSoldier,
+    DefEncircled,
+    ViolatedRepetition(Side),
+    NoMoveLeft(Side),
+    NoLegalMoveLeft(Side),
+}
+
+impl Display for ReasonForTermination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefEncircled => write!(f, "Defenders are encircled!"),
+            Self::KingCaptured => write!(f, "King was captured"),
+            Self::KingEscaped => write!(f, "King has escaped"),
+            Self::NoAttSoldier => write!(f, "Attackers are annihilated"),
+            Self::ViolatedRepetition(side) => write!(f, "{} violated the repetition rule", side),
+            Self::NoMoveLeft(side) => write!(f, "{} has no move left", side),
+            Self::NoLegalMoveLeft(side) => write!(f, "{} has no legal move left", side),
+        }
+    }
+}
 // 1st bit is 1 if (current player = attacker), 0 else
 // 2nd bit is 1 if (game is over on THIS turn) 
 // <- the last player made a winning move 
 // - this includes such a move that the opponent would have no move, or only the 3rd repetition)
+// UPDATE: 2nd bit is 1 if the game is over, regardless of when that happened.
 // 3rd ~ 8th bits: so far no use
 // 9~16th bits: turn counter (maybe useful at some point)
 #[derive(Clone, Copy, Debug)]
@@ -69,16 +100,16 @@ impl GameState {
     //     self.0 &= 0b1111_1100;
     // }
     pub fn change_side_mut(&mut self) {
-        self.0 ^= Self::TURN_ATT.bits();
+        self.toggle(Self::TURN_ATT);
     }
     pub fn change_side(&self) -> Self{
         Self(self.0 ^ Self::TURN_ATT.bits())
     }
     pub fn game_over_mut(&mut self) {
-        self.0 ^= Self::TERMINATED.bits();
+        self.insert(Self::TERMINATED);
     }
     pub fn game_over(&self) -> Self {
-        Self(self.0 ^ Self::TERMINATED.bits())
+        Self(self.0 | Self::TERMINATED.bits())
     }
     pub fn get_turn_count(&self) -> u8 {
         let count = self.bits() >> 8;
@@ -91,6 +122,19 @@ impl GameState {
     }
     pub fn incre_turn_count(&self) -> Self {
         Self(self.0 + 1 << 8)
+    }
+    pub fn get_victor(&self) -> Side {
+        if self.contains(Self::ATTACKER_VICTORY) {
+            Side::Att
+        } else {
+            Side::Def
+        }
+    }
+    pub fn set_victor(&mut self, side: Side) {
+        match side {
+            Side::Att => self.insert(Self::ATTACKER_VICTORY),
+            Side::Def => self.remove(Self::ATTACKER_VICTORY),
+        }
     }
 }
 
@@ -190,13 +234,26 @@ type RepetitionCounter = u8;
 pub struct ShortHistory (ArrayDeque<TaflBoardEleven, 4, Wrapping> );
 
 impl ShortHistory{
-    pub fn push_back(&mut self, board: TaflBoardEleven) 
+    pub fn push_front(&mut self, board: TaflBoardEleven) 
+    {
+        self.0.push_front(board);
+    }
+    pub fn push_back(&mut self, board: TaflBoardEleven)
     {
         self.0.push_back(board);
     }
+    pub fn get_most_recent(&self) -> Option<&TaflBoardEleven> {
+        self.0.get(0)
+    }
+    pub fn get_oldest(&self) -> Option<&TaflBoardEleven> {
+        self.0.get(3)
+    }
+    pub fn get_second_oldest(&self) -> Option<&TaflBoardEleven> {
+        self.0.get(2)
+    }
     pub fn check_repetition(&self, new_board: &TaflBoardEleven) -> bool
     {
-        if let Some(b) = self.0.get(0)
+        if let Some(b) = self.get_oldest()
         {
             b.equals(new_board)
         }
@@ -234,7 +291,7 @@ impl Game{
 
     //NOTE:  Call this function BEFORE the board is changed
     pub fn update_short_history_mut(&mut self) {
-        self.short_history.push_back(self.board);
+        self.short_history.push_front(self.board);
     }
 
     // returns true if the new_board (board after action) is repetitive
@@ -268,6 +325,56 @@ impl Game{
         Self::from_board(board, Side::Att)
     }
 
+    // When the action would result in the repetition, returns true. If not, (even when the action is invalid), returns false.
+    pub fn move_would_result_in_repetition(&self, side: Side, piece_type: Option<PieceType>, action: &MoveOnBoardEleven) -> bool {
+
+        let piece_type = 
+        if let Some(p) = piece_type { p }
+        else { match self.board.determine_action_piecetype(side, &action) {
+            Ok(pt) => pt,
+            Err(_) => { return false; }
+        }
+        };
+
+        let resulting_board_prior = match piece_type {
+            PieceType::AttSoldier => self.board.att_force_move(action),
+            PieceType::DefSoldier => self.board.def_force_move(action),
+            PieceType::King => self.board.king_force_move(action),
+        };
+        // let resulting_board_prior = match side {
+        //     Side::Att => self.board.att_force_move(action),
+        //     Side::Def => {
+        //         match self.board.determine_action_piecetype(Side::Def, &action){
+        //             Ok(PieceType::DefSoldier) => self.board.def_force_move(action),
+        //             Ok(PieceType::King) => self.board.king_force_move(action),
+        //             _ => { return false; }
+        //         }
+        //     }
+        // };
+        
+        // First test is if the movement itself without subsequent captures would result in repetition.
+        // This is a very order-specific way of checking, if one wants more safety, consider instead calling short_history.contains(resulting_board_prior)
+        if let Some(reference_board) = self.short_history.get_second_oldest()
+        {
+            if resulting_board_prior.equals(reference_board) {
+                // Second test is if any capture would occur (if it does, then it cannot be a repetition)
+                match side {
+                    Side::Att => {
+                        if self.board.def_capture(action).is_nonzero() || self.board.king_capture(action).is_nonzero()
+                        || self.board.shield_wall_capture(action).is_nonzero()  
+                        { false } else { true }
+                    },
+                    Side::Def => {
+                        if self.board.att_capture(action).is_nonzero()  
+                        { false } else { true }
+                    }
+                }
+            } else { false }
+        } else {
+            false
+        }
+    }
+
     pub fn check_action_validity(&self, action: &MoveOnBoardEleven, piece_type: Option<PieceType>) -> Result<(), InvalidActionError>{
 
         let mut e = InvalidActionError::from_bits_retain(0);
@@ -286,24 +393,7 @@ impl Game{
         }
         else
         {
-            let p: PieceType = match playing_side{
-                Side::Att => PieceType::AttSoldier,
-                Side::Def => {
-                    let def_has_piece_there = !self.board.bit_def.tile_is_empty_at(&action.start);
-                    let king_has_piece_there = !self.board.bit_king.tile_is_empty_at(&action.start);
-                    if def_has_piece_there && !king_has_piece_there {PieceType::DefSoldier}
-                    else if king_has_piece_there && !def_has_piece_there {PieceType::King}
-                    else if !king_has_piece_there && !def_has_piece_there { 
-
-                        e.insert(InvalidActionError::PIECETYPE_CONTRADICTS_STATE);
-                        PieceType::DefSoldier // as a dummy value
-                    }
-                    else { 
-                        // This is an irrecoverable error, shutting the game down..
-                        panic!("Defender and King pieces have an overlap!")
-                    }
-                },
-            };
+            let p: PieceType = self.board.determine_action_piecetype(playing_side, &action)?;
 
             invalid_action_check_given_piece(&mut e, &self, &p, action, &opt);
         }
@@ -330,17 +420,24 @@ impl Game{
             }
 
             // Finally, check for the repetition
-            let resulting_board: TaflBoardEleven = match p {
-                PieceType::AttSoldier => game.board.att_force_move(action),
-                PieceType::DefSoldier => game.board.def_force_move(action),
-                PieceType::King       => game.board.king_force_move(action),
+            let side = match p {
+                PieceType::AttSoldier => Side::Att,
+                PieceType::DefSoldier | PieceType::King => Side::Def,
             };
-            if game.check_repetition(&resulting_board) {
-                let rep_count = game.repetition_counter >> 6;
-                if rep_count >= 2 {
-                    e.insert(InvalidActionError::THIRD_REPETITION);
-                }
+            if get_rep_counter_for_oldest(game.repetition_counter) == 2 && game.move_would_result_in_repetition(side, Some(*p), action) {
+                e.insert(InvalidActionError::THIRD_REPETITION);
             }
+            // let resulting_board: TaflBoardEleven = match p {
+            //     PieceType::AttSoldier => game.board.att_force_move(action),
+            //     PieceType::DefSoldier => game.board.def_force_move(action),
+            //     PieceType::King       => game.board.king_force_move(action),
+            // };
+            // if game.check_repetition(&resulting_board) {
+            //     let rep_count = game.repetition_counter >> 6;
+            //     if rep_count >= 2 {
+            //         e.insert(InvalidActionError::THIRD_REPETITION);
+            //     }
+            // }
 
         }
 
@@ -397,6 +494,100 @@ impl Game{
         if e.bits() == 0 { Ok(()) } else { Err(e) }
     }
 
+    pub fn do_action_wo_validity_check_mut(&mut self, action: &MoveOnBoardEleven, piece_type: Option<PieceType>) {
+
+        let side = self.state.show_side();
+
+        // Be careful not to call this elsewhere!!
+        self.short_history.push_front(self.board);
+
+        match side{
+            Side::Att => {
+
+                let def_capt = self.board.def_capture(action);
+                let king_capt = self.board.king_capture(action);
+                let shield_wall_capt = self.board.shield_wall_capture(action);
+
+                self.board.att_force_move_mut(action);
+                self.board.bit_def ^= def_capt | (shield_wall_capt & self.board.bit_def);
+                self.board.bit_king ^= king_capt | (shield_wall_capt & self.board.bit_king);
+
+                self.state.change_side_mut();
+                if king_capt.is_nonzero(){
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Att);
+                }
+                if self.board.def_is_encircled() {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Att);
+                }
+                self.state.incre_turn_count_mut();
+
+                let new_repetition_counter = self.short_history.update_repetition_counter(&self.board, self.repetition_counter);                
+                self.repetition_counter = new_repetition_counter;
+
+            },
+            Side::Def => {
+
+                let att_capt = self.board.att_capture(action);
+
+                // If the user specified which piece to move (defender soldier or king), we trust that information
+                if let Some(p) = piece_type 
+                {
+                    match p 
+                    {
+                        PieceType::DefSoldier => self.board.def_force_move_mut(action),
+                        PieceType::King => self.board.king_force_move_mut(action),
+                        PieceType::AttSoldier => {}
+                    };
+                } else 
+                {
+                    let def_has_piece_there = !self.board.bit_def.tile_is_empty_at(&action.start);
+                    let king_has_piece_there = !self.board.bit_king.tile_is_empty_at(&action.start);
+
+                    if def_has_piece_there && !king_has_piece_there 
+                    {
+                        self.board.def_force_move_mut(action);
+                    }
+                    else if king_has_piece_there && !def_has_piece_there
+                    {
+                        self.board.king_force_move_mut(action);
+                    }
+                    else if !def_has_piece_there && !king_has_piece_there
+                    {
+                        {}
+                    }
+                    else
+                    { 
+                        panic!("Defender soldiers and King had an overlap!"); 
+                    }
+
+                }
+                self.board.bit_att ^= att_capt;
+
+                // change state
+                self.state.change_side_mut();
+                if !self.board.bit_att.is_nonzero()
+                {
+                    self.state.game_over();
+                    self.state.set_victor(Side::Def);
+                }
+                if (self.board.bit_king & GOALS).is_nonzero()
+                {
+                    self.state.game_over();
+                    self.state.set_victor(Side::Def);
+                } 
+
+                self.state.incre_turn_count_mut();
+
+                let new_repetition_counter = self.short_history.update_repetition_counter(&self.board, self.repetition_counter);                
+                self.repetition_counter = new_repetition_counter;
+
+            },
+        }
+        
+    }
+
     // recommended to check the validity of the action before. It ALLOWS repetitive action
     pub fn do_action_wo_validity_check(&self, action: &MoveOnBoardEleven, piece_type: Option<PieceType>) -> Self{
 
@@ -409,7 +600,7 @@ impl Game{
 
 
         // Be careful not to call this elsewhere!!
-        new_short_history.push_back(self.board);
+        new_short_history.push_front(self.board);
 
         match side{
             Side::Att => {
@@ -490,6 +681,180 @@ impl Game{
         }
         
     }
+
+    pub fn forward_turn(&mut self) {
+        self.state.incre_turn_count();
+        self.state.change_side_mut();
+    } 
+
+    // This checks the victory condition for the specified side and update if necessary based on the current board. 
+    // It assumes that the specified side is the one who made the last move
+    pub fn update_victory(&mut self, side: Side, pass_next_moves: bool) -> (Option<ReasonForTermination>, Option<Vec<MoveOnBoardEleven>>) {
+        use ReasonForTermination::*;
+
+        let mut opt: Option<ReasonForTermination> = None;
+        match side {
+            Side::Att => {
+                if !self.board.bit_king.is_nonzero() {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Att);
+                    opt = Some(KingCaptured);
+                }
+                if self.board.def_is_encircled() {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Att);
+                    opt = Some(DefEncircled);
+                }
+                let mut def_possible_moves = self.board.generate_actions_for_defsoldiers();
+                let mut king_possible_moves = self.board.generate_actions_for_king();
+
+                if def_possible_moves.len() == 0 && king_possible_moves.len() == 0 {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Att);
+                    opt = Some(NoMoveLeft(Side::Def));
+
+                } else if get_rep_counter_for_oldest(self.repetition_counter) == 2 {
+
+                    let no_legal_move_for_defsol = def_possible_moves.iter().fold(true, |s, action| 
+                        s && self.move_would_result_in_repetition(Side::Def, None, action)
+                    );
+                    let no_legal_move_for_king = king_possible_moves.iter().fold(true, |s,action| 
+                        s && self.move_would_result_in_repetition(Side::Def, None, action)
+                    );
+                    if no_legal_move_for_defsol && no_legal_move_for_king {
+                        self.state.game_over_mut();
+                        self.state.set_victor(Side::Att);
+                        opt = Some(NoLegalMoveLeft(Side::Def));
+                    }
+                }
+                if pass_next_moves {
+                    def_possible_moves.append(&mut king_possible_moves);
+                    (opt, Some(def_possible_moves))
+                } else {
+                    (opt, None)
+                }
+            }
+            Side::Def => {
+                if !self.board.bit_att.is_nonzero() {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Def);
+                    opt = Some(NoAttSoldier);
+                }
+                let att_possible_moves = self.board.generate_actions_for_attsoldiers();
+                if att_possible_moves.len() == 0 {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Def);
+                    opt = Some(NoMoveLeft(Side::Att));
+                } else if get_rep_counter_for_oldest(self.repetition_counter) == 2 {
+                    let no_legal_move_for_att = att_possible_moves.iter().fold(true, |s, action|
+                        s && self.move_would_result_in_repetition(Side::Att, Some(PieceType::AttSoldier), action)
+                    );
+                    if no_legal_move_for_att {
+                        self.state.game_over_mut();
+                        self.state.set_victor(Side::Def);
+                        opt = Some(NoLegalMoveLeft(Side::Att));
+                    }
+                }
+                if (self.board.bit_king & GOALS).is_nonzero() {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Def);
+                    opt = Some(KingEscaped)
+                }
+                if pass_next_moves {
+                    (opt, Some(att_possible_moves))
+                } else {
+                    (opt, None)
+                }
+            }
+        }
+    }
+
+    // Check if the last move was illegal (currently only checks the repetition) and update the state
+    // Assumes 'side' is the one who made the last move
+    pub fn update_if_lost(&mut self, side: Side) -> Option<ReasonForTermination> {
+
+        use ReasonForTermination::*;
+        if get_rep_counter_for_cur(self.repetition_counter) == 3 {
+            match side {
+                Side::Att => {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Def);
+                    Some(ViolatedRepetition(Side::Att))
+                },
+                Side::Def => {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Side::Att);
+                    Some(ViolatedRepetition(Side::Def))
+                }
+            }
+        } else { None }
+    }
+
+    pub fn do_move_and_update_whole_mut(&mut self, action: &MoveOnBoardEleven, piecetype: Option<PieceType>, pass_next_moves: bool) 
+    -> Result<(Option<ReasonForTermination>, Option<Vec<MoveOnBoardEleven>>), InvalidActionError> {
+
+        let side = self.state.show_side();
+            
+        self.short_history.push_front(self.board);
+        let piecetype 
+            = if let Some(p) = piecetype { p } 
+            else { self.board.determine_action_piecetype(side, action)? };
+
+        match piecetype {
+            PieceType::AttSoldier => {
+
+                let def_capt = self.board.def_capture(action);
+                let king_capt = self.board.king_capture(action);
+                let shield_wall_capt = self.board.shield_wall_capture(action);
+
+                self.board.att_force_move_mut(action);
+                self.board.bit_def ^= def_capt | (shield_wall_capt & self.board.bit_def);
+                self.board.bit_king ^= king_capt | (shield_wall_capt & self.board.bit_king);
+
+            }
+            PieceType::DefSoldier => {
+
+                let att_capt = self.board.att_capture(action);
+
+                self.board.def_force_move_mut(action);
+                self.board.bit_att ^= att_capt;
+            }
+            PieceType::King => {
+
+                let att_capt = self.board.att_capture(action);
+
+                self.board.king_force_move_mut(action);
+                self.board.bit_att ^= att_capt;
+            }
+        }
+
+        let new_repetition_counter = self.short_history.update_repetition_counter(&self.board, self.repetition_counter);                
+        self.repetition_counter = new_repetition_counter;
+        
+        // Check for game termination
+        let value = if let Some(r) = self.update_if_lost(side) {
+            Ok((Some(r), None))
+        } else if let (Some(rr), v) = self.update_victory(side, pass_next_moves) {
+            Ok((Some(rr), v))
+        } else { Ok((None, None))
+        };
+
+        self.forward_turn();
+
+        value
+    }
+
+    pub fn check_and_do_and_update_whole_mut(&mut self, action: &MoveOnBoardEleven, piece_type: Option<PieceType>, pass_next_moves: bool)
+        -> Result<(Option<ReasonForTermination>, Option<Vec<MoveOnBoardEleven>>), InvalidActionError> {
+
+            let piece_type = 
+            if let Some(p) = piece_type { p } 
+            else { self.board.determine_action_piecetype(self.state.show_side(), action)? }; 
+
+            self.check_action_validity(action, Some(piece_type))?;
+
+            self.do_move_and_update_whole_mut(action, Some(piece_type), pass_next_moves)
+    }
 }
 
 pub fn parse_repetition_counter(rep_c: RepetitionCounter) -> [u8; 4]{
@@ -499,6 +864,14 @@ pub fn parse_repetition_counter(rep_c: RepetitionCounter) -> [u8; 4]{
         a[i] = c;
     }
     a
+}
+
+pub fn get_rep_counter_for_oldest(rep_c: RepetitionCounter) -> u8 {
+    rep_c >> 6 & 0b11
+}
+
+pub fn get_rep_counter_for_cur(rep_c: RepetitionCounter) -> u8 {
+    rep_c & 0b11
 }
 
 impl std::fmt::Display for Game {

@@ -2,7 +2,7 @@
 // my modules
 use bitboard::eleven::{MoveOnBoardEleven, ElevenBoardPositionalEncoding};
 use color_eyre::owo_colors::OwoColorize;
-use game::game::{Game, GameState, ShortHistory, Side};
+use game::game::{parse_repetition_counter, Game, GameState, ShortHistory, Side};
 use game::board::{self, TaflBoardEleven};
 
 // external modules
@@ -139,7 +139,7 @@ fn get_big_tile_text(b: &TaflBoardEleven, pos: &ElevenBoardPositionalEncoding) -
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let mut terminal = ratatui::init();
-    let mut app = App::new();
+    let mut app = App::default();
     let app_result = app.run(&mut terminal);
     ratatui::restore();
     app_result
@@ -152,6 +152,7 @@ struct App{
     input: String,
     character_index: usize,
     error_report: Option<ErrReport>,
+    game_end_message: String,
 }
 
 bitflags! {
@@ -160,6 +161,7 @@ bitflags! {
         const QUIT = 1 << 1;
         const ACCEPT_INPUT = 1 << 2;
         const POPUP = 1 << 3;
+        const TERMINATED = 1 << 4;
     }
 }
 
@@ -170,12 +172,6 @@ impl Default for AppFlags{
 }
 
 impl App {
-    fn new() -> Self{
-        let game = Game::init_std();
-        let flags = AppFlags::default();
-        let input = String::default();
-        Self { game, flags, input, character_index: 0, error_report: None}
-    }
 
     fn draw(&mut self, frame: &mut Frame){
 
@@ -197,7 +193,7 @@ impl App {
         );
 
         let [cur_board_area, input_area_prior, recent_history_area_prior] = board_horizontal.areas(board_display_area);
-        let [game_state_area, recent_history_area, _] = Layout::vertical([Length(8),Max(30),Fill(1)]).areas(recent_history_area_prior);
+        let [game_state_area, recent_history_area, _] = Layout::vertical([Length(4),Max(40),Fill(1)]).areas(recent_history_area_prior);
 
         // Render the current board
         let cur_board = TaflBoardElevenWidget{board: &self.game.board };
@@ -207,7 +203,7 @@ impl App {
         });
 
         // Render the recent histories
-        let outer_block = Block::bordered().border_type(BorderType::Rounded).title("recent history");
+        let outer_block = Block::bordered().border_type(BorderType::Rounded).title("recent history (repetition count)");
         let inner_block = outer_block.inner(recent_history_area);
         outer_block.render(recent_history_area, buf);
 
@@ -216,10 +212,12 @@ impl App {
             msg.left_aligned().render(inner_block,buf);
         }) {
 
+            let rc = parse_repetition_counter(self.game.repetition_counter);
             let recent_history = self.game.short_history
                 .iter().map(|board| TaflBoardElevenWidget{ board });
             for (i,(rect, b)) in rects.into_iter().zip(recent_history).enumerate(){
-                draw_small_board(b, format!("{}",i+1).to_string(), rect, buf);
+                let true_idx = (i + 1) % 4;
+                draw_small_board(b, format!("{} ({})",i+1, rc[true_idx]).to_string(), rect, buf);
                 // b.render(rect, buf);
             }
 
@@ -269,7 +267,45 @@ impl App {
                 .render(popup_rect, frame.buffer_mut());
         }
 
+        // Render game end message
+        if self.flags.contains(AppFlags::TERMINATED)
+        {
+            let popup_area = get_popup_area(frame.area());
+            frame.render_widget(Clear, popup_area);
+            let instruction = vec![
+                Span::raw("Press <g> to start new game. "),
+                Span::raw("Press <q> to quit")
+            ];
+            let msg = Text::from(format!("{}", self.game_end_message));
+            Paragraph::new(msg)
+                .left_aligned()
+                .block(Block::bordered().border_type(BorderType::Double).border_style(Style::default().blue())
+                .title_bottom(Line::from(instruction)))
+                .render(popup_area, frame.buffer_mut());
+
+        }
+
     } 
+
+    fn start_afresh(&mut self) {
+        // Reset the game to initial state
+        self.game = Game::init_std();
+
+        // Reset all flags to default state
+        self.flags = AppFlags::default();
+
+        // Clear input and reset cursor
+        self.input = String::new();
+        self.character_index = 0;
+
+        // Clear any error reports
+        self.error_report = None;
+
+        // Clear game end message
+        self.game_end_message = String::new();
+
+    }
+
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()>{
         while !self.flags.contains(AppFlags::QUIT) {
@@ -330,6 +366,7 @@ impl App {
                 self.flags.toggle(AppFlags::POPUP);
                 self.error_report = None;
             },
+            KeyCode::Char('g') if self.flags.contains(AppFlags::TERMINATED) => { self.start_afresh() },
             KeyCode::Char(c) => if self.flags.contains(AppFlags::ALLOWS_INPUT) {self.push_char(c)},
             KeyCode::Backspace => if self.flags.contains(AppFlags::ALLOWS_INPUT) {self.pop_char()},
             KeyCode::Enter => if self.flags.contains(AppFlags::ACCEPT_INPUT) {
@@ -345,16 +382,30 @@ impl App {
                 //     return Err(())
                 // }
                 // self.flush_input();
-                match self.game.check_action_validity(&action, None)
+
+                // match self.game.check_action_validity(&action, None)
+                // {
+                //     Ok(_) => {
+                //         let game_new = self.game.do_action_wo_validity_check(&action, None);
+                //         self.game = game_new;
+                //         self.flush_input();
+                //     },
+                //     Err(e) => {
+                //         return Err(ErrReport::msg(format!("Invalid Action Error!\n{}", e)))
+                //     }
+                // }
+
+                let maybe_finished = self.game.check_and_do_and_update_whole_mut(&action, None, false)
+                    .map_err(|e| ErrReport::msg(format!("Invalid Action Error!\n{}", e)))?;
+                self.flush_input();
+                if let (Some(r), _) = maybe_finished 
                 {
-                    Ok(_) => {
-                        let game_new = self.game.do_action_wo_validity_check(&action, None);
-                        self.game = game_new;
-                        self.flush_input();
-                    },
-                    Err(e) => {
-                        return Err(ErrReport::msg(format!("Invalid Action Error!\n{}", e)))
-                    }
+                    self.flags.insert(AppFlags::TERMINATED);
+                    let victor = self.game.state.get_victor();
+                    self.game_end_message = format!("Game finished!\n Winner: {}\n {}", victor, r);
+                    self.flags.remove(AppFlags::ALLOWS_INPUT);
+                    self.flags.remove(AppFlags::ACCEPT_INPUT);
+
                 }
             }
             _ => {}
@@ -398,6 +449,21 @@ impl<'a> GameWidget<'a> {
     pub fn new(game: &'a Game) -> Self {
         Self { game }
     }
+}
+
+fn get_popup_area(area: Rect) -> Rect {
+
+    let x = area.x;
+    let y = area.y;
+    let width = area.width;
+    let height = area.height;
+    let popup_rect = Rect{
+        x: x + width / 3,
+        y: y + height / 3,
+        width: width / 2,
+        height: height / 2
+    };
+    popup_rect
 }
 
 fn draw_main_board(area: Rect, buf: &mut Buffer, board: TaflBoardElevenWidget) -> Result<(), DisplayError>{
@@ -453,56 +519,6 @@ fn draw_main_board(area: Rect, buf: &mut Buffer, board: TaflBoardElevenWidget) -
 
 }
 
-impl<'a> Widget for GameWidget<'a> {
-    fn render(self, area: Rect, buf: &mut ratatui::prelude::Buffer)
-        where
-            Self: Sized 
-    {
-        use Constraint::{Length,Min,Percentage,Fill,Max};
-
-        let vertical = Layout::vertical(
-            [Length(50), Min(0)]
-        ); 
-        let [board_display_area, misc_area] = vertical.areas(area);
-        let main_board_height = board_display_area.height;
-        let board_horizontal = Layout::horizontal(
-            [Length(60), Fill(1), Length(60)]
-        );
-
-        let [cur_board_area, _, recent_history_area_prior] = board_horizontal.areas(board_display_area);
-        let [recent_history_area, _] = Layout::vertical([Length(30),Fill(1)]).areas(recent_history_area_prior);
-
-        // Render the current board
-        let cur_board = TaflBoardElevenWidget{board: &self.game.board };
-        draw_main_board(cur_board_area, buf, cur_board).map_err(|e| {
-            let msg = Line::from(format!("{}",e));
-            msg.left_aligned().render(cur_board_area, buf);
-        });
-
-        // Render the recent histories
-        let outer_block = Block::bordered().border_type(BorderType::Rounded).title("recent history");
-        let inner_block = outer_block.inner(recent_history_area);
-        outer_block.render(recent_history_area, buf);
-
-        if let Ok(rects) = prepare_recent_history_rects(inner_block).map_err(|e| {
-            let msg = Line::from(format!("{}",e));
-            msg.left_aligned().render(inner_block,buf);
-        }) {
-
-            let recent_history = self.game.short_history
-                .iter().map(|board| TaflBoardElevenWidget{ board });
-            for (i,(rect, b)) in rects.into_iter().zip(recent_history).enumerate(){
-                draw_small_board(b, format!("{}",i+1).to_string(), rect, buf);
-            }
-
-        }
-        // for (t, rect) in recent_history.zip(take_square(recent_history_area, 2))
-        // {
-        //     t.render(rect, buf);
-        // }
-    }
-}
-
 fn prepare_recent_history_rects(area: Rect) -> Result<[Rect;4] , DisplayError> {
 
     use Constraint::{Length,Min};
@@ -510,7 +526,7 @@ fn prepare_recent_history_rects(area: Rect) -> Result<[Rect;4] , DisplayError> {
         return Err(DisplayError::TooSmall)
     }
 
-    let v_constraints = [Min(0),Length(13),Min(2),Length(13),Min(0)];
+    let v_constraints = [Min(0),Length(16),Min(2),Length(16),Min(0)];
     let v_layout = Layout::vertical(v_constraints);
     let [_, row1, _, row2,_] = v_layout.areas::<5>(area);
     let h_constraints = [Min(0),Length(2 * 11),Min(4),Length(2 * 11),Min(0)];
@@ -546,16 +562,6 @@ fn take_square(area: Rect, n: u32) -> Vec<Rect>
     rows.into_iter().flat_map(|row| horizontal.split(row).to_vec()).collect()
 }
 
-// Wrapper type for TaflBoardEleven to implement Widget
-pub struct TaflBoardElevenWidget<'a> {
-    pub board: &'a TaflBoardEleven,
-}
-
-impl<'a> TaflBoardElevenWidget<'a> {
-    pub fn new(board: &'a TaflBoardEleven) -> Self {
-        Self { board }
-    }
-}
 
 #[derive(Debug)]
 enum DisplayError{
@@ -575,7 +581,7 @@ impl Error for DisplayError {}
 
 fn draw_small_board(board: TaflBoardElevenWidget, title: String, area: Rect, buf: &mut Buffer) -> Result<(), DisplayError> {
 
-    use Constraint::{Length, Min, Fill};
+    use Constraint::{Length, Min, Max, Fill};
     
     if area.width < 11 || area.height < 12
     {
@@ -583,7 +589,7 @@ fn draw_small_board(board: TaflBoardElevenWidget, title: String, area: Rect, buf
     }
 
     // extract the board area from the input area
-    let v_constraint = [Min(0),Length(13),Min(0)];
+    let v_constraint = [Min(0),Length(15),Min(0)];
     let v_layout = Layout::vertical(v_constraint);
     let [_,board_area_prior,_] = v_layout.areas::<3>(area);
     let h_constraint = [Min(0),Length(2 * 11),Min(0)];
@@ -668,6 +674,53 @@ fn draw_big_board(board: TaflBoardElevenWidget, area: Rect, buf: &mut Buffer) ->
     Ok(())
 }
 
+
+const fn get_file_char(n: u16) -> char {
+    match n {
+        0 => 'A',
+        1 => 'B',
+        2 => 'C',
+        3 => 'D',
+        4 => 'E',
+        5 => 'F',
+        6 => 'G',
+        7 => 'H',
+        8 => 'I',
+        9 => 'J',
+        10 => 'K',
+        _ => '?',
+    }
+}
+
+const fn valid_input_char(c: char) -> bool{
+    let i = c.len_utf8();
+    if i > 1 {
+        false
+    } else {
+        let mut buffer: [u8; 1] = [0; 1];
+        c.encode_utf8(&mut buffer);
+        let n = buffer[0];
+        match n {
+            97..108 => true,
+            65..76 => true,
+            48..=57 => true, // '0' ~ '9'
+            _ => false
+        }
+    }
+}
+
+// Wrapper type for TaflBoardEleven to implement Widget
+pub struct TaflBoardElevenWidget<'a> {
+    pub board: &'a TaflBoardEleven,
+}
+
+impl<'a> TaflBoardElevenWidget<'a> {
+    pub fn new(board: &'a TaflBoardEleven) -> Self {
+        Self { board }
+    }
+}
+
+// Deprecated
 impl<'a> Widget for TaflBoardElevenWidget<'a> {
     // renders one board using the full area. Note: area is assumed to be square.
     fn render(self, area: Rect, buf: &mut ratatui::prelude::Buffer)
@@ -733,36 +786,53 @@ impl<'a> Widget for TaflBoardElevenWidget<'a> {
 }
 
 
-const fn get_file_char(n: u16) -> char {
-    match n {
-        0 => 'A',
-        1 => 'B',
-        2 => 'C',
-        3 => 'D',
-        4 => 'E',
-        5 => 'F',
-        6 => 'G',
-        7 => 'H',
-        8 => 'I',
-        9 => 'J',
-        10 => 'K',
-        _ => '?',
-    }
-}
+// Deprecated. 
+impl<'a> Widget for GameWidget<'a> {
+    fn render(self, area: Rect, buf: &mut ratatui::prelude::Buffer)
+        where
+            Self: Sized 
+    {
+        use Constraint::{Length,Min,Percentage,Fill,Max};
 
-const fn valid_input_char(c: char) -> bool{
-    let i = c.len_utf8();
-    if i > 1 {
-        false
-    } else {
-        let mut buffer: [u8; 1] = [0; 1];
-        c.encode_utf8(&mut buffer);
-        let n = buffer[0];
-        match n {
-            97..108 => true,
-            65..76 => true,
-            49..60 => true,
-            _ => false
+        let vertical = Layout::vertical(
+            [Length(50), Min(0)]
+        ); 
+        let [board_display_area, misc_area] = vertical.areas(area);
+        let main_board_height = board_display_area.height;
+        let board_horizontal = Layout::horizontal(
+            [Length(60), Fill(1), Length(60)]
+        );
+
+        let [cur_board_area, _, recent_history_area_prior] = board_horizontal.areas(board_display_area);
+        let [recent_history_area, _] = Layout::vertical([Length(40),Fill(1)]).areas(recent_history_area_prior);
+
+        // Render the current board
+        let cur_board = TaflBoardElevenWidget{board: &self.game.board };
+        draw_main_board(cur_board_area, buf, cur_board).map_err(|e| {
+            let msg = Line::from(format!("{}",e));
+            msg.left_aligned().render(cur_board_area, buf);
+        });
+
+        // Render the recent histories
+        let outer_block = Block::bordered().border_type(BorderType::Rounded).title("recent history");
+        let inner_block = outer_block.inner(recent_history_area);
+        outer_block.render(recent_history_area, buf);
+
+        if let Ok(rects) = prepare_recent_history_rects(inner_block).map_err(|e| {
+            let msg = Line::from(format!("{}",e));
+            msg.left_aligned().render(inner_block,buf);
+        }) {
+
+            let recent_history = self.game.short_history
+                .iter().map(|board| TaflBoardElevenWidget{ board });
+            for (i,(rect, b)) in rects.into_iter().zip(recent_history).enumerate(){
+                draw_small_board(b, format!("{}",i+1).to_string(), rect, buf);
+            }
+
         }
+        // for (t, rect) in recent_history.zip(take_square(recent_history_area, 2))
+        // {
+        //     t.render(rect, buf);
+        // }
     }
 }
