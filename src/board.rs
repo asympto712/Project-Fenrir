@@ -9,6 +9,7 @@ pub const ELEVENBOARDPRESET_STD_DEF: [u64;3] = [0x020_000_000_000, 0x020_070_0D8
 pub const ELEVENBOARDPRESET_STD_KING: [u64;3] = [0x000_000_000_000, 0x000_000_020_000, 0x000_000_000];
 pub const ELEVENBOARDPRESET_STD_HOS: [u64;3] = [0x000_000_000_401, 0x000_000_020_000, 0x401_000_000];
 
+#[derive(Debug, Copy, Clone)]
 pub struct TaflBoardEleven{
     pub bit_att: BoardEleven,
     pub bit_def: BoardEleven,
@@ -24,6 +25,10 @@ impl TaflBoardEleven{
         let hostile = BoardEleven::from(ELEVENBOARDPRESET_STD_HOS);
         Self{bit_att, bit_def, bit_king, hostile}
     } 
+
+    pub fn equals(&self, rhs: &Self) -> bool{
+        self.bit_att.equals(&rhs.bit_att) && self.bit_def.equals(&rhs.bit_def) && self.bit_king.equals(&rhs.bit_king)
+    }
 }
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -286,9 +291,10 @@ impl TaflBoardEleven{
     // returns the defender pieces that are captured by the movement from the attacker pieces.
     // To actually update the board, simply take the XOR of the output with self.bit_def 
     pub fn def_capture(&self, action: &MoveOnBoardEleven) -> BoardEleven{
-        let dst_neighber = BoardEleven::neighber_of(&action.dst);
-        let restricted_def = self.bit_def & dst_neighber;
-        let mask = self.bit_att | self.hostile;
+        let dst_neighbor = BoardEleven::neighbor_of(&action.dst);
+        let restricted_def = self.bit_def & dst_neighbor;
+        let mut mask = self.bit_att | self.hostile;
+        mask.flip_target_bit_mut(&action.dst);
         let cpt_candid_e = (restricted_def.shift_e() & mask).shift_w();
         let cpt_candid_w = (restricted_def.shift_w() & mask).shift_e();
         let cpt_candid_s = (restricted_def.shift_s() & mask).shift_n();
@@ -300,9 +306,10 @@ impl TaflBoardEleven{
     // returns the attacker pieces that are captured by the movement from the defender pieces.
     // To actually update the board, simply take the XOR of the output with self.bit_att 
     pub fn att_capture(&self, action: &MoveOnBoardEleven) -> BoardEleven{
-        let dst_neighber = BoardEleven::neighber_of(&action.dst);
-        let restricted_att = self.bit_att & dst_neighber;
-        let mask = self.bit_def | self.bit_king | self.hostile;
+        let dst_neighbor = BoardEleven::neighbor_of(&action.dst);
+        let restricted_att = self.bit_att & dst_neighbor;
+        let mut mask = self.bit_def | self.bit_king | self.hostile;
+        mask.flip_target_bit_mut(&action.dst);
         let cpt_candid_e = (restricted_att.shift_e() & mask).shift_w();
         let cpt_candid_w = (restricted_att.shift_w() & mask).shift_e();
         let cpt_candid_s = (restricted_att.shift_s() & mask).shift_n();
@@ -314,11 +321,12 @@ impl TaflBoardEleven{
     // returns the king pieces that are captured by the movement from the attacker pieces.
     // To actually update the board, simply take the XOR of the output with self.bit_king 
     pub fn king_capture(&self, action: &MoveOnBoardEleven) -> BoardEleven{
-        let dst_neighber = BoardEleven::neighber_of(&action.dst);
-        let restricted_king = self.bit_king & dst_neighber;
+        let dst_neighbor = BoardEleven::neighbor_of(&action.dst);
+        let restricted_king = self.bit_king & dst_neighbor;
         if !restricted_king.is_nonzero(){ return BoardEleven{par1: 0, par2: 0, par3: 0} }
 
-        let mask = self.bit_att | self.hostile;
+        let mut mask = self.bit_att | self.hostile;
+        mask.flip_target_bit_mut(&action.dst);
         let cpt_candid_e = (restricted_king.shift_e() & mask).shift_w();
         let cpt_candid_w = (restricted_king.shift_w() & mask).shift_e();
         let cpt_candid_s = (restricted_king.shift_s() & mask).shift_n();
@@ -530,7 +538,7 @@ impl TaflBoardEleven{
             }
         } else {return BoardEleven{par1: 0, par2: 0, par3: 0}}
     }
-    // Shield Wall capture referes to the relatively new capture rule in Copenhagen ruleset, where a row of defenders + king on 
+    // Shield Wall capture refers to the relatively new capture rule in Copenhagen ruleset, where a row of defenders + king on 
     // one of the edges on the board can be captured if they are tightly surrounded by attackers. However, for that to happen the attacker must make 
     // a flanking move.
     // This function detects the tight entrapment of the defenders's shield walls by simulating a dilation starting from the proper position. 
@@ -622,4 +630,13 @@ fn shield_wall_capture_works(){
     println!("{}", b);
     let val = b.shield_wall_capture(&action);
     println!("{}", val);
+}
+
+#[test]
+fn action_on_board_works() {
+    let b = TaflBoardEleven::init_std();
+    let action = MoveOnBoardEleven::try_from("D1D2".to_owned()).unwrap();
+    let nb = b.att_force_move(&action);
+    println!("{}", b);
+    println!("{}", nb);
 }
