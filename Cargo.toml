@@ -1,0 +1,18 @@
+[package]
+name = "fenrir"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitboard = { path = "../bitboard"}
+game = { path = "../game" }
+tch = "0.20.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+color-eyre = "0.6"
+
+[[bin]]
+name = "train"
+path = "./src/train.rs"
+
+[lib]
