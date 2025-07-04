@@ -1,9 +1,0 @@
-{
-    "rust-analyzer.diagnostics.useRustcErrorCode": true,
-    "cSpell.words": [
-        "bitflags",
-        "crossterm",
-        "incre",
-        "piecetype"
-    ]
-}
