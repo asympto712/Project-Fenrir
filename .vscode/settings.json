@@ -1,8 +1,0 @@
-{
-    "rust-analyzer.diagnostics.useRustcErrorCode": true,
-    "cSpell.words": [
-        "convblocks",
-        "ksize",
-        "mcts"
-    ]
-}
