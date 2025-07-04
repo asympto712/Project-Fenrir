@@ -27,6 +27,7 @@ pub const PRESETX_BACKGROUND: [u64;3] = [0x7ff7ff7ff7ff, 0x7ff7ff7ff7ff, 0x7ff7f
 pub const BLACKMASK: BoardEleven = BoardEleven{par1: 0x7ff7ff7ff7ff, par2: 0x7ff7ff7ff7ff, par3: 0x7ff7ff7ff};
 pub const ONLY_PAD: BoardEleven = BoardEleven{par1: 0xffff_800_800_800_800, par2: 0xffff_800_800_800_800, par3: 0xfffffff_800_800_800};
 pub const ONLY_EDGES: BoardEleven = BoardEleven{par1: 0x401_401_401_7ff, par2: 0x401_401_401_401, par3: 0x7ff_401_401};
+pub const GOALS: BoardEleven = BoardEleven{par1: 0x000_000_000_401, par2: 0x000_000_000_000, par3: 0x401_000_000};
 
 pub const fn num_to_alphabet(n: u8) -> char{
     match n{
@@ -222,6 +223,47 @@ impl TryFrom<String> for MoveOnBoardEleven{
             ElevenBoardPositionalEncoding::try_from(&chars[alphabet_positions[1]..])?;
             return Ok(Self{start, dst})
         }
+    }
+}
+
+impl MoveOnBoardEleven{
+
+    // Find out how many steps to go in which direction to go from start to dst. This is not so trivial as locations are encoded. 
+    // Consider using this as little as possible to reduce performance overhead.
+    pub fn find_path(&self) -> Option<Direction>{
+        let init = BoardEleven::new().flip_target_bit(&self.start);
+        let target = BoardEleven::new().flip_target_bit(&self.dst);
+
+        // First, try moving east
+        let mut tmp = init;
+        for i in 1..=10{
+            tmp = tmp.shift_e();
+            if (tmp & target).is_nonzero() { return Some(Direction::E(i))}
+        } 
+
+        // Next, try moving west
+        let mut tmp = init;
+        for i in 1..=10{
+            tmp = tmp.shift_w();
+            if (tmp & target).is_nonzero() { return Some(Direction::W(i))}
+        } 
+        
+        // Next, try moving south
+        let mut tmp = init;
+        for i in 1..=10{
+            tmp = tmp.shift_s();
+            if (tmp & target).is_nonzero() { return Some(Direction::S(i))}
+        } 
+
+
+        // Next, try moving north
+        let mut tmp = init;
+        for i in 1..=10{
+            tmp = tmp.shift_n();
+            if (tmp & target).is_nonzero() { return Some(Direction::N(i))}
+        } 
+
+        None
     }
 }
 
@@ -465,6 +507,12 @@ impl BoardEleven{
         if b.par1 > 0 || b.par2 > 0 || b.par3 > 0 {true}
         else {false}
     }
+
+    #[inline]
+    pub fn equals(&self, rhs: &Self) -> bool{
+        let tmp = *self ^ *rhs;
+        !tmp.is_nonzero()
+    } 
 
     // flip the bits on the board, but keep the paddings to zero. Make sure to only use this to boards whose padding are reset.
     // Otherwise it might cause unexpected behavior. When in doubt, .reset_padding()
@@ -717,7 +765,7 @@ impl BoardEleven{
         value
     }
 
-    pub fn neighber_of(location: &ElevenBoardPositionalEncoding) -> Self{
+    pub fn neighbor_of(location: &ElevenBoardPositionalEncoding) -> Self{
         let address = location.0 >> 2;
         let tmp = match location.0 & 3{
             0 => {
@@ -985,7 +1033,7 @@ impl BoardEleven{
         let addresses = (movement.start.0 >> 2, movement.dst.0 >> 2);
         match blocks{
             (0,0) => {
-                Self {par1: self.par1 ^ (1 << addresses.0 + 1 << addresses.1), par2: self.par2, par3: self.par3}
+                Self {par1: self.par1 ^ (1 << addresses.0 ^ 1 << addresses.1), par2: self.par2, par3: self.par3}
             },
             (0,1) => {
                 Self {par1: self.par1 ^ (1 << addresses.0), par2: self.par2 ^ (1 << addresses.1), par3: self.par3}
@@ -997,7 +1045,7 @@ impl BoardEleven{
                 Self {par1: self.par1 ^ (1 << addresses.1), par2: self.par2 ^ (1 << addresses.0), par3: self.par3}
             },
             (1,1) => {
-                Self {par1: self.par1, par2: self.par2 ^ (1 << addresses.0 + 1 << addresses.1), par3: self.par3}
+                Self {par1: self.par1, par2: self.par2 ^ (1 << addresses.0 ^ 1 << addresses.1), par3: self.par3}
             },
             (1,2) => {
                 Self {par1: self.par1, par2: self.par2 ^ (1 << addresses.0), par3: self.par3 ^ (1 << addresses.1)}
@@ -1009,7 +1057,7 @@ impl BoardEleven{
                 Self {par1: self.par1, par2: self.par2 ^ (1 << addresses.1) , par3: self.par3 ^ (1 << addresses.0)}
             },
             (2,2) => {
-                Self {par1: self.par1, par2: self.par2, par3: self.par3 ^ (1 << addresses.0 + 1 << addresses.1)}
+                Self {par1: self.par1, par2: self.par2, par3: self.par3 ^ (1 << addresses.0 ^ 1 << addresses.1)}
             },
             _ => { panic!("specified position encode is invalid. Non-existent block was specified!")}
         }
@@ -1074,6 +1122,18 @@ impl BoardEleven{
 
         (surviver_s & surviver_n & surviver_w & surviver_e).locate_ones()
     }
+
+    pub fn tile_is_empty_at(&self, position: &ElevenBoardPositionalEncoding) -> bool{
+        let (block, address) = (position.0 & 3, position.0 >> 2);
+        let target_block = match block{
+            0 => self.par1,
+            1 => self.par2,
+            2 => self.par3,
+            _ => panic!("Invalid board block was specified"),
+        };
+        (target_block >> address) & 1 == 0
+    }
+
 }
 
 
@@ -1250,4 +1310,12 @@ fn list_moves_works(){
     for m in moves{
         print!("{} ", m);
     }
+}
+
+#[test]
+fn force_move_works() {
+    let b = BoardEleven::try_from(PRESETX1).unwrap();
+    let nb = b.force_move(&MoveOnBoardEleven::try_from("F6F9".to_owned()).unwrap());
+    println!("{}", b);
+    println!("{}", nb);
 }
