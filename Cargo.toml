@@ -3,13 +3,24 @@ name = "fenrir"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["torch"]
+no-torch = []
+torch = ["dep:tch", "dep:libc"]
+
 [dependencies]
 bitboard = { path = "../bitboard"}
 game = { path = "../game" }
-tch = "0.20.0"
+tch = {version = "0.20.0" , optional = true }
+libc = {version = "0.2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 color-eyre = "0.6"
+rand = "0.9"
+rayon = "1"
+crossbeam = "0.8"
+arraydeque = "0.5"
+
 
 [[bin]]
 name = "train"
