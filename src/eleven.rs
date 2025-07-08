@@ -1,10 +1,11 @@
-use core::num;
+#![allow(dead_code)]
+#![allow(clippy::unusual_byte_groupings)]
 use rand::prelude::*;
-use std::{fmt::{format, Display}, ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not}};
+use std::{fmt::Display, ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not}};
 use crate::Direction;
 
 use rawbytes::RawBytes;
-use bitflags::{bitflags, bitflags_match};
+use bitflags::bitflags;
 
 pub const BOARDELEVENPART1: usize = 48;
 pub const BOARDELEVENPART2: usize = 96;
@@ -17,8 +18,8 @@ pub const BLOCK2LEN: u8 = 48;
 pub const BLOCK3LEN: u8 = 36;
 
 #[allow(dead_code)]
-pub const PRESET1: &'static str = "10001010110\n00100111101\n00100111111\n00001111100\n11110011010\n00110101101\n11000011011\n11000000111\n00000000000\n00011111111\n00011001111\n";
-pub const PRESET_MASK: &'static str = "11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n";
+pub const PRESET1: &str = "10001010110\n00100111101\n00100111111\n00001111100\n11110011010\n00110101101\n11000011011\n11000000111\n00000000000\n00011111111\n00011001111\n";
+pub const PRESET_MASK: &str = "11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n11111111111\n";
 
 pub const PRESETX1: [u64;3] = [0x4aa5552aa555, 0x7ff7ff7ff000, 0x7ff7ff7ff];
 pub const PRESETX_EMPTY: [u64;3] = [0x000000000000, 0x000000000000, 0x000000000];
@@ -80,6 +81,21 @@ impl ElevenBoardPositionalEncoding{
         assert!(x < 11, "x-coordinate out of bound");
         Self(((new_y * 12 + x) << 2) + block)
     }
+
+    // obtain the coordinate in the screen-like coordinate system (north left: origin) 
+    // returning (x,y), where x ranges 0..11 and y ranges 0..11
+    pub fn get_coordinate(&self) -> (u8,u8) {
+        let block: u8 = match self.0 & 3 {
+            0 => 0,
+            1 => 4,
+            2 => 8,
+            _ => panic!("unexpected board partition")
+        };
+        let address: u8 = self.0 >> 2;
+        let y: u8 = address / 12 + block;
+        let x: u8 = address % 12;
+        (x,y)
+    }
 }
 
 impl TryFrom<u8> for ElevenBoardPositionalEncoding{
@@ -96,8 +112,8 @@ impl TryFrom<&[char]> for ElevenBoardPositionalEncoding{
         
         fn int_from_char(value: char) -> Option<u8>{
             if value.is_ascii_digit(){
-                return Some( (value as u32 - 0x30) as u8 )
-            } else { return None }
+                Some( (value as u32 - 0x30) as u8 )
+            } else { None }
         }
         fn int_from_char_slice(value: &[char]) -> Option<u8>{
             match value.len(){
@@ -118,8 +134,8 @@ impl TryFrom<&[char]> for ElevenBoardPositionalEncoding{
         }
         fn int_from_ascii_lowercase(value: char) -> Option<u8>{
             if value.is_ascii_lowercase(){
-                return Some( (value as u32 - 0x61) as u8 )
-            } else { return None }
+                Some( (value as u32 - 0x61) as u8 )
+            } else { None }
         }
         fn int_check_if_in_bound(value: u8) -> Result<u8, String>{
             if value < 11 { Ok(value)}
@@ -211,7 +227,7 @@ impl TryFrom<String> for MoveOnBoardEleven{
         let alphabet_positions: Vec<usize> = value.to_lowercase().chars().enumerate().filter_map(
             |(i,c)| c.is_ascii_lowercase().then_some(i)).collect();
         if alphabet_positions.len() != 2{
-            return Err("Wrong input pattern for movement: try e.g. A2D2".to_string())
+            Err("Wrong input pattern for movement: try e.g. A2D2".to_string())
         } else if alphabet_positions[1] - alphabet_positions[0] <= 1{
             return Err("Wrong input pattern for movement: try e.g. A2D2".to_string())
         } else {
@@ -284,6 +300,12 @@ impl BoardEleven {
     }
 }
 
+impl Default for BoardEleven {
+    fn default() -> Self {
+        BoardEleven::from(PRESETX1)
+    }
+}
+
 impl From<[u64;3]> for BoardEleven{
     fn from(value: [u64;3]) -> Self {
         Self {par1: value[0], par2: value[1], par3: value[2]}
@@ -293,7 +315,7 @@ impl From<[u64;3]> for BoardEleven{
 impl BitAnd for BoardEleven{
     type Output = Self;
     fn bitand(self, rhs: Self) -> Self::Output {
-        return Self{
+        Self{
             par1: self.par1 & rhs.par1,
             par2: self.par2 & rhs.par2,
             par3: self.par3 & rhs.par3,
@@ -311,7 +333,7 @@ impl BitAndAssign for BoardEleven{
 impl BitOr for BoardEleven{
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self::Output {
-        return Self{
+        Self{
             par1: self.par1 | rhs.par1,
             par2: self.par2 | rhs.par2,
             par3: self.par3 | rhs.par3,
@@ -328,7 +350,7 @@ impl BitOrAssign for BoardEleven{
 impl BitXor for BoardEleven{
     type Output = Self;
     fn bitxor(self, rhs: Self) -> Self::Output {
-        return Self{
+        Self{
             par1: self.par1 ^ rhs.par1,
             par2: self.par2 ^ rhs.par2,
             par3: self.par3 ^ rhs.par3,
@@ -418,10 +440,10 @@ impl TryFrom<String> for BoardEleven{
 
         fn inspect(c: char) -> Result<PieceOrNewline, String>{
             // print!("{c}");
-            if c == '1' { return Ok(PieceOrNewline::Piece(1)) }
-            else if c == '0' { return Ok(PieceOrNewline::Piece(0)) }
-            else if c == '\n' { return Ok(PieceOrNewline::Newline)}
-            else { return Err("invalid character encountered".to_owned())}
+            if c == '1' { Ok(PieceOrNewline::Piece(1)) }
+            else if c == '0' { Ok(PieceOrNewline::Piece(0)) }
+            else if c == '\n' { Ok(PieceOrNewline::Newline)}
+            else { Err("invalid character encountered".to_owned())}
         }
 
         fn store(parboard: &mut u64, shift: usize, c: char, count: &mut usize) -> Result<(),String>{
@@ -504,8 +526,7 @@ impl BoardEleven{
     #[inline]
     pub fn is_nonzero(&self) -> bool{
         let b = self.reset_padding();
-        if b.par1 > 0 || b.par2 > 0 || b.par3 > 0 {true}
-        else {false}
+        b.par1 > 0 || b.par2 > 0 || b.par3 > 0
     }
 
     #[inline]
@@ -547,72 +568,72 @@ impl BoardEleven{
     }
 
     pub fn dilation(&self, d: Direction) -> Self{
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         match d{
             Direction::E(u) => {
                 for _ in 0..u{
                     tmp = tmp | tmp.shift_e();
                 }
-                return tmp
+                tmp
             },
             Direction::W(u) => {
                 for _ in 0..u{
                     tmp = tmp | tmp.shift_w();
                 }
-                return tmp
+                tmp
             },
             Direction::N(u) => {
                 for _ in 0..u{
                     tmp = tmp | tmp.shift_n();
                 }
-                return tmp
+                tmp
             },
             Direction::S(u) => {
                 for _ in 0..u{
                     tmp = tmp | tmp.shift_s();
                 }
-                return tmp
+                tmp
             },
             Direction::All(u) => {
                 for _ in 0..u{
                     tmp = tmp | tmp.shift_e() | tmp.shift_n() | tmp.shift_s() | tmp.shift_w();
                 }
-                return tmp
+                tmp
             }
         }
     }
     pub fn erosion(&self, d: Direction) -> Self{
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         match d{
             Direction::E(u) => {
                 for _ in 0..u{
                     tmp = tmp & tmp.shift_e();
                 }
-                return tmp
+                tmp
             },
             Direction::W(u) => {
                 for _ in 0..u{
                     tmp = tmp & tmp.shift_w();
                 }
-                return tmp
+                tmp
             },
             Direction::N(u) => {
                 for _ in 0..u{
                     tmp = tmp & tmp.shift_n();
                 }
-                return tmp
+                tmp
             },
             Direction::S(u) => {
                 for _ in 0..u{
                     tmp = tmp & tmp.shift_s();
                 }
-                return tmp
+                tmp
             },
             Direction::All(u) => {
                 for _ in 0..u{
                     tmp = tmp & tmp.shift_e() & tmp.shift_n() & tmp.shift_s() & tmp.shift_w();
                 }
-                return tmp
+                tmp
             }
         }
     }
@@ -658,8 +679,7 @@ impl Shift for BoardEleven{
         let mut step1: BoardEleven = Self { par1: self.par1 << 12, par2: self.par2 << 12, par3: self.par3 << 12 };
         step1.par2 |= u1;
         step1.par3 |= u2;
-        let step2 = step1.reset_padding();
-        step2
+        step1.reset_padding()
     }
     #[inline]
     fn shift_n(&self) -> Self {
@@ -675,8 +695,7 @@ impl Shift for BoardEleven{
         let mut step1: BoardEleven = Self { par1: self.par1 >> 12, par2: self.par2 >> 12, par3: self.par3 >> 12 };
         step1.par1 |= u1;
         step1.par2 |= u2;
-        let step2 = step1.reset_padding();
-        step2
+        step1.reset_padding()
     }
 }
 
@@ -694,7 +713,7 @@ impl BoardEleven{
 
     #[inline] 
     pub fn shift_e_with_step(&self, step: u8) -> Self {
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for _ in 0..step{
             tmp = tmp.shift_e();
         }
@@ -702,7 +721,7 @@ impl BoardEleven{
     }
     #[inline] 
     pub fn shift_w_with_step(&self, step: u8) -> Self {
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for _ in 0..step{
             tmp = tmp.shift_w();
         }
@@ -710,7 +729,7 @@ impl BoardEleven{
     }
     #[inline] 
     pub fn shift_n_with_step(&self, step: u8) -> Self {
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for _ in 0..step{
             tmp = tmp.shift_n();
         }
@@ -718,7 +737,7 @@ impl BoardEleven{
     }
     #[inline] 
     pub fn shift_s_with_step(&self, step: u8) -> Self {
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for _ in 0..step{
             tmp = tmp.shift_s();
         }
@@ -786,7 +805,7 @@ impl BoardEleven{
 
         let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
 
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for step in 1..=movelen_lim{
             // If a path starting from a certain position is blocked at some point, there is no going further.
             // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
@@ -813,7 +832,7 @@ impl BoardEleven{
 
         let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
 
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for step in 1..=movelen_lim{
             // If a path starting from a certain position is blocked at some point, there is no going further.
             // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
@@ -839,7 +858,7 @@ impl BoardEleven{
 
         let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
 
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for step in 1..=movelen_lim{
             // If a path starting from a certain position is blocked at some point, there is no going further.
             // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
@@ -865,7 +884,7 @@ impl BoardEleven{
 
         let mut move_list: Vec<MoveOnBoardEleven> = Vec::new();
 
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for step in 1..=movelen_lim{
             // If a path starting from a certain position is blocked at some point, there is no going further.
             // Therefore after the book-keeping procedure we remove those blocked starting points from tmp.
@@ -927,15 +946,15 @@ impl BoardEleven{
         let mut moves: Vec<MoveOnBoardEleven> = Vec::new();
 
         // Moves to East are dealt with here
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for i in 1..=10{
             tmp = tmp.shift_e() & self.complement() & *mask;
             let positions = tmp.get_ones();
             if positions[0].len() + positions[1].len() + positions[2].len() == 0 {
                 break;
             }
-            for block in 0..=2{
-                for u in &positions[block]{
+            for (block, item) in positions.iter().enumerate(){
+                for u in item{
                     let dst: u8 = u << 2 | block as u8;
                     let start: u8 = calculate_start_position_for_move_east(*u, block as u8, i);
                     moves.push(MoveOnBoardEleven{
@@ -947,15 +966,15 @@ impl BoardEleven{
         }
 
         // Moves to West are dealt with here
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for i in 1..=10{
             tmp = tmp.shift_w() & self.complement() & *mask;
             let positions = tmp.get_ones();
             if positions[0].len() + positions[1].len() + positions[2].len() == 0 {
                 break;
             }
-            for block in 0..=2{
-                for u in &positions[block]{
+            for (block, item) in positions.iter().enumerate(){
+                for u in item{
                     let dst: u8 = u << 2 | block as u8;
                     let start: u8 = calculate_start_position_for_move_west(*u, block as u8, i);
                     moves.push(MoveOnBoardEleven{
@@ -967,15 +986,15 @@ impl BoardEleven{
         }
 
         // Moves to South are dealt with here
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for i in 1..=10{
             tmp = tmp.shift_s() & self.complement() & *mask;
             let positions = tmp.get_ones();
             if positions[0].len() + positions[1].len() + positions[2].len() == 0 {
                 break;
             }
-            for block in 0..=2{
-                for u in &positions[block]{
+            for (block, item) in positions.iter().enumerate(){
+                for u in item{
                     let dst: u8 = u << 2 | block as u8;
                     let start: u8 = calculate_start_position_for_move_south(*u, &mut (block as u8), i);
                     moves.push(MoveOnBoardEleven{
@@ -987,15 +1006,15 @@ impl BoardEleven{
         }
 
         // Moves to North are dealt with here
-        let mut tmp = self.clone();
+        let mut tmp = *self;
         for i in 1..=10{
             tmp = tmp.shift_s() & self.complement() & *mask;
             let positions = tmp.get_ones();
             if positions[0].len() + positions[1].len() + positions[2].len() == 0 {
                 break;
             }
-            for block in 0..=2{
-                for u in &positions[block]{
+            for (block, item) in positions.iter().enumerate(){
+                for u in item{
                     let dst: u8 = u << 2 | block as u8;
                     let start: u8 = calculate_start_position_for_move_north(*u, &mut (block as u8), i);
                     moves.push(MoveOnBoardEleven{
