@@ -1,12 +1,10 @@
 use std::fmt::Display;
-use std::io::ErrorKind;
 
-use crate::board::*;
 use crate::board::TaflBoardEleven;
 use bitboard::eleven::*;
 use bitboard::Direction;
 
-use bitflags::{bitflags, bitflags_match, Flag, Flags};
+use bitflags::{bitflags};
 use arraydeque::{ArrayDeque, Wrapping};
 
 #[derive(Debug, Copy, Clone)]
@@ -204,6 +202,7 @@ impl std::error::Error for InvalidActionError {}
 // But I decided that the move that would result in a 3rd repetition should simply  be rejected.
 // So, a player loses if she has only one move and that move would result in a 3rd repetition.
 
+#[derive(Debug, Clone)]
 pub struct Game{
     pub board: TaflBoardEleven,
     pub state: GameState,
@@ -230,7 +229,7 @@ pub struct Game{
 
 type RepetitionCounter = u8;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShortHistory (ArrayDeque<TaflBoardEleven, 4, Wrapping> );
 
 impl ShortHistory{
@@ -250,6 +249,9 @@ impl ShortHistory{
     }
     pub fn get_second_oldest(&self) -> Option<&TaflBoardEleven> {
         self.0.get(2)
+    }
+    pub fn get(&self, idx: usize) -> Option<&TaflBoardEleven> {
+        self.0.get(idx)
     }
     pub fn check_repetition(&self, new_board: &TaflBoardEleven) -> bool
     {
@@ -276,7 +278,7 @@ impl ShortHistory{
             tmp
         }
     }
-    pub fn iter(&self) -> arraydeque::Iter<TaflBoardEleven> {
+    pub fn iter(&'_ self) -> arraydeque::Iter<'_, TaflBoardEleven> {
         self.0.iter()
     }
 }
@@ -288,6 +290,19 @@ impl Default for Game {
 }
 
 impl Game{
+
+    pub fn get_possible_actions(&self) -> Vec<MoveOnBoardEleven> {
+        match self.state.show_side() {
+            Side::Att => {
+                self.board.generate_actions_for_attsoldiers()
+            },
+            Side::Def => {
+                let mut vec = self.board.generate_actions_for_defsoldiers();
+                vec.extend(self.board.generate_actions_for_king());
+                vec
+            }
+        }
+    }
 
     //NOTE:  Call this function BEFORE the board is changed
     pub fn update_short_history_mut(&mut self) {
@@ -844,6 +859,73 @@ impl Game{
         value
     }
 
+    // TODO! unit-test
+    pub fn do_move_and_update_whole(&self, action: &MoveOnBoardEleven, piecetype: Option<PieceType>, pass_next_moves: bool)
+     -> Result<(Self, Option<ReasonForTermination>, Option<Vec<MoveOnBoardEleven>>), InvalidActionError>
+    {
+
+        let side = self.state.show_side();
+            
+        let mut new_short_history = self.short_history.clone();
+        new_short_history.push_front(self.board);
+
+        let piecetype 
+            = if let Some(p) = piecetype { p } 
+            else { self.board.determine_action_piecetype(side, action)? };
+
+        let new_board = match piecetype {
+            PieceType::AttSoldier => {
+
+                let def_capt = self.board.def_capture(action);
+                let king_capt = self.board.king_capture(action);
+                let shield_wall_capt = self.board.shield_wall_capture(action);
+
+                let mut new_board = self.board.att_force_move(action);
+                new_board.bit_def ^= def_capt | (shield_wall_capt & self.board.bit_def);
+                new_board.bit_king ^= king_capt | (shield_wall_capt & self.board.bit_king);
+                new_board
+            }
+            PieceType::DefSoldier => {
+
+                let att_capt = self.board.att_capture(action);
+
+                let mut new_board = self.board.def_force_move(action);
+                new_board.bit_att ^= att_capt;
+                new_board
+            }
+            PieceType::King => {
+
+                let att_capt = self.board.att_capture(action);
+
+                let mut new_board = self.board.king_force_move(action);
+                new_board.bit_att ^= att_capt;
+                new_board
+            }
+        };
+
+        let new_repetition_counter = self.short_history.update_repetition_counter(&self.board, self.repetition_counter);
+
+        let mut new_game = Game {
+            board: new_board,
+            state: self.state.clone(),
+            short_history: new_short_history,
+            repetition_counter: new_repetition_counter,
+        };
+        
+        // Check for game termination
+        let postfix = if let Some(r) = new_game.update_if_lost(side) {
+            (Some(r), None)
+        } else if let (Some(rr), v) = new_game.update_victory(side, pass_next_moves) {
+            (Some(rr), v)
+        } else { (None, None)
+        };
+
+        new_game.forward_turn();
+
+        Ok((new_game, postfix.0, postfix.1))
+
+    }
+
     pub fn check_and_do_and_update_whole_mut(&mut self, action: &MoveOnBoardEleven, piece_type: Option<PieceType>, pass_next_moves: bool)
         -> Result<(Option<ReasonForTermination>, Option<Vec<MoveOnBoardEleven>>), InvalidActionError> {
 
@@ -855,6 +937,8 @@ impl Game{
 
             self.do_move_and_update_whole_mut(action, Some(piece_type), pass_next_moves)
     }
+
+
 }
 
 pub fn parse_repetition_counter(rep_c: RepetitionCounter) -> [u8; 4]{

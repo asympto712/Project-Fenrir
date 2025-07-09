@@ -1,7 +1,7 @@
 use rand::prelude::*;
 use std::{fmt::Display};
 
-use bitboard::eleven::{self, BoardEleven, ElevenBoardPositionalEncoding, MoveOnBoardEleven, Shift, PRESETX1, BLACKMASK, ONLY_EDGES};
+use bitboard::eleven::{BoardEleven, ElevenBoardPositionalEncoding, MoveOnBoardEleven, Shift, BLACKMASK, ONLY_EDGES};
 use bitflags::{bitflags, bitflags_match};
 
 use crate::game::{PieceType, Side, InvalidActionError};
@@ -155,12 +155,12 @@ impl TaflBoardEleven{
 
     pub fn generate_random_board<T>(rng: &mut T) -> Self
     where T: Rng{
-        let king_loc = (rng.random_range(0..11), rng.random_range(0..11));
+        let king_loc = (rng.gen_range(0..11), rng.gen_range(0..11));
         let mut king_board: BoardEleven = BoardEleven::from([0,0,0]);
         king_board.flip_target_bit_mut(&ElevenBoardPositionalEncoding::new(king_loc.0, king_loc.1));
         let hostile = BoardEleven::from(ELEVENBOARDPRESET_STD_HOS);
         let mut mask = hostile.complement() & king_board.complement();
-        if rng.random_bool(0.5){
+        if rng.gen_bool(0.5){
             let att_board = BoardEleven::random(rng) & mask;
             mask &= att_board.complement();
             let def_board = BoardEleven::random(rng) & mask;
@@ -618,7 +618,7 @@ fn generate_actions_for_attsoldiers_works() {
 
 #[test]
 fn list_captures_works() {
-    let mut rng = rand::rng();
+    let mut rng = thread_rng();
     let b = TaflBoardEleven::generate_random_board(&mut rng);
     println!("{}", b);
     let list = b.list_att_captures();
