@@ -10,10 +10,15 @@ use bitboard::eleven::{BoardEleven, ElevenBoardPositionalEncoding, MoveOnBoardEl
 
 // external
 use color_eyre::eyre::{ErrReport, Result};
-use rand::rng;
+use rand::prelude;
 
+use rand::thread_rng;
+use rand::Rng;
 #[cfg(feature = "torch")]
 use tch::Tensor;
+#[cfg(feature = "torch")]
+use tch::{Kind, Device};
+
 #[cfg(feature = "torch")]
 use libc::c_void;
 // #[cfg(feature = "torch")]
@@ -23,30 +28,100 @@ use libc::c_void;
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum MoveVector {
     S(u8),
-    W(u8),
+    E(u8),
 } 
 
 impl MoveVector {
     pub fn from_index(i: i64) -> Self {
         assert!(0 <= i && i < 20);
         if i < 10 { Self::S((i + 1).try_into().unwrap()) }
-        else { Self::W( (i + 1 - 10).try_into().unwrap())}
+        else { Self::E( (i + 1 - 10).try_into().unwrap())}
     }
 
     pub fn to_index(self) -> i64 {
         match self {
             MoveVector::S(i) => (i - 1).into(),
-            MoveVector::W(i) => (i + 10 - 1).into()
+            MoveVector::E(i) => (i + 10 - 1).into()
+        }
+    }
+
+    pub fn rotate90(&self) -> Self {
+        match self {
+            MoveVector::S(n) => MoveVector::E(*n),
+            MoveVector::E(n) => MoveVector::S(11 - n),
+        }
+    }
+
+    pub fn rotate180(&self) -> Self {
+        match self {
+            MoveVector::S(n) => MoveVector::S(11 - n),
+            MoveVector::E(n) => MoveVector::E(11 - n),
+        }
+    }
+
+    pub fn rotate270(&self) -> Self {
+        match self {
+            MoveVector::S(n) => MoveVector::E(11 - n),
+            MoveVector::E(n) => MoveVector::S(*n),
+        }
+    }
+
+    pub fn rotate_from_i64(&self, k: i64) -> Self {
+        let k = k % 4;
+        let k = if k < 0 { (4 + k) % 4 }
+            else { k };
+        match k {
+            0 => self.clone(),
+            1 => self.rotate90(),
+            2 => self.rotate180(),
+            3 => self.rotate270(),
+            _ => panic!(),
+        }
+    }
+
+    pub fn rotate_from_usize(&self, k: usize) -> Self {
+        let k = k % 4;
+        match k {
+            0 => self.clone(),
+            1 => self.rotate90(),
+            2 => self.rotate180(),
+            3 => self.rotate270(),
+            _ => panic!()
+        }
+    }
+
+    pub fn rotate_randomly(&self) -> Self {
+        let mut rng = thread_rng();
+        let k: usize = rng.gen_range(0..4);
+        self.rotate_from_usize(k)
+    }
+
+    pub fn rotate(&self, rot: Rotation) -> Self {
+        match rot {
+            Rotation::No => self.clone(),
+            Rotation::Do(k) => self.rotate_from_usize(k as usize),
+            Rotation::Random => self.rotate_randomly(),
         }
     }
 }
 
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-struct VectorBasedMove {
+pub struct VectorBasedMove {
     x: u8,
     y: u8,
     v: MoveVector
+}
+
+pub fn eleven_board_coordinate_rotate(x: u8, y: u8, k: u8) -> (u8, u8) {
+    let k = k % 4;
+    match k {
+        0 => (x, y),
+        1 => (y, 10-x),
+        2 => (10-x, 10-y),
+        3 => (10-y, x),
+        _ => panic!()
+    }
 }
 
 pub trait MoveRepresentation {
@@ -79,7 +154,7 @@ impl MoveRepresentation for VectorBasedMove {
         } else {
             // That means dy is zero..
             let true_dx = if dx > 0 { dx } else { 11 + dx };
-            Ok(Self { x, y, v: MoveVector::W(true_dx.try_into().unwrap())})
+            Ok(Self { x, y, v: MoveVector::E(true_dx.try_into().unwrap())})
         }
     }
 
@@ -95,7 +170,7 @@ impl MoveRepresentation for VectorBasedMove {
                     (0, board_len - i)
                 }
             }
-            MoveVector::W(i) => {
+            MoveVector::E(i) => {
                 let offset = self.x;
                 if offset + i < board_len {
                     (offset + i, 0)
@@ -122,6 +197,56 @@ impl VectorBasedMove {
     pub fn to_index(&self) -> i64 {
         ((self.x) as i64 + (self.y * 11) as i64 + MoveVector::to_index(self.v) * 121).into()
     }
+
+    pub fn rotate(&self, rot: Rotation) -> Self {
+        match rot {
+            Rotation::No => self.clone(),
+            Rotation::Do(k) => self.rotate_from_usize(k as usize),
+            Rotation::Random => self.rotate_randomly()
+        }
+    }
+
+    pub fn rotate90(&self) -> Self {
+        let (new_x, new_y) = eleven_board_coordinate_rotate(self.x, self.y, 1);
+        let new_v = self.v.rotate90();
+        Self { x: new_x, y: new_y, v: new_v }
+    }
+    pub fn rotate180(&self) -> Self {
+        let (new_x, new_y) = eleven_board_coordinate_rotate(self.x, self.y, 2);
+        let new_v = self.v.rotate180();
+        Self { x: new_x, y: new_y, v: new_v }
+    }
+    pub fn rotate270(&self) -> Self {
+        let (new_x, new_y) = eleven_board_coordinate_rotate(self.x, self.y, 3);
+        let new_v = self.v.rotate270();
+        Self { x: new_x, y: new_y, v: new_v }
+    }
+    pub fn rotate_from_i64(&self, k: i64) -> Self {
+        let k = k % 4;
+        let k = if k < 0 { k + 4 } else {k};
+        match k {
+            0 => self.clone(),
+            1 => self.rotate90(),
+            2 => self.rotate180(),
+            3 => self.rotate270(),
+            _ => panic!(),
+        }
+    }
+    pub fn rotate_from_usize(&self, k: usize) -> Self {
+        let k = k % 4;
+        match k {
+            0 => self.clone(),
+            1 => self.rotate90(),
+            2 => self.rotate180(),
+            3 => self.rotate270(),
+            _ => panic!(),
+        }
+    }
+    pub fn rotate_randomly(&self) -> Self {
+        let mut rng = thread_rng();
+        let k: usize = rng.gen_range(0..4);
+        self.rotate_from_usize(k)
+    }
 }
 
 pub enum Rotation {
@@ -142,7 +267,8 @@ impl Rotation {
             Rotation::Do(k) => k % 4,
             Rotation::No => 0,
             Rotation::Random => {
-                rand::random_range(0..4)
+                let mut rng = thread_rng();
+                rng.gen_range(0..4)
             }
         }
     }
@@ -156,6 +282,18 @@ pub struct TBoardEleven(tch::Tensor);
 impl TBoardEleven {
     pub fn new(ts: tch::Tensor) -> Self {
         Self(ts)
+    }
+
+    pub fn get_ref(&self) -> &Tensor {
+        &self.0
+    }
+
+    pub fn get(self) -> Tensor {
+        self.0
+    }
+
+    pub fn get_mut(&mut self) -> &mut Tensor {
+        &mut self.0
     }
 
     pub fn from_bitboard(b: &BoardEleven, options: (tch::Kind, tch::Device)) -> Self {
@@ -289,6 +427,65 @@ impl TBoardEleven {
         // (1, 11, 11)
         TBoardEleven(ts)
     }
+
+}
+
+pub struct TAction(Tensor);
+
+impl TAction {
+    pub fn get(&self) -> &Tensor {
+        &self.0
+    }
+
+    pub fn vbm_one_hot_encode(vbm: &VectorBasedMove) -> Self {
+        let index = vbm.to_index();
+        let mut arr: [i64; 11 * 11 * 20] = [0; 11 * 11 * 20];
+        arr[index as usize] = 1;
+        let ts = Tensor::from_slice(&arr);
+        let ts = ts.view([20,11,11]);
+        TAction(ts)
+    }
+    pub fn vec_vbm_one_hot_encode(vbms: &Vec<VectorBasedMove>) -> Self {
+        let mut arr: [i64; 11 * 11 * 20] = [0; 11 * 11 * 20];
+        let indices = vbms.iter()
+            .map(|a| a.to_index());
+        for index in indices {
+            arr[index as usize] = 1;
+        }
+        let ts = Tensor::from_slice(&arr[..]);
+        let ts = ts.view([20,11,11]);
+        debug_assert!(ts.kind() == Kind::Int64);
+        TAction(ts)
+    }
+
+    // returns the actions indicated by the non-zero indices in self. 
+    // self is assumed to be of size (20, 11, 11)
+    // will this work for Boolean Tensor ??
+    pub fn to_vbm(&self) -> Vec<VectorBasedMove> {
+        let mut vbms: Vec<VectorBasedMove> = vec![];
+        let ts = self.0.flatten(0, -1);
+        let nonzero_locations: Tensor = ts.nonzero().flatten(0, -1);
+        // should be a Tensor of size [N]. e.g. [0, 1, 3, 6, ...]
+
+        let vec = Vec::<i64>::try_from(nonzero_locations).unwrap();
+        for idx in vec {
+            vbms.push(VectorBasedMove::from_index(idx));
+        }
+        vbms
+    }
+
+    pub fn vec_vbm_one_hot_encode_boolean(vbms: &Vec<VectorBasedMove>) -> Self {
+        let mut arr: [bool; 11 * 11 * 20] = [false; 11 * 11 * 20];
+        let indices = vbms.iter()
+            .map(|a| a.to_index());
+        for index in indices {
+            arr[index as usize] = true;
+        }
+        let ts = Tensor::from_slice(&arr[..]);
+        let ts = ts.view([20,11,11]);
+        debug_assert!(ts.kind() == Kind::Bool);
+        TAction(ts)
+    }
 }
 
 
@@ -298,10 +495,11 @@ impl TBoardEleven {
 pub fn get_move_from_tensor(ts: &Tensor) -> Result<Vec<VectorBasedMove>>{
     let batch_size = ts.size()[0];
     let tts = ts.view([batch_size, -1]);
-    let idxs = Tensor::zeros(tts.size(), (tch::Kind::Int64, tts.device()));
+    let idxs = Tensor::zeros([batch_size], (tch::Kind::Int64, tts.device()));
     tts.argmax_out(&idxs, 1, false);
     println!("{:?}",idxs.kind());
     // size = (bs)
+    debug_assert_eq!(idxs.size(), [batch_size]);
     let v: Vec<i64> = Vec::try_from(idxs)?;
     let v = v.into_iter().map(|idx| VectorBasedMove::from_index(idx)).collect();
     Ok(v)
@@ -320,7 +518,7 @@ mod tests {
 
     // external
     use color_eyre::eyre::{ErrReport, Result};
-    use rand::rng;
+    use rand::prelude;
 
     #[cfg(feature = "torch")]
     use tch::Tensor;
@@ -354,7 +552,7 @@ mod tests {
     #[cfg(feature = "torch")]
     #[test]
     fn tboard_eleven_from_bitboard_works() {
-        let mut rng = rng();
+        let mut rng = thread_rng();
         let b = BoardEleven::random(&mut rng);
         println!("{}", b);
         let tb = TBoardEleven::from_bitboard(&b, (tch::Kind::Float, tch::Device::Cpu));
@@ -365,7 +563,7 @@ mod tests {
     #[cfg(feature = "torch")]
     #[test]
     fn tboard_eleven_from_taflboard_works() {
-        let mut rng = rng();
+        let mut rng = thread_rng();
         let b = TaflBoardEleven::generate_random_board(&mut rng);
         println!("{}", b);
         let tb = TBoardEleven::from_game_board(&b, (tch::Kind::Float, tch::Device::Cpu));
@@ -377,7 +575,7 @@ mod tests {
     #[test]
     fn get_vnet_input_works() {
         use game::game::Game;
-        let mut rng = rng();
+        let mut rng = thread_rng();
         let mut game = Game::default();
         let device = if tch::Cuda::is_available() { tch::Device::Cuda(0)} else {tch::Device::Cpu};
         let kind = tch::Kind::Float;
@@ -391,7 +589,7 @@ mod tests {
     #[test]
     fn get_pnet_input_works() {
         use game::game::Game;
-        let mut rng = rng();
+        let mut rng = thread_rng();
         let mut game = Game::default();
         let device = if tch::Cuda::is_available() { tch::Device::Cuda(0)} else {tch::Device::Cpu};
         let kind = tch::Kind::Float;
@@ -400,5 +598,72 @@ mod tests {
         assert!(pnet_input.0.is_contiguous());
         println!("{:?}", pnet_input.0);
     }
+
+    #[cfg(feature = "torch")]
+    #[test]
+    fn move_vector_rotation_fidelity_check() {
+        let mv: MoveVector = MoveVector::E(3);
+        let rotated90 = mv.rotate90();
+        let rotated180 = mv.rotate180();
+        let rotated270 = mv.rotate270();
+        assert_eq!(rotated90.rotate90(), rotated180);
+        assert_eq!(rotated90.rotate180(), rotated270);
+        assert_eq!(rotated90.rotate270(), mv);
+        assert_eq!(rotated180.rotate90(), rotated270);
+        assert_eq!(rotated180.rotate180(), mv);
+        assert_eq!(rotated270.rotate90(), mv);
+        assert_eq!(rotated270.rotate180(), rotated90);
+        assert_eq!(rotated270.rotate270(), rotated180);
+
+    }
+
+    #[cfg(feature = "torch")]
+    #[test]
+    fn tensor_action_translation_works() {
+        let mut vec_vbm: Vec<VectorBasedMove> = vec![];
+        vec_vbm.push(VectorBasedMove::new(2, 3, MoveVector::E(3)));
+        vec_vbm.push(VectorBasedMove::new(10, 2, MoveVector::S(3)));
+        vec_vbm.push(VectorBasedMove::new(0, 6, MoveVector::E(10)));
+        let ta: TAction = TAction::vec_vbm_one_hot_encode(&vec_vbm);
+        let translated_back: Vec<VectorBasedMove> = ta.to_vbm();
+        println!("{:?}", translated_back);
+        for vbm in &vec_vbm {
+            assert!(translated_back.contains(vbm));
+        }
+        let bool_ta: TAction = TAction::vec_vbm_one_hot_encode_boolean(&vec_vbm);
+        let translated_back_from_bool_ta: Vec<VectorBasedMove> = bool_ta.to_vbm();
+        println!("{:?}", translated_back_from_bool_ta);
+        for vbm in &vec_vbm {
+            assert!(translated_back_from_bool_ta.contains(vbm));
+        }
+
+    }
+
+    #[cfg(feature = "torch")]
+    #[test]
+    fn vbm_to_and_from_index_works() {
+        let vbm: VectorBasedMove = VectorBasedMove::new(2, 3, MoveVector::E(3));
+        let index = vbm.to_index();
+        let vbm_back = VectorBasedMove::from_index(index);
+        assert_eq!(vbm, vbm_back);
+    }
+
+    #[cfg(feature = "torch")]
+    #[test]
+    fn tensor_get_nonzero_works() {
+        let vbm: VectorBasedMove = VectorBasedMove::new(2, 3, MoveVector::E(3));
+        let index = vbm.to_index();
+        let mut arr: [i64; 20*11*11] = [0i64; 20*11*11];
+        arr[index as usize] = 1;
+        let ts = Tensor::from_slice(&arr[..]);
+        println!("{:?}", ts.size());
+        let nonzero = ts.nonzero();
+        // I don't know why, but size is [1,1]
+        println!("{:?}", nonzero.size());
+        let nonzero: Vec<i64> = Vec::<i64>::try_from(nonzero.flatten(0, -1)).unwrap();
+        println!("{:?}", nonzero);
+        assert_eq!(index, nonzero[0]);
+    }
+
 }
 

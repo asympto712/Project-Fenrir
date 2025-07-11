@@ -7,20 +7,22 @@
 //external
 use tch;
 use tch::nn;
+use tch::Tensor;
+use tch::nn::ConvConfigND;
+use tch::nn::Module;
 use serde::Deserialize;
 use color_eyre::eyre::ErrReport;
+use color_eyre::eyre::Result;
 
 //internal
 use game::board::TaflBoardEleven;
 use bitboard::eleven::MoveOnBoardEleven;
-use tch::nn::ConvConfigND;
-use tch::nn::Module;
 
 // std
 use std::fs;
 
 #[derive(Debug, Deserialize)]
-struct ModelConfig {
+pub struct ModelConfig {
     learning_rate: f32,
     batch_size: i64,
     input_history_length: usize,
@@ -33,6 +35,14 @@ struct ModelConfig {
     in_features: i64,
     conv_filters: i64,
     kernel_size: i64,
+}
+
+impl ModelConfig {
+    pub fn load_from_toml(path: &str) -> Result<Self>{
+        let config_str = fs::read_to_string(path)?;
+        let params: ModelConfig = toml::from_str(&config_str)?;
+        Ok(params)
+    }
 }
 
 fn load_model_config(path: &str) 
@@ -120,7 +130,10 @@ fn value_head(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
     seq
 }
 
-struct PVNet {
+pub type Evaluation = (Tensor, Tensor);
+
+#[derive(Debug)]
+pub struct PVNet {
     base_net: nn::Sequential,
     policy_head: nn::Sequential,
     value_head: nn::Sequential,
@@ -137,7 +150,7 @@ impl PVNet {
 }
 
 impl PVNet {
-    pub fn infer(&self, xs: &tch::Tensor) -> (tch::Tensor, tch::Tensor) {
+    pub fn infer(&self, xs: &tch::Tensor) -> Evaluation {
         let xs = self.base_net.forward(xs);
         let p = self.policy_head.forward(&xs);
         let v = self.value_head.forward(&xs);
