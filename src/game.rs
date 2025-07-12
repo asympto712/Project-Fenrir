@@ -63,7 +63,7 @@ impl Display for ReasonForTermination {
 // UPDATE: 2nd bit is 1 if the game is over, regardless of when that happened.
 // 3rd ~ 8th bits: so far no use
 // 9~16th bits: turn counter (maybe useful at some point)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GameState(u16);
 
 bitflags! {
@@ -202,7 +202,7 @@ impl std::error::Error for InvalidActionError {}
 // But I decided that the move that would result in a 3rd repetition should simply  be rejected.
 // So, a player loses if she has only one move and that move would result in a 3rd repetition.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Game{
     pub board: TaflBoardEleven,
     pub state: GameState,
@@ -231,6 +231,14 @@ type RepetitionCounter = u8;
 
 #[derive(Debug, Clone)]
 pub struct ShortHistory (ArrayDeque<TaflBoardEleven, 4, Wrapping> );
+
+impl PartialEq for ShortHistory {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter()
+            .zip(other.0.iter())
+            .all(|(a,b)| a.equals(b))
+    }
+}
 
 impl ShortHistory{
     pub fn push_front(&mut self, board: TaflBoardEleven) 
@@ -338,6 +346,23 @@ impl Game{
     pub fn init_std() -> Self{
         let board = TaflBoardEleven::init_std();
         Self::from_board(board, Side::Att)
+    }
+
+    // only for cheap creation of dummy variable
+    #[inline]
+    pub fn ghastly() -> Self {
+        let board = TaflBoardEleven::new(
+            BoardEleven::ghastly(),
+            BoardEleven::ghastly(),
+            BoardEleven::ghastly(),
+            BoardEleven::ghastly()
+        );
+        Self { 
+            board,
+            state: GameState(0),
+            short_history: ShortHistory::new(),
+            repetition_counter: 0
+        }
     }
 
     // When the action would result in the repetition, returns true. If not, (even when the action is invalid), returns false.
@@ -698,7 +723,7 @@ impl Game{
     }
 
     pub fn forward_turn(&mut self) {
-        self.state.incre_turn_count();
+        self.state.incre_turn_count_mut();
         self.state.change_side_mut();
     } 
 

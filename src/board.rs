@@ -19,6 +19,12 @@ pub struct TaflBoardEleven{
     pub hostile: BoardEleven
 }
 
+impl PartialEq for TaflBoardEleven {
+    fn eq(&self, other: &Self) -> bool {
+        self.equals(other)
+    }
+}
+
 impl TaflBoardEleven{
     pub fn init_std() -> Self{
         let bit_att = BoardEleven::from(ELEVENBOARDPRESET_STD_ATT);
