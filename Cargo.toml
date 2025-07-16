@@ -21,6 +21,7 @@ rayon = "1"
 crossbeam = "0.8"
 arraydeque = "0.5"
 rv = "0.18"
+bincode = "2"
 
 
 [[bin]]
