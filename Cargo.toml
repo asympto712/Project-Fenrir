@@ -23,9 +23,4 @@ arraydeque = "0.5"
 rv = "0.18"
 bincode = "2"
 
-
-[[bin]]
-name = "train"
-path = "./src/train.rs"
-
 [lib]

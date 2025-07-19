@@ -4,12 +4,16 @@
 #![cfg(feature = "torch")]
 #![allow(unused)]
 #![allow(dead_code)]
+use bincode::config::Config;
 //external
 use tch;
 use tch::nn;
+use tch::nn::linear;
 use tch::Tensor;
 use tch::nn::ConvConfigND;
 use tch::nn::Module;
+use tch::nn::ModuleT;
+use tch::nn::FuncT;
 use serde::Deserialize;
 use color_eyre::eyre::ErrReport;
 use color_eyre::eyre::Result;
@@ -18,8 +22,20 @@ use color_eyre::eyre::Result;
 use game::board::TaflBoardEleven;
 use bitboard::eleven::MoveOnBoardEleven;
 
+use std::fmt::format;
 // std
 use std::fs;
+
+// It seems like theoretically, applying weight decay such as L2 regularization does not make much sense,
+// although the degradation effect (or lack thereof) on the actual performance by doing so is debatable.
+// For reference, official pytorch does include BN weight and bias in the weight decay group.
+// If one decide to exclude them, one can simply call .set_group method on the Path instance to pass to the batch-norm creation function
+// and adjust the weight decay group in the optimizer accordingly.
+const NO_WEIGHT_DECAY_GROUP: usize = 1;
+
+pub trait PVModel {
+    fn evaluate_t(xs: &Tensor, train: bool) -> Evaluation;
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
@@ -52,37 +68,195 @@ fn load_model_config(path: &str)
     Ok(params)
 }
 
+
+// Expects to use odd kernel size. Keep the 2d dimension unchanged by padding
+fn conv_config(ksize: i64) -> nn::ConvConfig {
+    let pad: i64 = (ksize - 1) / 2;
+    nn::ConvConfig {
+        stride: 1,
+        padding: pad,
+        ..Default::default()
+    }
+}
+
+// in default, cudNN is enabled, affine learnable transformation is on, and initial value is based on that BN paper (2016)
+fn bn_config() -> nn::BatchNormConfig {
+    nn::BatchNormConfig {
+        ..Default::default()
+    }
+}
+
+// function that defines residual block specified in AlphaZero. Kernel size is 3 across the board
+// Assumes that in_feature = out_feature
+fn res_block(
+    vs: &nn::Path,
+    features: i64,
+    ksize: i64,
+) -> impl ModuleT {
+    
+    // setting the weight and bias of batch norm as exception for weight decay
+    let vs_no_weight_decay = vs.set_group(NO_WEIGHT_DECAY_GROUP);
+    let conv1 = nn::conv2d(vs / "conv1", features, features, ksize, conv_config(ksize));
+    let bn1 = nn::batch_norm2d(vs_no_weight_decay / "bn1", features, bn_config());
+    let conv2 = nn::conv2d(vs / "conv2", features,features, ksize, conv_config(ksize));
+    let bn2 = nn::batch_norm2d(vs_no_weight_decay / "bn2", features, bn_config());
+    nn::func_t(move |xs, train| {
+        let ys = xs.apply(&conv1).apply_t(&bn1, train).relu().apply(&conv2).apply_t(&bn2, train);
+        (xs + ys).relu()
+    })
+
+}
+
 fn conv_block(
+    vs: &nn::Path,
+    in_features: i64,
+    out_features: i64,
+    ksize: i64,
+) -> impl ModuleT {
+
+    let vs_no_weight_decay = vs.set_group(NO_WEIGHT_DECAY_GROUP);
+    let conv = nn::conv2d(vs / "conv1", in_features, out_features, ksize, conv_config(ksize));
+    let bn = nn::batch_norm2d(vs_no_weight_decay / "bn1", out_features, bn_config());
+    nn::func_t(move |xs, train| {
+        xs.apply(&conv).apply_t(&bn, train).relu()
+    })
+
+}
+
+fn base_tower(
+    vs: &nn::Path,
+    config: &ModelConfig
+) -> nn::SequentialT {
+
+    let mut seq = nn::seq_t();
+    seq.add(conv_block(vs / "block0", config.in_features, config.conv_filters, config.kernel_size));
+    for i in 1..=config.num_convblocks {
+
+        seq.add(res_block(vs / &format!("block{}", i), config.conv_filters, config.kernel_size));
+    }
+    seq
+}
+
+fn fenrir_policy_head(
+    vs: &nn::Path,
+    config: &ModelConfig
+) -> nn::SequentialT {
+
+    nn::seq_t()
+        .add(conv_block(vs / "conv layer", config.conv_filters, config.conv_filters, config.kernel_size))
+        .add(conv_block(vs / "logit layer", config.conv_filters, config.policy_out_features, 1))
+}
+
+fn fenrir_value_head(
+    vs: &nn::Path,
+    config: &ModelConfig
+) -> nn::SequentialT {
+
+    nn::seq_t()
+        .add(nn::conv2d(vs / "conv layer", config.conv_filters, 1, 1, Default::default())) // (BS, 1, N, N)
+        .add_fn(|ts| ts.view([ts.size()[0], -1])) // (BS, N * N)
+        .add(linear(vs / "linear", config.board_size * config.board_size, 256, Default::default()))
+        .add_fn(|ts| ts.relu())
+        .add_fn(linear(vs / "linear2", 256, 1, Default::default()))
+        .add_fn(|ts| ts.tanh())
+}
+
+struct GeneralPVDualModel {
+    base: nn::SequentialT,
+    p_head: nn::SequentialT,
+    v_head: nn::SequentialT,
+    config: ModelConfig
+}
+
+impl GeneralPVDualModel {
+    fn new(vs: &nn::Path, config: ModelConfig) -> Self {
+
+        let base = base_tower(vs / "base", &config);
+        let p_head = fenrir_policy_head(vs / "p-head", &config);
+        let v_head = fenrir_value_head(vs / "v-head", &config);
+        Self { base, p_head, v_head, config}
+    }
+}
+
+impl PVModel for GeneralPVDualModel {
+    // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
+    fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
+        
+        let v = xs.split_sizes([-1,1], 1);
+        let minus_side = v[0].contiguous();
+        let based = minus_side.apply_t(&self.base, train);
+        // (BS, Conv_filters, N, N)
+        let base_output = Tensor::cat(&[based, v[1]], 1);
+        let base_output = base_output.contiguous(); // Again, not sure if needed
+        let logits = base_output.apply_t(&self.p_head, train);
+        let value = base_output.apply_t(&self.v_head, train);
+
+        if !train {
+            let likelihood = logits
+                .view([logits.size1().unwrap(), -1])
+                .softmax(1, Kind::Float)
+                .view([logits.size1().unwrap(), self.config.policy_out_features, self.config.board_size, self.config.board_size]);
+            (likelihood, value)
+        } else {
+            (logits, value)
+        }
+    }
+}
+
+
+struct GeneralPVSepModel {
+    p_base: nn::SequentialT,
+    v_base: nn::SequentialT,
+    p_head: nn::SequentialT,
+    v_head: nn::SequentialT,
+    config: ModelConfig
+}
+
+impl GeneralPVSepModel {
+    fn new(vs: &nn::Path, config: ModelConfig) -> Self {
+        
+        let p_base = base_tower(vs / "p-base", &config);
+        let v_base = base_tower(vs / "v-base", &config);
+        let p_head = fenrir_policy_head(vs / "p-head", &config);
+        let v_head = fenrir_value_head(vs / "v-head", &config);
+        Self { p_base, v_base, p_head, v_head, config}
+    }
+}
+
+impl PVModel for GeneralPVSepModel {
+    // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
+    fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
+
+        let v = xs.split_sizes([-1, 1], 1);
+        let minus_side = v[0].contiguous(); // Might not need this since conv2D automatically creates new contiguous tensor (needs testing)
+        let logits = xs.apply_t(&self.p_base, train).apply_t(&self.p_head, train);
+        let value = minus_side.apply_t(&self.v_base, train).apply_t(&self.v_head, train);
+        if !train {
+            let likelihood = logits
+                .view([logits.size1().unwrap(), -1])
+                .softmax(1, Kind::Float)
+                .view([logits.size1().unwrap(), self.config.policy_out_features, self.config.board_size, self.config.board_size]);
+            (likelihood, value)
+        } else {
+            (logits, value)
+        }
+    }
+
+}
+
+
+
+fn alpha_go_conv_block(
     vs: &nn::Path,
     in_features: i64,
     out_features: i64, 
     ksize: i64,
     id: usize) -> nn::Conv2D {
 
-    nn::conv2d(vs / &format!("conv block {}", id), in_features, out_features, ksize, Default::default())
-
+    nn::conv2d(vs / &format!("conv block {}", id), in_features, out_features, ksize, conv_config(ksize))
 }
-// pub struct ConvBlock {
-//     conv: nn::Conv2D,
-// }
 
-// impl ConvBlock {
-//     fn new(vs: &nn::Path, config: &ModelConfig) -> Self {
-//         let i = config.in_features;
-//         let o = config.conv_filters;
-//         let k = config.kernel_size;
-//         let conv1 = nn::conv2d(vs,i,o,k,Default::default());
-//     }
-// }
-
-// impl nn::ModuleT for ConvBlock {
-//     fn forward_t(&self, xs: &tch::Tensor, train: bool) -> tch::Tensor {
-//         xs.apply(&self.conv)
-//             .relu()
-//     }
-// } 
-
-fn base_net(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
+fn alpha_go_base_net(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
 
     let mut seq = nn::seq();
     for i in 0..config.num_convblocks {
@@ -91,8 +265,7 @@ fn base_net(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
         let out_features = config.conv_filters;
         let ksize = config.kernel_size;
         let id = i + 1;
-        seq = seq.add(conv_block(vs, in_features, out_features, ksize, id));
-        seq = seq.add_fn(move |ts| ts.zero_pad2d((ksize - 1) / 2, (ksize - 1) / 2, (ksize - 1) / 2, (ksize - 1) / 2));
+        seq = seq.add(alpha_go_conv_block(vs, in_features, out_features, ksize, id));
         seq = seq.add_fn(|ts| ts.relu());
 
     }
@@ -101,7 +274,7 @@ fn base_net(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
 
 }
 
-fn policy_head(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
+fn alpha_go_policy_head(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
     
     let mut seq = nn::seq();
     let base_out_features = config.conv_filters;
@@ -116,7 +289,7 @@ fn policy_head(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
     seq
 }
 
-fn value_head(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
+fn alpha_go_value_head(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
     let mut seq = nn::seq();
     let base_out_features = config.conv_filters;
     let board_size = config.board_size;

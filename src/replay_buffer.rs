@@ -135,7 +135,7 @@ impl SAR {
 
 
 #[derive(Debug, Default)]
-struct Episode {
+pub struct Episode {
     pub episode: Vec<EpisodeUnit>
 }
 
@@ -160,7 +160,7 @@ impl Episode {
 }
 
 #[derive(Debug, Default, bincode::Encode, bincode::Decode)]
-struct ReplayBuffer {
+pub struct ReplayBuffer {
     pub replay_buffer: Mutex<VecDeque<EpisodeUnit>>,
     pub capacity: usize,
 }

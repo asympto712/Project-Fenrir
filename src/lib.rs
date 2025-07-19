@@ -8,6 +8,8 @@ pub mod replay_buffer;
 pub mod agent;
 #[cfg(feature = "torch")]
 pub mod self_play;
+#[cfg(feature = "torch")]
+pub mod train;
 
 pub mod utils;
 
