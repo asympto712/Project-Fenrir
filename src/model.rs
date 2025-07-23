@@ -9,6 +9,8 @@ use bincode::config::Config;
 use tch;
 use tch::nn;
 use tch::nn::linear;
+use tch::nn::VarStore;
+use tch::Device;
 use tch::Tensor;
 use tch::nn::ConvConfigND;
 use tch::nn::Module;
@@ -22,6 +24,7 @@ use color_eyre::eyre::Result;
 use game::board::TaflBoardEleven;
 use bitboard::eleven::MoveOnBoardEleven;
 
+use std::collections::HashMap;
 use std::fmt::format;
 // std
 use std::fs;
@@ -34,7 +37,9 @@ use std::fs;
 const NO_WEIGHT_DECAY_GROUP: usize = 1;
 
 pub trait PVModel {
-    fn evaluate_t(xs: &Tensor, train: bool) -> Evaluation;
+    pub fn new(vs: &nn::Path, config: ModelConfig) -> Self; 
+    pub fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation;
+    pub fn device(&self) -> Device;
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,20 +170,18 @@ struct GeneralPVDualModel {
     base: nn::SequentialT,
     p_head: nn::SequentialT,
     v_head: nn::SequentialT,
-    config: ModelConfig
-}
-
-impl GeneralPVDualModel {
-    fn new(vs: &nn::Path, config: ModelConfig) -> Self {
-
-        let base = base_tower(vs / "base", &config);
-        let p_head = fenrir_policy_head(vs / "p-head", &config);
-        let v_head = fenrir_value_head(vs / "v-head", &config);
-        Self { base, p_head, v_head, config}
-    }
+    config: ModelConfig,
+    device: Device,
 }
 
 impl PVModel for GeneralPVDualModel {
+    fn new(vs: &nn::Path, config: ModelConfig) -> Self {
+        
+        let base = base_tower(vs / "base", &config);
+        let p_head = fenrir_policy_head(vs / "p-head", &config);
+        let v_head = fenrir_value_head(vs / "v-head", &config);
+        Self { base, p_head, v_head, config, device: vs.device()}
+    }
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
         
@@ -201,29 +204,31 @@ impl PVModel for GeneralPVDualModel {
             (logits, value)
         }
     }
+
+    fn device(&self) -> Device {
+        self.device
+    }
 }
 
 
-struct GeneralPVSepModel {
+struct GeneralPVSepModel<'a> {
     p_base: nn::SequentialT,
     v_base: nn::SequentialT,
     p_head: nn::SequentialT,
     v_head: nn::SequentialT,
-    config: ModelConfig
+    config: ModelConfig,
+    device: Device,
 }
 
-impl GeneralPVSepModel {
+impl PVModel for GeneralPVSepModel {
     fn new(vs: &nn::Path, config: ModelConfig) -> Self {
         
         let p_base = base_tower(vs / "p-base", &config);
         let v_base = base_tower(vs / "v-base", &config);
         let p_head = fenrir_policy_head(vs / "p-head", &config);
         let v_head = fenrir_value_head(vs / "v-head", &config);
-        Self { p_base, v_base, p_head, v_head, config}
+        Self { p_base, v_base, p_head, v_head, config, device: vs.device()}
     }
-}
-
-impl PVModel for GeneralPVSepModel {
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
 
@@ -240,6 +245,10 @@ impl PVModel for GeneralPVSepModel {
         } else {
             (logits, value)
         }
+    }
+
+    fn device(&self) -> Device {
+        self.device
     }
 
 }

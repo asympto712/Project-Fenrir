@@ -1,4 +1,7 @@
 #![allow(unused)]
+use std::borrow::Borrow;
+use std::process::id;
+
 // internal
 use game::board::TaflBoardEleven;
 use game::game::Game;
@@ -21,8 +24,28 @@ use tch::{Kind, Device};
 
 #[cfg(feature = "torch")]
 use libc::c_void;
+
+use crate::agent::PosteriorDist;
 // #[cfg(feature = "torch")]
 // use tch::Tensor::C_Tensor;
+
+#[derive(Debug, Clone)]
+pub struct IndexPolicy(Vec<(i64, f32)>);
+
+impl From<PosteriorDist> for IndexPolicy {
+    fn from(value: PosteriorDist) -> Self {
+        let v = value.into_iter()
+            .map(|(borrow_action, p)| {
+                let mbe = Borrow::<MoveOnBoardEleven>::borrow(&borrow_action);
+                let vbm = VectorBasedMove::convert_from(mbe).unwrap();
+                (vbm.to_index(), p)
+            })
+            .collect::<Vec<(i64, f32)>>();
+        Self(v)
+    }
+}
+
+
 
 // Directional move. Assumes Periodical Boundary
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -437,6 +460,10 @@ impl TAction {
         &self.0
     }
 
+    pub fn inner(self) -> Tensor {
+        self.0
+    }
+
     pub fn vbm_one_hot_encode(vbm: &VectorBasedMove) -> Self {
         let index = vbm.to_index();
         let mut arr: [i64; 11 * 11 * 20] = [0; 11 * 11 * 20];
@@ -485,6 +512,16 @@ impl TAction {
         let ts = ts.view([20,11,11]);
         debug_assert!(ts.kind() == Kind::Bool);
         TAction(ts)
+    }
+
+    pub fn from_index_policy(idx_policy: &IndexPolicy) -> Self {
+        let mut slice = &mut [0.0f32; 20 * 11 * 11];
+        for (idx, value) in idx_policy.0 {
+            slice[idx as usize] = value;
+        }
+        let mut ts = Tensor::from_slice(slice);
+        ts.view([20, 11, 11]);
+        Self(ts)
     }
 }
 

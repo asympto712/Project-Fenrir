@@ -10,6 +10,8 @@ pub mod agent;
 pub mod self_play;
 #[cfg(feature = "torch")]
 pub mod train;
+#[cfg(feature = "mpi")]
+pub mod run;
 
 pub mod utils;
 

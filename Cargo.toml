@@ -4,15 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["torch"]
+default = ["torch", "mpi"]
 no-torch = []
 torch = ["dep:tch", "dep:libc"]
+mpi = ["dep:mpi"]
 
 [dependencies]
 bitboard = { path = "../bitboard"}
 game = { path = "../game" }
 tch = {version = "0.20.0" , optional = true }
 libc = {version = "0.2", optional = true }
+mpi = {version = "0.8", features = ["derive"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 color-eyre = "0.6"

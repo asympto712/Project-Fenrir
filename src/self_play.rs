@@ -3,15 +3,15 @@
 #![cfg(feature = "torch")]
 
 //internal
-use game::game::{Game, GameState};
+use game::game::{Game, GameState, Side};
 use game::board::{TaflBoardEleven};
 use bitboard::eleven::{ElevenBoardPositionalEncoding, MoveOnBoardEleven};
 use crate::{model, utils};
-use crate::replay_buffer;
-use crate::model::ModelConfig;
+use crate::replay_buffer::{self, Episode, EpisodeUnit, ReplayBuffer};
+use crate::model::{ModelConfig, PVModel};
 use crate::model::PVNet;
 use crate::model::Evaluation;
-use crate::agent::{self, Actor, MCTSTree, Temperature};
+use crate::agent::{self, Actor, MCTSConfig, MCTSTree, Temperature, PosteriorDist};
 
 //external
 use tch::Tensor;
@@ -30,6 +30,9 @@ use std::thread::{self, current};
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
+use std::ffi::OsString;
+use std::path;
+use std::convert::AsRef;
 
 // needs experimenting
 const BATCHSIZE: i64 = 64;
@@ -174,9 +177,9 @@ pub type Query = Tensor;
 
 // A struct that manages model allocation, receiving inference requests, collection and redistribution of results.
 #[derive(Debug)]
-pub struct Directer {
+pub struct Directer<P: PVModel> {
     device_allocation: Vec<Device>,
-    modules: Vec<PVNet>,
+    modules: Vec<P>,
     receiver: Receiver<(Request, usize)>,
     // each element holds one batch for one model.
     pub batches: Vec<Batch>,
@@ -186,12 +189,12 @@ pub struct Directer {
     model_lookup: HashMap::<String, usize>
 }
 
-impl Directer {
+impl<P: PVModel> Directer<P: PVModel> {
     // Creates a new instance of Directer along with the Sender corresponding to its receiver.
-    pub fn new(config: &ModelConfig, new_model_count: i64, trained_models: Vec<(i64, String)>, batch_capacity: usize) -> Result<(Self, Sender<(Request, usize)>)> {
+    pub fn new<P: PVModel, S: AsRef<OsString>>(config: &ModelConfig, new_model_count: i64, trained_models: Vec<(i64, S)>, batch_capacity: usize) -> Result<(Self, Sender<(Request, usize)>)> {
 
         let mut device_allocation: Vec<Device> = vec![];
-        let mut modules: Vec<PVNet> = vec![];
+        let mut modules: Vec<P> = vec![];
         let mut model_lookup = HashMap::<String, usize>::new();
         let mut module_ind: Vec<Vec<usize>> = vec![];
 
@@ -203,8 +206,10 @@ impl Directer {
 
         let mut model_id: usize = 0;
         let mut cuda_index: usize = 0;
-        for (id_minus_one, (n, path)) in trained_models.iter().enumerate()
+        for (id_minus_one, (n, ostr)) in trained_models.iter().enumerate()
         {
+            let path = path::Path::new(ostr.as_ref());
+            debug_assert!(path.is_file());
             let mut module_indices = vec![];
             for _ in 0..*n
             {
@@ -213,7 +218,7 @@ impl Directer {
                     let mut vs = nn::VarStore::new(Device::Cpu);
                     device_allocation.push(Device::Cpu);
                     vs.load(path)?;
-                    PVNet::model(&vs.root(), config)
+                    P::new(&vs.root(), config)
                 } 
                 else 
                 {
@@ -222,7 +227,7 @@ impl Directer {
                     vs.load(path)?;
                     cuda_index += 1;
                     cuda_left -= 1;
-                    PVNet::model(&vs.root(), config)
+                    P::new(&vs.root(), config)
                 };
                 module_indices.push(modules.len());
                 modules.push(net);
@@ -233,22 +238,36 @@ impl Directer {
         }
 
         let mut new_module_indices = vec![];
-        for _ in 0..new_model_count {
-            let net = if cuda_left == 0 
-            {
-                let vs = nn::VarStore::new(Device::Cpu);
-                device_allocation.push(Device::Cpu);
-                PVNet::model(&vs.root(), config)
-            } else 
-            {
-                let vs = nn::VarStore::new(Device::Cuda(cuda_index));
-                device_allocation.push(Device::Cuda(cuda_index));
-                cuda_index += 1;
-                cuda_left -= 1;
-                PVNet::model(&vs.root(), config)
-            };
-            new_module_indices.push(modules.len());
-            modules.push(net);
+        if new_model_count > 0 {
+
+            let original_vs = nn::VarStore::new(Device::Cpu);
+            // define a dummy model just so that original_vs will be properly initialized
+            let dummy_model = P::new(&original_vs.root(), config);
+
+            for _ in 0..new_model_count {
+                let net = if cuda_left == 0 
+                {
+                    let mut vs = nn::VarStore::new(Device::Cpu);
+                    let replica = P::new(&vs.root(), config);
+                    vs.copy(&original_vs);
+                    device_allocation.push(Device::Cpu);
+                    replica
+                } else 
+                {
+                    let mut vs = nn::VarStore::new(Device::Cpu);
+                    let replica = P::new(&vs.root(), config);
+                    vs.copy(&original_vs);
+                    vs.set_device(Device::Cuda(cuda_index));
+                    device_allocation.push(Device::Cuda(cuda_index));
+                    cuda_index += 1;
+                    cuda_left -= 1;
+                    replica
+                };
+                new_module_indices.push(modules.len());
+                modules.push(net);
+            }
+            
+
         }
         model_lookup.insert("new".to_owned(), model_id);
         module_ind.push(new_module_indices);
@@ -375,7 +394,7 @@ impl Directer {
                 }
                 let module_id = self.module_ind[batch_id][i];
                 let xs_allocated = xs.to(self.device_allocation[module_id]);
-                let mut evaluation = self.modules[module_id].infer(&xs_allocated);
+                let mut evaluation = self.modules[module_id].evaluate_t(&xs_allocated, false);
                 evaluation.0 = evaluation.0.to(Device::Cpu);
                 evaluation.1 = evaluation.1.to(Device::Cpu);
                 Ok(evaluation)
@@ -396,17 +415,17 @@ impl Directer {
                 continue;
             }
 
-            let logits_splits = infer_results[device_idx].0
+            let policy_splits = infer_results[device_idx].0
                 .split_with_sizes(&device_split_sizes, 0);
             let values_splits = infer_results[device_idx].1
                 .split_with_sizes(&device_split_sizes, 0);
 
-            for ((logits, values), (_, sender)) in logits_splits
+            for ((policy, values), (_, sender)) in policy_splits
                 .into_iter()
                 .zip(values_splits)
                 .zip(dispatcher_slice.iter())
             {
-                sender.send((logits, values))
+                sender.send((policy, values))
                     .map_err(|_| ErrReport::msg("Error happened while sending the inference results"))?;
             }
         }
@@ -463,12 +482,31 @@ impl Directer {
 
 
 // play the game for the specified amount using the specified model, create the replay buffer
-pub fn self_play(model_opt: Option<String>, num_games: usize, batch_capacity: usize, config: &ModelConfig) -> Result<()>{
+pub fn self_play(
+    model_opt: Option<String>,
+    n_replica: usize,
+    num_games: usize,
+    batch_capacity: usize,
+    model_config: &ModelConfig,
+    mcts_config: &MCTSConfig,
+    replay_buffer: &ReplayBuffer,
+) -> Result<()>{
 
     let (mut directer, sender) = match model_opt {
-        Some(ref model_name) => Directer::new(config, 0, vec![(1, model_name.clone())], batch_capacity),
-        None => Directer::new(config, 1, vec![], batch_capacity)
+
+        Some(ref model_name) => Directer::new(
+            model_config, 
+            0,
+            vec![(n_replica, model_name.clone())],
+            batch_capacity),
+        None => Directer::new(
+            model_config,
+            n_replica,
+            vec![],
+            batch_capacity)
+
     }?;
+
     let request_sender = Arc::new(sender);
     let model_name = model_opt.unwrap_or("new".to_owned());
     let model_id = directer.lookup_id_from_model(model_name.clone())?;
@@ -482,7 +520,8 @@ pub fn self_play(model_opt: Option<String>, num_games: usize, batch_capacity: us
         || {
             let (sender, receiver) = unbounded::<Evaluation>();
             let sender = Arc::new(sender);
-            let mut mcts_tree = MCTSTree::generate(0.3, 0.03, 0.25, Temperature::Temp(1.0));
+            let game = Game::default();
+            let mut mcts_tree = MCTSTree::generate(game, *mcts_config);
             let actor = Actor::new_with_model_id(request_sender.clone(), model_id);
             (sender, receiver, mcts_tree, actor)
         }, 
@@ -492,9 +531,19 @@ pub fn self_play(model_opt: Option<String>, num_games: usize, batch_capacity: us
             mcts_tree,
             actor
         ), worker_idx| {
-        while !mcts_tree.root_is_terminal() {
-            let posterior = mcts_tree.get_policy_and_update(actor, 100, true).unwrap();
-        }
+
+            let mut episode: Episode = Episode::new();
+
+            while !mcts_tree.root_is_terminal() {
+                let (game,_, posterior) = mcts_tree.get_policy_and_update(actor).unwrap();
+                episode.append_wo_reward(&game, posterior);
+            }
+            let winner = mcts_tree.get_winner();
+            match winner {
+                Side::Att => episode.give_reward(1i64),
+                Side::Def => episode.give_reward(-1i64),
+            };
+            replay_buffer.append_from_episode(&mut episode);
     });
 
     directer_channel.join().unwrap();
