@@ -10,8 +10,11 @@ use game::game::get_rep_counter_for_oldest;
 use game::game::Side;
 use bitboard::Direction;
 use bitboard::eleven::{ElevenBoardPositionalEncoding, BoardEleven, MoveOnBoardEleven};
+use rand::distributions::Uniform;
 
+use crate::agent::PosteriorDist;
 use crate::replay_buffer;
+use crate::utils::IndexPolicy;
 #[cfg(feature = "torch")]
 use crate::utils::TBoardEleven;
 #[cfg(feature = "torch")]
@@ -20,11 +23,14 @@ use tch::Tensor;
 use tch::{Kind, Device};
 
 use bincode;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result};
+use rand::prelude::*;
 
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
 use std::path::Path;
+#[cfg(feature = "torch")]
+use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex};
 use std::{fs, usize};
 use std::io::{prelude::*, BufReader};
@@ -62,27 +68,27 @@ impl ElevenBoardForRB {
 
 #[derive(Debug, Clone, Copy, bincode::Encode, bincode::Decode)]
 pub enum EpisodeUnit {
-    SAR(SAR),
+    SPR(SPR),
     Sep
 }
 
-impl From<SAR> for EpisodeUnit {
-    fn from(value: SAR) -> Self {
-        EpisodeUnit::SAR(value)
+impl From<SPR> for EpisodeUnit {
+    fn from(value: SPR) -> Self {
+        EpisodeUnit::SPR(value)
     }
 }
 
 impl EpisodeUnit {
     pub fn give_reward(&mut self, reward: Reward) {
-        if let Self::SAR(sar) = self {
-            sar.give_reward(reward);
+        if let Self::SPR(spr) = self {
+            spr.give_reward(reward);
         }
     }
 
     #[cfg(feature = "torch")]
     pub fn to_tboard(&self, options: (Kind, Device)) -> TBoardEleven {
         match self {
-            EpisodeUnit::SAR(sar) => sar.board.to_tboard(options),
+            EpisodeUnit::SPR(spr) => spr.board.to_tboard(options),
             EpisodeUnit::Sep => {
                 TBoardEleven::new(Tensor::zeros([3, 11, 11], options))
             }
@@ -91,38 +97,38 @@ impl EpisodeUnit {
 }
 
 #[derive(Debug, Copy, Clone, bincode::Encode, bincode::Decode)]
-pub struct SAR {
+pub struct SPR {
     board: ElevenBoardForRB,
     state: GameState,
-    action: MoveOnBoardEleven,
+    policy: IndexPolicy,
     repetition_counter: u8,
     reward: Reward,
 }
 
-impl SAR {
-    pub fn reward_uninitialized(game: &Game, action: &MoveOnBoardEleven) -> Self {
+impl SPR {
+    pub fn reward_uninitialized(game: &Game, posterior: PosteriorDist) -> Self {
         let board = ElevenBoardForRB::from_tbe(&game.board);
         let state = game.state.clone();
-        let action = action.clone();
         let repetition_counter = get_rep_counter_for_oldest(game.repetition_counter);
+        let policy: IndexPolicy = IndexPolicy::from(posterior);
         Self { 
             board,
             state,
-            action,
+            policy,
             repetition_counter,
             reward: 0 
         }
     }
 
-    pub fn reward_initialized(game: &Game, action: &MoveOnBoardEleven, reward: Reward) -> Self {
+    pub fn reward_initialized(game: &Game, posterior: PosteriorDist, reward: Reward) -> Self {
         let board = ElevenBoardForRB::from_tbe(&game.board);
         let state = game.state.clone();
-        let action = action.clone();
         let repetition_counter = get_rep_counter_for_oldest(game.repetition_counter);
+        let policy: IndexPolicy = IndexPolicy::from(posterior);
         Self { 
             board,
             state,
-            action,
+            policy,
             repetition_counter,
             reward
         }
@@ -149,9 +155,9 @@ impl Episode {
         let episode = vec![EpisodeUnit::Sep];
         Self { episode }
     }
-    pub fn append_wo_reward(&mut self, game: &Game, action: &MoveOnBoardEleven) {
-        let sar = SAR::reward_uninitialized(game, action);
-        let u = EpisodeUnit::from(sar);
+    pub fn append_wo_reward(&mut self, game: &Game, posterior: PosteriorDist) {
+        let spr = SPR::reward_uninitialized(game, posterior);
+        let u = EpisodeUnit::from(spr);
         self.episode.push(u);
     }
     pub fn len(&self) -> usize {
@@ -161,21 +167,21 @@ impl Episode {
 
 #[derive(Debug, Default, bincode::Encode, bincode::Decode)]
 pub struct ReplayBuffer {
-    pub replay_buffer: Mutex<VecDeque<EpisodeUnit>>,
+    pub replay_buffer: Mutex<Vec<EpisodeUnit>>,
     pub capacity: usize,
 }
 // TODO: define custom default so that memory efficient
 
 impl ReplayBuffer {
     pub fn new(capacity: usize) -> Self {
-        let replay_buffer = VecDeque::<EpisodeUnit>::with_capacity(capacity);
+        let replay_buffer = Vec::<EpisodeUnit>::with_capacity(capacity);
         let replay_buffer = Mutex::new(replay_buffer);
         Self { replay_buffer, capacity }
     }
 
     // append to the replay_buffer from the episode.
     // This enforces the capacity, meaning the oldest episodes would be removed if necessary
-    pub fn extend_from_episode(&mut self, episode: Episode) {
+    pub fn extend_from_episode(&self, episode: &mut Episode) {
         let mut q = self.replay_buffer.lock().unwrap();
         let dif: i64 = self.capacity as i64 - q.len() as i64 - episode.len() as i64;
         if dif >= 0 {
@@ -194,7 +200,7 @@ impl ReplayBuffer {
 
     // append to the replay_buffer, draining the episode.
     // This enforces the capacity, meaning the oldest episodes would be removed if necessary
-    pub fn append_from_episode(&mut self, episode: &mut Episode) {
+    pub fn append_from_episode(&self, episode: &mut Episode) {
         let mut q = self.replay_buffer.lock().unwrap();
         let dif: i64 = self.capacity as i64 - q.len() as i64 - episode.len() as i64;
         if dif >= 0 {
@@ -212,7 +218,7 @@ impl ReplayBuffer {
     }
 
     // empty the buffer
-    pub fn empty(&mut self) {
+    pub fn empty(&self) {
         let mut q = self.replay_buffer.lock().unwrap();
         let _ = q.drain(..);
     }
@@ -222,7 +228,7 @@ impl ReplayBuffer {
     }
 
     // enforce the capacity, deleting the oldest episodes from the front if necessary.
-    pub fn enforce_capacity(&mut self) {
+    pub fn enforce_capacity(&self) {
         let mut q = self.replay_buffer.lock().unwrap();
         if q.len() > self.capacity {
             let offset_opt = ReplayBuffer::get_next_sep_pos_exceeding_offset(
@@ -238,73 +244,119 @@ impl ReplayBuffer {
     }
 
     #[cfg(feature = "torch")]
-    pub fn get_inference_input(&self, idx: usize, options: (Kind, Device)) -> Option<Tensor> {
-        debug_assert!(1 <= idx && idx < self.replay_buffer.len());
-        match self.replay_buffer[idx] {
-            EpisodeUnit::Sep => None,
-            EpisodeUnit::SAR(sar) => {
-                let cur_board = sar.board.to_tboard(options).get();
-                let mut past = true;
-                let mut short_history: [Option<Tensor>; 4] = std::array::from_fn(|i| {
+    pub fn get_inference_input(q: &Vec<EpisodeUnit>, idx: usize, options: (Kind, Device)) -> Option<(Tensor, Tensor, Tensor)> {
 
-                    let ts = if past {
+        if let Some(eu) = q.get(idx) {
+            match eu {
+                EpisodeUnit::Sep => {
+                    None
+                }
+                EpisodeUnit::SPR(spr) => {
+                    use crate::utils::TAction;
 
-                        if let Some(eu) = self.replay_buffer.get(idx - i - 1) {
-                            if let EpisodeUnit::SAR(sar) = eu {
-                                sar.board.to_tboard(options).get()
+
+                    let policy = TAction::from_index_policy(&spr.policy)
+                        .inner()
+                        .to_kind(options.0)
+                        .to_device(options.1);
+
+                    let reward = Tensor::from_slice([spr.reward as f32])
+                        .to_kind(options.0)
+                        .to_device(options.1);
+
+                    let cur_board = spr.board.to_tboard(options).get();
+                    let mut past = true;
+                    let mut short_history: [Option<Tensor>; 4] = std::array::from_fn(|i| {
+
+                        let ts = if past {
+
+                            if let Some(eu) = q.get(idx - i - 1) {
+                                if let EpisodeUnit::SPR(spr) = eu {
+                                    spr.board.to_tboard(options).get()
+                                } else {
+                                    past = false;
+                                    Tensor::zeros([3,11,11], options)
+                                }
                             } else {
                                 past = false;
                                 Tensor::zeros([3,11,11], options)
                             }
+
                         } else {
-                            past = false;
                             Tensor::zeros([3,11,11], options)
-                        }
+                        };
+                        Some(ts)
 
-                    } else {
-                        Tensor::zeros([3,11,11], options)
+                    });
+
+                    let tot_move_count: i64 = spr.state.get_turn_count().into();
+                    let tmc: Tensor = Tensor::scalar_tensor(tot_move_count, options);
+                    let tmc: Tensor = tmc.broadcast_to([1, 11, 11]);
+
+                    let rc: Tensor = Tensor::scalar_tensor(spr.repetition_counter as i64, options);
+                    let rc: Tensor = rc.broadcast_to([1, 11, 11]);
+
+                    let side: i64 = match spr.state.show_side() {
+                        Side::Att => 1,
+                        Side::Def => 0,
                     };
-                    Some(ts)
+                    let side: Tensor = Tensor::scalar_tensor(side, options);
+                    let side: Tensor = side.broadcast_to([1, 11, 11]);
 
-                });
-
-                let tot_move_count: i64 = sar.state.get_turn_count().into();
-                let tmc: Tensor = Tensor::scalar_tensor(tot_move_count, options);
-                let tmc: Tensor = tmc.broadcast_to([1, 11, 11]);
-
-                let rc: Tensor = Tensor::scalar_tensor(sar.repetition_counter as i64, options);
-                let rc: Tensor = rc.broadcast_to([1, 11, 11]);
-
-                let side: i64 = match sar.state.show_side() {
-                    Side::Att => 1,
-                    Side::Def => 0,
-                };
-                let side: Tensor = Tensor::scalar_tensor(side, options);
-                let side: Tensor = side.broadcast_to([1, 11, 11]);
-
-                let ts = Tensor::cat(&[
-                    cur_board,
-                    short_history[0].take().unwrap(),
-                    short_history[1].take().unwrap(),
-                    short_history[2].take().unwrap(),
-                    short_history[3].take().unwrap(),
-                    tmc,
-                    rc,
-                    side
-                    ], 0);
-                Some(ts)
-
+                    let position = Tensor::cat(&[
+                        cur_board,
+                        short_history[0].take().unwrap(),
+                        short_history[1].take().unwrap(),
+                        short_history[2].take().unwrap(),
+                        short_history[3].take().unwrap(),
+                        tmc,
+                        rc,
+                        side
+                        ], 0);
+                    
+                    Some((position, policy, reward))
+                }
             }
+        } else {
+            None
         }
     }
 
+    pub fn sample_batch<R: Rng + ?Sized>(&self, batch_size: usize, options: (Kind, Device), rng: &mut R) -> Result<(Tensor, Tensor, Tensor)> {
+
+        let q = self.replay_buffer.lock().unwrap();
+        let len = q.len();
+        if len < batch_size {
+            return Err(eyre!("replay buffer didn't have enough size"));
+        }
+        let uniform = Uniform::new(0, len);
+        let mut start = 0;
+        let mut position_v: Vec<Tensor> = Vec::with_capacity(batch_size);
+        let mut policy_v: Vec<Tensor> = Vec::with_capacity(batch_size);
+        let mut reward_v: Vec<Tensor> = Vec::with_capacity(batch_size);
+        while start < batch_size {
+            let idx = uniform.sample(rng);
+            if let Some((position, policy, reward)) = Self::get_inference_input(&q, idx, options) {
+                position_v.push(position);
+                policy_v.push(policy);
+                reward_v.push(reward);
+                start += 1;
+            }
+        }
+
+        let positions = Tensor::stack(&position_v, 0);
+        let policies = Tensor::stack(&policy_v, 0);
+        let rewards = Tensor::stack(&reward_v, 0);
+
+        Ok((positions, policies, rewards))
+    } 
+
     // write a range of episodes into a file
     // Episodes are serialized and has to be decoded. 
-    // Each episode is encoded as Vec<SAR>, followed by how many bytes it took to encode it.
+    // Each episode is encoded as Vec<SPR>, followed by how many bytes it took to encode it.
     // This will be essential when retrieving data from a file
-    pub fn save<R: RangeBounds<usize>>(self, path: &Path, game_range: R) -> Result<()> {
-        let mut file = fs::File::create(path)?;
-        let mut v: Vec<SAR> = vec![];
+    pub fn save<R: RangeBounds<usize>, W: Write>(self, writer: &mut W, game_range: R) -> Result<()> {
+        let mut v: Vec<SPR> = vec![];
         let mut q = self.replay_buffer.lock()?;
         let mut game_idx = 0;
         let mut pos: usize = 0;
@@ -313,23 +365,23 @@ impl ReplayBuffer {
 
         for eu in eu_iter {
             match eu {
-                EpisodeUnit::SAR(sar) => {
-                    v.push(sar);
+                EpisodeUnit::SPR(spr) => {
+                    v.push(spr);
                 },
                 EpisodeUnit::Sep => {
                     if v.len() == 0 {
                         continue;
                     }
-                    let v_sar = std::mem::replace(&mut v, vec![]);
+                    let v_spr = std::mem::replace(&mut v, vec![]);
                     if game_range.contains(game_idx) {
-                        write_one_episode(v_sar, &mut file)?;
+                        write_one_episode(v_spr, writer)?;
                     }
                     game_idx += 1;
                 }
             }
         }
         if game_range.contains(game_idx) {
-            write_one_episode(v, &mut file)?;
+            write_one_episode(v, writer)?;
         }
         Ok(())
     }
@@ -337,13 +389,11 @@ impl ReplayBuffer {
 
     // load the latest n episodes from the specified file.
     // The capacity of the output is set to be usize::MAX
-    pub fn load_from_file(path: &Path, n_episodes: usize) -> Result<Self> {
+    pub fn load_from_reader<R: Read + Seek>(mut reader: R, n_episodes: usize) -> Result<Self> {
 
         use std::io::SeekFrom;
         let mut output: Vec<EpisodeUnit> = vec![];
-        let mut file = fs::File::open(path)?;
-        let mut buf_reader = BufReader::new(file);
-        let mut pos = buf_reader.seek(SeekFrom::End(0))?;
+        let mut pos = reader.seek(SeekFrom::End(0))?;
         let mut episode_n_byte_buf: [u8;8] = [0;8];
         let mut episode_count = 0;
 
@@ -352,32 +402,36 @@ impl ReplayBuffer {
                 break;
             }
             pos = -8;
-            buf_reader.seek_relative(-8)?;
-            buf_reader.read(&mut episode_n_byte_buf)?;
+            reader.seek_relative(-8)?;
+            reader.read_exact(&mut episode_n_byte_buf)?;
             let episode_n_byte: u64 = u64::from_le_bytes(episode_n_byte_buf);
+
             pos -= episode_n_byte;
-            buf_reader.seek_relative(-1 * 8 - episode_n_byte as i64)?;
+            reader.seek_relative(-8 - episode_n_byte as i64)?;
             let mut data_buf = vec![0u8; episode_n_byte as usize];
-            buf_reader.read(&mut data_buf)?;
-            let (mut v_sar, u) = bincode::decode_from_slice::<Vec<SAR>>(
+            reader.read_exact(&mut data_buf)?;
+
+            let (mut v_spr, u) = bincode::decode_from_slice::<Vec<SPR>>(
                 data_buf.as_slice(), 
                 REPLAY_BUFFER_ENCODE_CONFIG
             )?;
-            buf_reader.seek_relative(-1 * u as i64)?;
-            output.extend(v_sar.into_iter().map(|sar| EpisodeUnit::SAR(sar)).rev());
+            reader.seek_relative(-1 * u as i64)?;
+            output.extend(v_spr.into_iter().map(|spr| EpisodeUnit::SPR(spr)).rev());
             output.push(EpisodeUnit::Sep);
 
             episode_count += 1;
         }
+
         output.reverse();
-        let replay_buffer = VecDeque::from(output);
+
+        let replay_buffer = Vec::from(output);
         let replay_buffer = Mutex::new(replay_buffer);
         let decoded = ReplayBuffer { replay_buffer, capacity: usize::MAX};
         Ok(decoded)
     }
 
     // Get the minimum index of EpisodeUnit::Sep that would exceed the specified offset
-    pub fn get_next_sep_pos_exceeding_offset(v: &VecDeque<EpisodeUnit>, offset: usize) -> Option<usize> {
+    pub fn get_next_sep_pos_exceeding_offset(v: &Vec<EpisodeUnit>, offset: usize) -> Option<usize> {
         let mut count: usize = 0;
         for eu in v.iter(){
             if let EpisodeUnit::Sep = *eu && count > offset{
@@ -390,7 +444,7 @@ impl ReplayBuffer {
 
 }
 
-fn write_one_episode<W: Write> (v: Vec<SAR>, w: &mut W) -> Result<()> {
+fn write_one_episode<W: Write> (v: Vec<SPR>, w: &mut W) -> Result<()> {
     let n_bytes = bincode::encode_into_std_write(
         v,
         w,
