@@ -31,12 +31,52 @@ use crate::self_play::{Batch, Directer, Request, Query};
 
 // multi-threading related 
 use crossbeam::channel::{unbounded, Sender, Receiver};
+use std::borrow::Borrow;
 use std::thread;
 use std::sync::Arc;
 use rayon::{iter::{IntoParallelIterator, ParallelIterator}};
 
 // std
 use std::rc::Rc;
+
+pub type PosteriorDist = Vec<(Borrow<MoveOnBoardEleven>, f32)>;
+
+#[derive(Debug, Copy, Clone)]
+pub struct MCTSConfig {
+    c_puct: f32,
+    n_sim: usize,
+    dirichlet_alpha: f64,
+    dirichlet_epsilon: f32,
+    temp_schedule_target_policy: fn(usize) -> Temperature,
+    temp_schedule_move_selection: fn(usize) -> Temperature
+}
+
+impl Default for MCTSConfig {
+    fn default() -> Self {
+        let c_puct: f32 = 0.3;
+        let n_sim: usize = 1600;
+        let dirichlet_alpha: f64 = 0.03;
+        let dirichlet_epsilon: f32 = 0.25;
+        fn temp_schedule_target_policy(i: usize) -> Temperature {
+            Temperature::Temp(1)
+        }
+        fn temp_schedule_move_selection(i: usize) -> Temperature {
+            if i < 30 {
+                Temperature::Temp(1)
+            } else {
+                Temperature::Zero
+            }
+        }
+        MCTSConfig { 
+            c_puct,
+            n_sim,
+            dirichlet_alpha,
+            dirichlet_epsilon,
+            temp_schedule_target_policy,
+            temp_schedule_move_selection
+        }
+    }
+}
 
 pub trait Oracle {
     fn infer(&self, game: &Game, actions: Option<Vec<&MoveOnBoardEleven>>) -> Result<(Tensor, f32)>;
@@ -50,7 +90,7 @@ pub struct Actor {
 
 impl Oracle for Actor {
 
-    // returns logits of the valid actions and the value
+    // returns the distribution of the valid actions and the value
     fn infer(&self, game: &Game, actions: Option<Vec<&MoveOnBoardEleven>>) -> Result<(Tensor, f32)> {
         let (s, r) = unbounded::<Evaluation>();
         let mut rng = thread_rng();
@@ -61,7 +101,7 @@ impl Oracle for Actor {
             .map_err(|_| ErrReport::msg("Could not send the inference request"))?;
 
 
-        let (pre_logits, pre_value) = r.recv()?;
+        let (pre_dist, pre_value) = r.recv()?;
         // Not sure, but the received result should have the shape
         // [1,20,11,11] and [1,1]
         // Calling squeeze just in case
@@ -80,11 +120,11 @@ impl Oracle for Actor {
             TAction::vec_vbm_one_hot_encode(&vbms)
         };
 
-        let pre_logits = pre_logits.squeeze();
-        let logits = &pre_logits * mask.get().to_kind(Kind::Float);
-        let sum: f64 = logits.sum(Kind::Float).double_value(&[0]);
-        let logits = logits.divide_scalar(sum);
-        Ok((logits, value))
+        let pre_dist = pre_dist.squeeze().rot90(-1 * k as i64, [-2,-1]);
+        let dist = &pre_dist * mask.get().to_kind(Kind::Float);
+        let sum: f64 = dist.sum(Kind::Float).double_value(&[0]);
+        let dist = dist.divide_scalar(sum);
+        Ok((dist, value))
 
     }
 }
@@ -108,13 +148,13 @@ impl Actor {
 
 }
 
-pub fn get_vec_priors(logits: &Tensor, ordered_actions: &Vec<MoveOnBoardEleven>) -> Result<Vec<f32>> {
-    let flattened_logits = logits.flatten(0, -1);
+pub fn get_vec_priors(dist: &Tensor, ordered_actions: &Vec<MoveOnBoardEleven>) -> Result<Vec<f32>> {
+    let flattened_dist = dist.flatten(0, -1);
     let priors: Vec<f32> = ordered_actions.iter()
         .map(|mbe| {
             let vbm = VectorBasedMove::convert_from(mbe)?;
             let index = vbm.to_index();
-            let p: f32 = flattened_logits.double_value(&[index]) as f32;
+            let p: f32 = flattened_dist.double_value(&[index]) as f32;
             Ok(p)
         }).collect::<Result<Vec<_>>>()?;
     Ok(priors)
@@ -252,7 +292,7 @@ impl Node {
         Ok(selected_edge_id)
     }
 
-    fn generate_dist_from_visit_counts(&self, temperature: Temperature) -> Result<Vec<(&MoveOnBoardEleven, f32)>> {
+    fn generate_dist_from_visit_counts(&self, temperature: Temperature) -> Result<PosteriorDist> {
 
         let dist = match temperature {
             Temperature::Temp(temp) => {
@@ -294,7 +334,7 @@ impl Node {
 
     // This will drain self.actions, leaving it empty
     fn generate_dist_from_visit_count_destructively(&mut self, temperature: Temperature)
-    -> Result<Vec<(MoveOnBoardEleven, f32)>> {
+    -> Result<PosteriorDist> {
 
         let dist = match temperature {
             Temperature::Temp(temp) => {
@@ -398,42 +438,57 @@ impl Edge {
     }
 }
 
+
 #[derive(Debug)]
 pub struct MCTSTree {
     root: Rc<Node>,
+    turn_count: usize,
+    n_sim: usize,
     c_puct: f32,
     alpha: f64,
     epsilon: f32,
-    temperature: Temperature,
+    temp_schedule_target_policy: fn(usize) -> Temperature,
+    temp_schedule_move_selection: fn(usize) -> Temperature
 }
 
 impl Default for MCTSTree {
     fn default() -> Self {
-        MCTSTree::generate(1.0, 0.03, 0.25, Temperature::Temp(1.0))
+        let game: Game = Game::default();
+        let config: MCTSConfig = MCTSConfig::default();
+        Self::generate(game, config)
     }
 }
 
 impl MCTSTree {
 
-    pub fn generate(c_puct: f32, alpha: f64, epsilon: f32, temperature: Temperature) -> Self {
-        let game = Game::default();
+    pub fn generate(game: Game, config: MCTSConfig) -> Self {
         let actions = game.get_possible_actions();
+        let turn_count = game.state.get_turn_count() as usize;
         let root = Node::generate(game, actions);
-        MCTSTree::new(root, c_puct, alpha, epsilon, temperature)
-    }
-
-    pub fn new(root: Node, c_puct: f32, alpha: f64, epsilon: f32, temperature: Temperature) -> Self {
-        Self {
-            root: Rc::new(root),
+        let n_sim = config.n_sim;
+        let c_puct = config.c_puct;
+        let alpha = config.dirichlet_alpha;
+        let epsilon = config.dirichlet_epsilon;
+        let temp_schedule_target_policy = config.temp_schedule_target_policy;
+        let temp_schedule_move_selection = config.temp_schedule_move_selection;
+        MCTSTree{
+            root,
+            turn_count,
+            n_sim,
             c_puct,
             alpha,
             epsilon,
-            temperature
+            temp_schedule_target_policy,
+            temp_schedule_move_selection,
         }
     }
 
     pub fn root_is_terminal(&self) -> bool {
         !self.root.game.state.is_ongoing()
+    }
+
+    pub fn get_winner(&self) -> Side {
+        self.root.game.state.get_victor()
     }
 
     // traverse the tree from root and find the leaf node, and returns the edge that leads to the (potentially) new node
@@ -507,28 +562,10 @@ impl MCTSTree {
         }
 
         let actions: Vec<&MoveOnBoardEleven> = leaf.actions.iter().collect();
-        let (logits, value) = actor.infer(&leaf.game, Some(actions))?;
-        let priors = get_vec_priors(&logits, &leaf.actions)?;
+        let (dist, value) = actor.infer(&leaf.game, Some(actions))?;
+        let priors = get_vec_priors(&dist, &leaf.actions)?;
 
         leaf.expand(priors)?;
-        // for (id, (action, prior)) in leaf.actions.iter().zip(priors).enumerate() {
-        //     let (new_game,
-        //         _,
-        //         opt_actions) 
-        //         = leaf.game.do_move_and_update_whole(&action, None, true)?;
-
-        //     let actions = opt_actions.unwrap();
-        //     let uninitialized_edges = actions.iter().map(|_| None).collect();
-        //     let node = Node::new(&new_game, actions, uninitialized_edges)?;
-        //     let edge = Edge::new(
-        //         Rc::new(node),
-        //         prior,
-        //         0.0,
-        //         0.0,
-        //         0.0);
-            
-        //     leaf.edges[id] = Some(edge);
-        // }
         Ok(value)
     }
 
@@ -549,43 +586,36 @@ impl MCTSTree {
         Ok(())
     }
 
-    fn get_posterior(&self) -> Result<Vec<(&MoveOnBoardEleven, f32)>> {
+    fn get_posterior(&self) -> Result<PosteriorDist> {
 
-        self.root.generate_dist_from_visit_counts(self.temperature)
+        let temperature = self.temp_schedule_target_policy(self.turn_count);
+        self.root.generate_dist_from_visit_counts(temperature)
 
     }
 
 
-    fn get_posterior_w_sampled_action_index(&self, greedy: bool) 
-    -> Result<(Vec<(&MoveOnBoardEleven, f32)>, usize)>
+    fn get_posterior_w_sampled_action_index(&self) 
+    -> Result<(PosteriorDist, usize)>
     {
 
+        let temp_posterior = self.temp_schedule_target_policy(self.turn_count);
+        let temp_move_selection = self.temp_schedule_move_selection(self.turn_count);
         let dist = self.root
-            .generate_dist_from_visit_counts(self.temperature)?;
+            .generate_dist_from_visit_counts(temp_posterior)?;
 
-        match self.temperature {
+        match temp_move_selection {
 
             Temperature::Temp(temp) => {
 
-                let sampled_action_idx = if greedy {
-
-                    let argmax_action_idx = self.root.get_edge_id_w_highest_visit_count()?;
-
-                    argmax_action_idx
-                } else {
-
-                    let mut rng = thread_rng();
-                    let index_vec = sample_weighted(
-                        &mut rng,
-                        dist.len(),
-                        |i| dist[i].1,
-                        1
-                    )?;
-                    debug_assert_eq!(index_vec.len(), 1);
-                    let index = index_vec.index(0);
-
-                    index
-                };
+                let mut rng = thread_rng();
+                let index_vec = sample_weighted(
+                    &mut rng,
+                    dist.len(),
+                    |i| dist[i].1,
+                    1
+                )?;
+                debug_assert_eq!(index_vec.len(), 1);
+                let sampled_action_idx = index_vec.index(0);
                 
                 Ok((dist, sampled_action_idx))
             }
@@ -598,44 +628,31 @@ impl MCTSTree {
         }
     }
 
-    fn get_posterior_w_sampled_action_index_destructively(&mut self, greedy: bool) 
-    -> Result<(Vec<(MoveOnBoardEleven, f32)>, usize)>
+    fn get_posterior_w_sampled_action_index_destructively(&mut self) 
+    -> Result<(PosteriorDist, usize)>
     {
 
+        let temp_posterior = self.temp_schedule_target_policy(self.turn_count);
+        let temp_move_selection = self.temp_schedule_move_selection(self.turn_count);
         let dist = {
             let mut_ref_root = Rc::get_mut(&mut self.root)
                 .ok_or_eyre("Tried to get mutable reference to the tree root when there are more than one reference to it")?;
             mut_ref_root
-                .generate_dist_from_visit_count_destructively(self.temperature)?
+                .generate_dist_from_visit_count_destructively(temp_posterior)?
         };
-        // let mut_ref_root = Rc::get_mut(&mut self.root)
-        //     .ok_or("Tried to get mutable reference to the tree root when there are more than one reference to it")?;
-        // let dist = mut_ref_root
-        //     .generate_dist_from_visit_count_destructively(self.temperature)?;
-
-        match self.temperature {
+        match temp_move_selection {
 
             Temperature::Temp(temp) => {
 
-                let sampled_action_idx = if greedy {
-
-                    let argmax_action_idx = self.root.get_edge_id_w_highest_visit_count()?;
-
-                    argmax_action_idx
-                } else {
-
-                    let mut rng = thread_rng();
-                    let index_vec = sample_weighted(
-                        &mut rng,
-                        dist.len(),
-                        |i| dist[i].1,
-                        1
-                    )?;
-                    debug_assert_eq!(index_vec.len(), 1);
-                    let index = index_vec.index(0);
-
-                    index
-                };
+                let mut rng = thread_rng();
+                let index_vec = sample_weighted(
+                    &mut rng,
+                    dist.len(),
+                    |i| dist[i].1,
+                    1
+                )?;
+                debug_assert_eq!(index_vec.len(), 1);
+                let sampled_action_idx = index_vec.index(0);
                 
                 Ok((dist, sampled_action_idx))
             }
@@ -703,20 +720,21 @@ impl MCTSTree {
         Ok(())
     } 
 
-    pub fn get_policy_and_update(&mut self, actor: &Actor, n_simulation: usize, greedy: bool) 
-    -> Result<Vec<(MoveOnBoardEleven, f32)>> 
+    pub fn get_policy_and_update(&mut self, actor: &Actor) 
+    -> Result<(Game, MoveOnBoardEleven, PosteriorDist)> 
     {
 
-        for _ in 0..n_simulation {
+        for _ in 0..self.n_sim {
             self.search_expand_backup(actor)?;
         }
 
         let (posterior, action_id) 
-        = self.get_posterior_w_sampled_action_index_destructively(greedy)?;
+        = self.get_posterior_w_sampled_action_index_destructively()?;
 
-        self.trim_root(action_id)?;
+        let (game, action) = self.trim_root(action_id)?;
+        self.turn_count += 1;
 
-        Ok(posterior)
+        Ok((game, action, posterior))
     }
 
 }
