@@ -1,5 +1,6 @@
 #![cfg(feature = "mpi")]
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::time::Duration;
@@ -64,6 +65,40 @@ struct ModelSetupConfig{
     modules: Vec<ModuleLoadInfo>,
 }
 
+// This takes the output of the setup function (loaded models along with their var stores and their path names), and create correspondence between their names and their group id.
+// This function operates locally (inside each mpi node)
+fn create_lookup_table<P: PVModel>(rank: Option<i32>, loaded_model: Vec<(OsString, P, VarStore)>) -> 
+Result<(Vec<Vec<(P, VarStore)>>, Vec<OsString>)> {
+    
+    let mut table: Vec<Vec<(P, VarStore)>> = vec![];
+    let mut name_lookup: Vec<&OsStr> = vec![];
+
+    // taking XOR
+    if self.use_mpi ^ rank.is_some() {
+        return Err(eyre!(
+            "inconsistency in mpi usage-related input: rank should be None if and only if use_mpi is false"
+        ));
+    }
+    
+    for (name, model, vs) in loaded_model.into_iter() {
+        
+        if let Some(i) = rank && info.rank != i {
+            continue;
+        }
+
+        if let Some(id) = name_lookup.iter().position(|&&s| s == name){
+            table.get_mut(id).unwrap().push((model, vs));
+        } else {
+            // If this is the first time that the 'name' comes up, 
+            table.push(vec![]);
+            name_lookup.push(name.as_os_str());
+            table.last_mut().unwrap().push((model, vs));
+        }
+
+    }
+
+    Ok((table, name_lookup))
+}
 struct ModuleLoadInfo {
     // path to the file that stores the model weight
     path: OsString,
@@ -75,26 +110,26 @@ struct ModuleLoadInfo {
     config: ModelConfig,
 }
 
-fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> (P, VarStore) {
+fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> (OsString, P, VarStore) {
 
     let path = Path::from(info.path);
     let mut vs = VarStore::new(info.device);
     let module: P = P::new(&vs.root(), info.config);
     vs.load(path);
-    (module, vs)
+    (info.path.to_owned(), module, vs)
 
 }
 
-fn load_module_from_stream<P: PVModel, S: Read + Seek>(info: &ModuleLoadInfo, stream: S) -> (P, VarStore) {
+fn load_module_from_stream<P: PVModel, S: Read + Seek>(info: &ModuleLoadInfo, stream: S) -> (OsString, P, VarStore) {
 
     let mut vs = VarStore::new(info.device);
     let module: P = P::new(&vs.root(), info.config);
     vs.load_from_stream(stream);
-    (module, vs)
+    (info.path.to_owned(), module, vs)
 
 }
 
-fn setup<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(P, VarStore)>>{
+fn setup<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>>{
 
     #[cfg(not(feature = "mpi"))]
     {
@@ -122,38 +157,85 @@ fn setup<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(P, VarStore)>>{
 
 }
 
-// This function loads the models, ignoring the mpi options. It is intended to be used inside the 'setup' function
-fn setup_wo_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(P, VarStore)>> {
+fn add_module_to_list<P: PVModel>(info: &ModuleLoadInfo, list: &mut Vec<(OsString, P, VarStore)>, available_cuda: &mut Vec<Device>) -> Result<()> {
 
-    let mut loaded_models: Vec<(P, VarStore)> = vec![];
+    match info.device {
+
+        Device::Cpu => {
+            let (name, module, var_store) = load_module::<P>(&info);
+            list.push((name, module, var_store));
+        },
+        Device::Cuda(i) => {
+
+            if !available_cuda.contains(&info.device) {
+                return Err(eyre!("cuda allocation failed: Check the ModelSetupConfig again"));
+            }
+            available_cuda.remove(i);
+            let (name, module, var_store) = load_module::<P>(&info);
+            list.push((name, module, var_store));
+            
+        },
+        _ => {
+            return Err(eyre!("unexpected device encountered"));
+        }
+    }
+}
+
+fn add_module_from_stream_to_list<P: PVModel, S: Seek + Read>(
+    info: &ModuleLoadInfo,
+    list: &mut Vec<(OsString, P, VarStore)>,
+    available_cuda: &mut Vec<Device>,
+    stream: S) -> Result<()> {
+
+    match info.device {
+
+        Device::Cpu => {
+            let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream);
+            list.push((name, module, var_store));
+        },
+        Device::Cuda(i) => {
+
+            if !available_cuda.contains(&info.device) {
+                return Err(eyre!("cuda allocation failed: Check the ModelSetupConfig again"));
+            }
+            available_cuda.remove(i);
+            let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream);
+            list.push((name, module, var_store));
+            
+        },
+        _ => {
+            return Err(eyre!("unexpected device encountered"));
+        }
+    }
+}
+
+// This function loads the models, ignoring the mpi options. It is intended to be used inside the 'setup' function
+fn setup_wo_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
+
+    let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
 
     let n_cuda = tch::Cuda::device_count();
-    let available_cuda: Vec<Device>  = (0..n_cuda).map(|i| Device::Cuda(i)).collect();
+    let mut available_cuda: Vec<Device>  = (0..n_cuda).map(|i| Device::Cuda(i)).collect();
 
     for module_info in config.modules {
-        if !available_cuda.contains(&module_info.device) {
-            return Err(eyre!("cuda allocation failed: Check the ModelSetupConfig again"));
-        }
-        if let Device::Cuda(i) = module_info.device {
-            available_cuda.remove(i);
-        }
-        let (module, var_store) = load_module::<P>(&module_info);
-        loaded_models.push((module, var_store));
+        add_module_to_list(&module_info, &mut loaded_models, &mut available_cuda)?;
     }
     Ok(loaded_models)
 }
 
 #[cfg(feature = "mpi")]
-fn setup_w_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(P, VarStore)>> {
+fn setup_w_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
 
     use mpi::traits::Communicator;
-
+    // mpi related setup
     let universe = mpi::initialize()?;
     let world = universe.world();
     let rank = world.rank();
     let size = world.size();
 
-    let mut loaded_models: Vec<(P, VarStore)> = vec![];
+    let n_cuda = tch::Cuda::device_count();
+    let mut available_cuda: Vec<Device> = (0..n_cuda).map(|i| Device::Cuda(i)).collect();
+    let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
 
     for module_info in config.modules {
 
@@ -162,13 +244,12 @@ fn setup_w_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(P, VarStore)
         }
 
         let path = Path::from(module_info.path);
+
         if path.exists() {
-            let (module, var_store) = load_module::<P>(&module_info);
-            loaded_models.push((module, var_store));
+            add_module_to_list(&module_info, &mut loaded_models, &mut available_cuda)?;
         } else if rank != 0 {
             let cursor = request_model_from_root(&world, 0, path.as_os_str().to_str().unwrap());
-            let (module, var_store) = load_module_from_stream::<P>(&module_info, cursor);
-            loaded_models.push((module, var_store));
+            add_module_from_stream_to_list(&module_info, loaded_models, available_cuda, cursor)?;
         } else {
             // If you are a root node and you can't find the file, then something has gone wrong.
             return Err(eyre!("Could not find the file {} on the root node.", path.as_os_str()));

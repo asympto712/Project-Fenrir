@@ -12,13 +12,15 @@ use crate::model::{ModelConfig, PVModel};
 use crate::model::PVNet;
 use crate::model::Evaluation;
 use crate::agent::{self, Actor, MCTSConfig, MCTSTree, Temperature, PosteriorDist};
+use crate::run::ModelSetupConfig;
 
 //external
 use tch::Tensor;
 use tch::nn;
 use tch::Device;
 use tch::Kind;
-use color_eyre::eyre::{Context, ErrReport, OptionExt, Result};
+use tch::nn::VarStore;
+use color_eyre::eyre::{eyre, Context, ErrReport, OptionExt, Result};
 
 // multithreading-related
 use crossbeam::channel::{unbounded, Sender, Receiver};
@@ -33,6 +35,7 @@ use std::time::Duration;
 use std::ffi::OsString;
 use std::path;
 use std::convert::AsRef;
+use std::borrow::Borrow;
 
 // needs experimenting
 const BATCHSIZE: i64 = 64;
@@ -84,12 +87,6 @@ impl Batch {
         self.dispatcher.clear();
         // This will leave the self.requests empty
         let requests = std::mem::take(&mut self.requests);
-        // let vec_tensor: Vec<Query> = requests.iter().map(|r| *r.query).collect();
-        // let ts = Tensor::cat(vec_tensor.as_slice(), 0);
-        // for request in requests.into_iter() {
-        //     self.dispatcher.push((request.query.size()[0], request.sender));
-        // }
-        // ts
         let (queries, dispatcher_info):(Vec<Query>, Vec<(i64, Arc<Sender<Evaluation>>)>) =
             requests.into_iter()
             .map(|r| {
@@ -122,11 +119,11 @@ impl Batch {
         self.internal_length += length;
     }
 
-    pub fn extend(&mut self, vr: Vec<Request>) {
-        let length: i64 = vr.iter().fold(0, |acc, r| 
+    pub fn extend<T: AsRef<[Request]>>(&mut self, slice: T) {
+        let length: i64 = slice.as_ref().iter().fold(0, |acc, r| 
         acc + r.query.size()[0]);
         self.internal_length += length;
-        self.requests.extend(vr);
+        self.requests.extend(r);
     }
 
     // This will make the vr empty
@@ -551,6 +548,33 @@ pub fn self_play(
     Ok(())
 }
 
-pub fn make_episode() {
-    todo!()
+// N denotes the number of groups (different models)
+// ModuleShelf stores the model replicas and its variable stores, grouped by the model they are derived from.
+struct ModuleShelf<P: PVModel> {
+    // This separates the model by group id
+    table: Vec<Vec<(P, VarStore)>>,
+    // This is a look up function for model_name (file_name) <-> group id
+    name_lookup: Vec<OsString>,
+}
+
+impl<P: PVModel> ModuleShelf<P> {
+
+    fn module_shelf(table: Vec<Vec<(P, VarStore)>>, name_lookup: Vec<OsString>) -> Self{
+        Self { table, name_lookup }
+    }
+
+    fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize>
+    {
+        self.name_lookup
+            .iter()
+            .position(|os_str| os_str.borrow() == name.borrow())
+    }
+}
+
+// This struct collects the inference request during self-play and tournament, and batch them appropriately.
+// It is intended to be set up per machine
+struct InferenceManager<'a, P: PVModel> {
+
+    shelf: &'a ModuleShelf<P>,
+    
 }
