@@ -24,5 +24,7 @@ crossbeam = "0.8"
 arraydeque = "0.5"
 rv = "0.18"
 bincode = "2"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
 
 [lib]

@@ -34,7 +34,7 @@ use std::fs;
 // For reference, official pytorch does include BN weight and bias in the weight decay group.
 // If one decide to exclude them, one can simply call .set_group method on the Path instance to pass to the batch-norm creation function
 // and adjust the weight decay group in the optimizer accordingly.
-const NO_WEIGHT_DECAY_GROUP: usize = 1;
+pub const NO_WEIGHT_DECAY_GROUP: usize = 1;
 
 pub trait PVModel {
     pub fn new(vs: &nn::Path, config: ModelConfig) -> Self; 
@@ -42,11 +42,8 @@ pub trait PVModel {
     pub fn device(&self) -> Device;
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ModelConfig {
-    learning_rate: f32,
-    batch_size: i64,
-    input_history_length: usize,
     policy_out_features: i64,
     board_size: i64,
     value_hidden_layer_unit_count: i64,
@@ -359,9 +356,6 @@ mod tests {
     
     use crate::model::*;
     const CONFIG: ModelConfig = ModelConfig {
-        learning_rate: 0.01,
-        batch_size: 10,
-        input_history_length: 4,
         policy_out_features: 3,
         board_size: 5,
         value_hidden_layer_unit_count: 3, 

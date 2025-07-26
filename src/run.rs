@@ -3,18 +3,20 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
+use std::sync::RwLock;
 use std::time::Duration;
 use std::path::Path;
 use std::io::{Read, Seek, Cursor};
+use std::convert::AsRef;
 
 use crate::agent::MCTSConfig;
-use crate::model::ModelConfig;
+use crate::model::{self, ModelConfig};
 use crate::model::PVModel;
 use crate::replay_buffer::ReplayBuffer;
 use crate::run;
-use crate::self_play;
+use crate::self_play::{self, self_play_new, InferenceManager, ModuleShelf};
 use crate::self_play::self_play;
-use crate::train;
+use crate::train::{self, ModelSyncConfig, Trainer};
 use crate::replay_buffer;
 
 use color_eyre::eyre::eyre;
@@ -26,10 +28,12 @@ use mpi::datatype::Equivalence;
 
 use color_eyre::eyre::Result;
 use rand::prelude::*;
+use rv::traits::Mode;
 use tch::nn::ModuleT;
 use tch::nn::VarStore;
 use tch::vision::image::load;
 use tch::Device;
+use chrono::{Uts, Local};
 
 #[derive(Debug, Clone)]
 struct FenrirConfig {
@@ -48,7 +52,7 @@ struct FenrirConfig {
     run_time_hr: u64,
     momentum: f64,
     learning_rate_schedule: fn(usize) -> f64,
-    weight_decay_factor: f64,
+    weight_decay: f64,
 }
 
 const fn agz_lr_schedule(n_steps: usize) -> f64 {
@@ -62,43 +66,51 @@ const fn agz_lr_schedule(n_steps: usize) -> f64 {
 // Set up related stuff
 struct ModelSetupConfig{
     use_mpi: bool,
-    modules: Vec<ModuleLoadInfo>,
+    module_load_infos: Vec<ModuleLoadInfo>,
 }
 
-// This takes the output of the setup function (loaded models along with their var stores and their path names), and create correspondence between their names and their group id.
-// This function operates locally (inside each mpi node)
-fn create_lookup_table<P: PVModel>(rank: Option<i32>, loaded_model: Vec<(OsString, P, VarStore)>) -> 
-Result<(Vec<Vec<(P, VarStore)>>, Vec<OsString>)> {
-    
-    let mut table: Vec<Vec<(P, VarStore)>> = vec![];
-    let mut name_lookup: Vec<&OsStr> = vec![];
-
-    // taking XOR
-    if self.use_mpi ^ rank.is_some() {
-        return Err(eyre!(
-            "inconsistency in mpi usage-related input: rank should be None if and only if use_mpi is false"
-        ));
+impl ModelSetupConfig {
+    fn model_setup_config(use_mpi: bool, module_load_infos: Vec<ModuleLoadInfo>) -> Self {
+        Self {
+            use_mpi,
+            module_load_infos
+        }
     }
-    
-    for (name, model, vs) in loaded_model.into_iter() {
+    // This takes the output of the setup function (loaded models along with their var stores and their path names), and create correspondence between their names and their group id.
+    // This function operates locally (inside each mpi node)
+    fn create_lookup_table<P: PVModel>(&self, rank: Option<i32>, loaded_model: Vec<(OsString, P, VarStore)>) -> 
+    Result<(Vec<Vec<(P, VarStore)>>, Vec<OsString>)> {
         
-        if let Some(i) = rank && info.rank != i {
-            continue;
+        let mut table: Vec<Vec<(P, VarStore)>> = vec![];
+        let mut name_lookup: Vec<OsString> = vec![];
+
+        // taking XOR
+        if self.use_mpi ^ rank.is_some() {
+            return Err(eyre!(
+                "inconsistency in mpi usage-related input: rank should be None if and only if use_mpi is false"
+            ));
+        }
+        
+        for ((name, model, vs), info) in loaded_model.into_iter().zip(self.modules.iter()) {
+            
+            if let Some(i) = rank && info.rank != i {
+                continue;
+            }
+
+            if let Some(id) = name_lookup.iter().position(|&&s| s == name){
+                table.get_mut(id).unwrap().push((model, vs));
+            } else {
+                // If this is the first time that the 'name' comes up, 
+                table.push(vec![]);
+                name_lookup.push(name.clone());
+                table.last_mut().unwrap().push((model, vs));
+            }
         }
 
-        if let Some(id) = name_lookup.iter().position(|&&s| s == name){
-            table.get_mut(id).unwrap().push((model, vs));
-        } else {
-            // If this is the first time that the 'name' comes up, 
-            table.push(vec![]);
-            name_lookup.push(name.as_os_str());
-            table.last_mut().unwrap().push((model, vs));
-        }
-
+        Ok((table, name_lookup))
     }
-
-    Ok((table, name_lookup))
 }
+
 struct ModuleLoadInfo {
     // path to the file that stores the model weight
     path: OsString,
@@ -108,6 +120,17 @@ struct ModuleLoadInfo {
     device: Device,
     // model config
     config: ModelConfig,
+}
+
+impl ModuleLoadInfo {
+    fn module_load_info(path: OsString, rank: Option<i32>, device: Device, config: ModelConfig) -> Self {
+        Self{
+            path,
+            rank,
+            device,
+            config
+        }
+    }
 }
 
 fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> (OsString, P, VarStore) {
@@ -129,7 +152,7 @@ fn load_module_from_stream<P: PVModel, S: Read + Seek>(info: &ModuleLoadInfo, st
 
 }
 
-fn setup<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>>{
+fn setup<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>>{
 
     #[cfg(not(feature = "mpi"))]
     {
@@ -210,21 +233,21 @@ fn add_module_from_stream_to_list<P: PVModel, S: Seek + Read>(
 }
 
 // This function loads the models, ignoring the mpi options. It is intended to be used inside the 'setup' function
-fn setup_wo_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
+fn setup_wo_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
 
     let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
 
     let n_cuda = tch::Cuda::device_count();
     let mut available_cuda: Vec<Device>  = (0..n_cuda).map(|i| Device::Cuda(i)).collect();
 
-    for module_info in config.modules {
-        add_module_to_list(&module_info, &mut loaded_models, &mut available_cuda)?;
+    for module_info in config.modules.iter() {
+        add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?;
     }
     Ok(loaded_models)
 }
 
 #[cfg(feature = "mpi")]
-fn setup_w_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
+fn setup_w_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
 
     use mpi::traits::Communicator;
     // mpi related setup
@@ -237,7 +260,7 @@ fn setup_w_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P,
     let mut available_cuda: Vec<Device> = (0..n_cuda).map(|i| Device::Cuda(i)).collect();
     let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
 
-    for module_info in config.modules {
+    for module_info in config.modules.iter() {
 
         if module_info.rank != rank {
             continue;
@@ -246,10 +269,10 @@ fn setup_w_mpi<P: PVModel>(config: ModelSetupConfig) -> Result<Vec<(OsString, P,
         let path = Path::from(module_info.path);
 
         if path.exists() {
-            add_module_to_list(&module_info, &mut loaded_models, &mut available_cuda)?;
+            add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?;
         } else if rank != 0 {
             let cursor = request_model_from_root(&world, 0, path.as_os_str().to_str().unwrap());
-            add_module_from_stream_to_list(&module_info, loaded_models, available_cuda, cursor)?;
+            add_module_from_stream_to_list(module_info, loaded_models, available_cuda, cursor)?;
         } else {
             // If you are a root node and you can't find the file, then something has gone wrong.
             return Err(eyre!("Could not find the file {} on the root node.", path.as_os_str()));
@@ -324,25 +347,63 @@ fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
     Ok(())
 }
 
-fn run_wo_mpi_sequential(config: &FenrirConfig, model_config: &ModelConfig, mcts_config: &MCTSConfig) -> Result<()> {
-    assert!(!config.use_mpi);
-    let start = std::time::Instant::now();
-    let run_time = Duration::from_hours(config.run_time_hr);
-    let mut model_opt = None;
-    let mut rng = thread_rng();
-    while start.elapsed() < run_time {
+fn now_into_filename() -> OsString {
+    let now = Local::now();
+    let filename = format!("{}.pv", now.format("%Y%m%d_%H%M"));
+    filename.into()
+}
 
-        let replay_buffer = ReplayBuffer::new(config.replay_buffer_capacity);
-        self_play(
-            model_opt,
-            config.n_model_replica_self_play,
+fn run_wo_mpi_sequential<P: PVModel>(config: &FenrirConfig, model_config: &ModelConfig, mcts_config: &MCTSConfig) -> Result<()> {
+
+    assert!(!config.use_mpi);
+
+    // let start = std::time::Instant::now();
+    // let run_time = Duration::from_hours(config.run_time_hr);
+
+    // Create a new model
+    let vs = VarStore::new(Device::Cpu);
+    let new_model = P::new(vs.root(), model_config.clone());
+    let mut path: OsString = OsString::new().push("./test_models/").push(now_into_filename().as_os_str());
+
+    let modules_load_infos = vec![ModuleLoadInfo::module_load_info(path.clone(), None, Device::Cpu, model_config.clone())];
+    let model_setup_config = ModelSetupConfig::model_setup_config(false, modules_load_infos);
+    let loaded_modules = setup::<P>(model_setup_config)?;
+    let (table, name_lookup) = model_setup_config.create_lookup_table(None, loaded_modules)?;
+    let mut shelf = ModuleShelf::module_shelf(table, name_lookup);
+    let replay_buffer = ReplayBuffer::new(config.replay_buffer_capacity);
+    
+    let mut storage = Vec::<u8>::new();
+ 
+    for i in 0..2 {
+
+        if i != 0 {
+            shelf.update_modules_from_stream(0, Cursor::new(storage))?;
+        }
+
+        let (manager, request_senders) = InferenceManager::<P>::new(&mut shelf, config.mini_batch_size);
+
+        self_play_new(
+            manager,
+            request_senders[0],
             config.n_self_play_games,
-            config.replay_buffer_capacity,
-            model_config,
             mcts_config,
-            &replay_buffer
+            replay_buffer
         )?;
 
+        let trainer = Trainer::<P>::new::<tch::nn::Sgd>(
+            shelf.get_group_mut(0),
+            tch::nn::sgd(config.momentum, 0.0f64, config.weight_decay, false),
+            (config.learning_rate_schedule)(0),
+            config.weight_decay,
+            config.mini_batch_size,
+            ModelSyncConfig::new(train::SumOrAve::Ave)
+        )?;
+
+        trainer.train(config.n_training_step_per_cycle, config.n_training_step_per_cycle, replay_buffer)?;
+        trainer.save_to_stream(Cursor::new(&mut storage));
+
+        // path = OsString::new().push("./test_models/").push(now_into_filename().as_os_str());
+        // loaded_modules[0].2.save(path)?;
         
     }
 }

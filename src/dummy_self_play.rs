@@ -2,17 +2,17 @@
 #![allow(dead_code)]
 #![cfg(feature = "torch")]
 
-use color_eyre::owo_colors::OwoColorize;
 //internal
 use game::game::{Game, GameState, Side};
 use game::board::{TaflBoardEleven};
 use bitboard::eleven::{ElevenBoardPositionalEncoding, MoveOnBoardEleven};
+use mpi::datatype::MutView;
 use crate::{model, utils};
 use crate::replay_buffer::{self, Episode, EpisodeUnit, ReplayBuffer};
 use crate::model::{ModelConfig, PVModel};
 use crate::model::PVNet;
 use crate::model::Evaluation;
-use crate::agent::{self, Actor, MCTSConfig, MCTSTree, NewActor, PosteriorDist, Temperature};
+use crate::agent::{self, Actor, MCTSConfig, MCTSTree, Temperature, PosteriorDist};
 use crate::run::ModelSetupConfig;
 
 //external
@@ -26,8 +26,6 @@ use color_eyre::eyre::{eyre, Context, ErrReport, OptionExt, Result};
 // multithreading-related
 use crossbeam::channel::{unbounded, Sender, Receiver};
 use rayon::{iter::{IntoParallelIterator, ParallelIterator}};
-use tokio::task::JoinSet;
-use mpi::datatype::MutView;
 
 use std::mem::MaybeUninit;
 // std
@@ -40,7 +38,6 @@ use std::ffi::OsString;
 use std::path;
 use std::convert::AsRef;
 use std::borrow::Borrow;
-use std::io::{Read, Seek};
 
 // needs experimenting
 const BATCHSIZE: i64 = 64;
@@ -60,7 +57,6 @@ pub struct Batch {
     capacity: usize,
     send_threshold: i64,
     state: BatchState,
-    internal_length: i64,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -82,8 +78,7 @@ impl Batch {
             dispatcher: vec![],
             capacity,
             send_threshold,
-            state: BatchState::default(),
-            internal_length: 0i64,
+            state: BatchState::default()
         }
     }
 
@@ -541,6 +536,7 @@ pub fn self_play(
     Ok(())
 }
 
+// N denotes the number of groups (different models)
 // ModuleShelf stores the model replicas and its variable stores, grouped by the model they are derived from.
 pub struct ModuleShelf<P: PVModel, A: AsRef<P>> {
     // This separates the model by group id
@@ -551,7 +547,7 @@ pub struct ModuleShelf<P: PVModel, A: AsRef<P>> {
 
 impl<P: PVModel, A: AsRef<P>> ModuleShelf<P, A> {
 
-    pub fn module_shelf(table: Vec<Vec<(A, VarStore)>>, name_lookup: Vec<OsString>) -> Self{
+    pub fn module_shelf<P: PVModel, A: AsRef<P>>(table: Vec<Vec<(A, VarStore)>>, name_lookup: Vec<OsString>) -> Self{
         Self { table, name_lookup }
     }
 
@@ -560,23 +556,6 @@ impl<P: PVModel, A: AsRef<P>> ModuleShelf<P, A> {
         self.name_lookup
             .iter()
             .position(|os_str| os_str.borrow() == name.borrow())
-    }
-
-    pub fn update_modules_from_stream<S: Read + Seek>(&mut self, group_id: usize, stream: &mut S) -> Result<()> {
-
-        for (_, vs) in self.table[group_id].iter_mut() {
-            vs.load_from_stream(stream).wrap_err("module update failed")?
-        }
-
-        Ok(())
-    }
-
-    pub fn get_group<'a>(&'a self, group_id: usize) -> Option<&'a Vec<(A, VarStore)>> {
-        self.table.get(group_id)
-    }
-    
-    pub fn get_group_mut<'a>(&'a mut self, group_id: usize) -> Option<&'a mut Vec<(A, VarStore)>> {
-        self.table.get_mut(group_id)
     }
 }
 
@@ -597,14 +576,18 @@ impl NewBatch {
 
 // This struct collects the inference request during self-play and tournament, and batch them appropriately.
 // It is intended to be set up per machine
-pub struct InferenceManager<'a, P: PVModel> {
+pub struct InferenceManager<'a, P: PVModel, const N: usize> {
 
     shelf: &'a mut ModuleShelf<P, P>,
     batch: Vec<NewBatch>,
     request_receivers: Vec<Receiver<Request>>,
     status: Vec<Vec<ModuleStatus>>,
+    completion_receivers: Vec<Receiver<usize>>,
+    completion_senders: Vec<Sender<usize>>,
     batch_size: usize,
-    job_queue:  VecDeque<Job>
+    threads: [JoinHandle<()>; N],
+    job_senders: [Sender<(Tensor, P, usize, Vec<Arc<Sender<Evaluation>>>, Sender<usize>)>; N],
+    compass: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -622,23 +605,17 @@ impl Default for ModuleStatus {
 impl ModuleStatus {
     fn flip(&mut self) {
         match *self {
-            Self::Free => *self = Self::Occupied,
-            Self::Occupied => *self = Self::Free,
+            Self::Free => self = Self::Occupied,
+            Self::Occupied => self = Self::Free,
         };
     }
-    fn free(&mut self) {
-        *self = Self::Free;
-    }
-    fn occupy(&mut self) {
-        *self = Self::Occupied;
-    }
 }
-//          input, group_id, evaluation_sender
-type Job = (Tensor, usize, Vec<Arc<Sender<Evaluation>>>);
 
-impl<'a, P: PVModel> InferenceManager<'a, P> {
+type Job<P> = (Tensor, P, usize, Vec<Arc<Sender<Evaluation>>>, Sender<usize>);
 
-    pub fn new(ref_shelf: &'a mut ModuleShelf<P, P>, batch_size: usize) -> (Self, Vec<Sender<Request>>) {
+impl<'a, P: PVModel, const N: usize> InferenceManager<'a, P, N> {
+
+    pub fn new(ref_shelf: &'a mut ModuleShelf<P, P>, capacity: usize, send_threshold: usize, batch_size: usize) -> (Self, Vec<Sender<Request>>) {
 
         let len = ref_shelf.table.len();
         let batch = vec![NewBatch::new(); len];
@@ -646,11 +623,48 @@ impl<'a, P: PVModel> InferenceManager<'a, P> {
             vec![ModuleStatus::default(); x.len()]
         }).collect::<Vec<Vec<ModuleStatus>>>();
 
-        let (request_senders, request_receivers): (Vec<_>, Vec<_>) = (0..len)
-            .map(|_| { unbounded::<Request>() })
+
+        let (completion_senders, completion_receivers) : (Vec<_>, Vec<_>) = (0..len)
+            .map(|_| unbounded::<usize>())
             .unzip();
 
-        let job_queue = VecDeque::<Job>::new();
+        let (request_senders, request_receivers) : (Vec<_>, Vec<_>) = (0..len)
+            .map(|_| unbounded::<Request>())
+            .unzip();
+
+        let mut uninit_job_senders: [MaybeUninit::<Sender<Job<P>>>; N] = unsafe {
+            MaybeUninit::uninit().assume_init()
+        };
+        let mut uninit_job_receivers: [MaybeUninit::<Receiver<Job<P>>>; N] = unsafe {
+            MaybeUninit::uninit().assume_init()
+        };
+        for i in 0..N {
+            let (s,r) 
+            = unbounded::<Job<P>>();
+            uninit_job_senders[i].write(s);
+            uninit_job_receivers[i].write(r);
+        }
+
+        let job_senders: [Sender<Job<P>>; N] = unsafe {
+            std::mem::transmute(uninit_job_senders)
+        };
+        let job_receivers: [Receiver<Job<P>>; N] = unsafe {
+            std::mem::transmute(uninit_job_receivers)
+        };
+
+        let mut uninit_threads: [MaybeUninit<JoinHandle<()>>; N] = unsafe {
+            MaybeUninit::uninit().assume_init()
+        };
+
+        for i in 0..N {
+            uninit_threads[i].write(Self::spawn_job_thread(job_receivers[i]));
+        }
+
+        let threads: [JoinHandle<()>; N] = unsafe {
+            std::mem::transmute(uninit_threads)
+        };
+
+        let compass = 0usize;
 
         (Self { 
             shelf: ref_shelf,
@@ -658,133 +672,178 @@ impl<'a, P: PVModel> InferenceManager<'a, P> {
             request_receivers,
             status,
             batch_size,
-            job_queue
+            completion_receivers,
+            completion_senders,
+            threads,
+            job_senders,
+            compass,
         }, request_senders)
+    }
+
+    fn spawn_job_thread(job_receiver: Receiver<Job<P>>) -> JoinHandle<()> {
+        thread::spawn(move || {
+            while let Ok((
+                mini_batch,
+                module_ref,
+                module_id,
+                senders,
+                completion_sender
+            )) = job_receiver.recv() {
+
+                if let Err(e) = do_inference_job(mini_batch, module_ref, senders, module_id, completion_sender) {
+                    eprintln!("Inference job failed: {:?}", e);
+                }
+
+            }
+        })
     }
 
     pub fn n_group(&self) -> usize {
         self.batch.len()
     }
 
-    // Since tch Tensor does not implement Send + Sync, we utilize scoped threads to access module references.
+    // Look for the available module in the given group solely by looking at the status
+    fn get_available_module(&self, group_id: usize) -> Option<usize> {
+        let group_status = &self.status[group_id];
+        group_status.iter().position(|x| *x == ModuleStatus::Free)
+    }
+
+    fn increment_compass(&mut self) {
+        self.compass = (self.compass + 1) % N;
+    }
+
+    // look for the available module in the given group. When none is available, wait for job completion.
+    // side note: Ideally we should spend as little time as possible here (get_available_module should immediately return Some())
+    // maybe todo: add some dbg logic that counts how much time we spend inside the loop
+    fn wait_for_available_module(&mut self, group_id: usize) -> Result<usize> {
+
+        if group_id >= self.status.len() {
+            return Err(eyre!("group id out of bounds"));
+        }
+
+        if let Some(module_id) = self.get_available_module(group_id) {
+            return Ok(module_id);
+        }
+
+        loop {
+            match self.completion_receivers[group_id].recv() {
+                Ok(completed_module_id) => {
+
+                    self.status[group_id][completed_module_id] = ModuleStatus::Free;
+
+                    return Ok(completed_module_id)
+                }
+                Err(e) => {
+                    return Err(eyre!("Failed to receive inference job completion message for group {}: {:?}", group_id, e));
+                }
+            }
+        }
+    }
+
+    fn launch_inference_job(
+        &mut self,
+        group_id: usize,
+        module_id: usize,
+        mini_batch: Tensor,
+        senders: Vec<Arc<Sender<Evaluation>>>) -> Result<()> {
+
+            let module_ref = self.shelf.table[group_id][module_id].0.clone();
+            let completion_sender = self.completion_senders[group_id].clone();
+
+            self.job_senders[self.compass].send((mini_batch, module_ref, module_id, senders, completion_sender)).map_err(|e| {
+                eyre!("inference job was not sent: {:?}", e)
+            })?;
+
+            self.status[group_id][module_id] = ModuleStatus::Occupied;
+
+            Ok(())
+    }
+
+
+    fn process_batch(&mut self, group_id: usize) -> Result<()>{
+
+        if group_id >= self.shelf.table.len() {
+            return Err(eyre!("group id out of bounds"));
+        }
+
+        let mini_batch_size = std::cmp::min(self.batch_size, self.batch[group_id].requests.len());
+        if mini_batch_size == 0{
+            return Ok(());
+        }
+
+        let drain = self.batch[group_id].requests.drain(0..mini_batch_size);
+        let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
+            (request.query, request.sender)
+        }).unzip();
+        let mini_batch = Tensor::stack(queries.as_slice(), 0);
+
+        let module_id = self.wait_for_available_module(group_id)?;
+
+        self.launch_inference_job(group_id, module_id, mini_batch, senders)?;
+
+        // change the destination for the next job
+        self.increment_compass();
+
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<()> {
 
-        use tokio::sync::Mutex;
 
-        let job_queue = Arc::new(Mutex::new(self.job_queue));
-        let module_status = Arc::new(Mutex::new(self.status));
+        loop {
+            for (group_id, request_receiver) in self.request_receivers.iter().enumerate() {
 
-        thread::scope(|s| {
-            
-            s.spawn(|| {
-                loop{
+                if let Ok(request) = request_receiver.recv_timeout(DIRECTOR_RCV_TIMEOUT)
+                {
+                    self.batch[group_id].push_request(request);
 
-                    for (group_id, request_receiver) in self.request_receivers.iter().enumerate() {
+                    if self.batch[group_id].requests.len() >= self.batch_size {
 
-                        if let Ok(request) = request_receiver.try_recv() {
-                            &mut self.batch[group_id].push_request(request);
-
-                            if self.batch[group_id].requests.len() > self.batch_size {
-
-                                if group_id >= self.shelf.table.len() {
-                                    eprintln!("Group id out of bounds");
-                                    break;
-                                }
-
-                                let mini_batch_size = std::cmp::min(self.batch_size, self.batch[group_id].requests.len());
-                                if mini_batch_size == 0{
-                                    break;
-                                }
-
-                                let drain = self.batch[group_id].requests.drain(0..mini_batch_size);
-                                let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
-                                    (request.query, request.sender)
-                                }).unzip();
-
-                                let mini_batch = Tensor::stack(queries.as_slice(), 0);
-
-                                job_queue.blocking_lock().push_back((mini_batch, group_id, senders));
-                            }
-                        } else {
-                            continue;
-                        }
-
+                        self.process_batch(group_id)?;
                     }
+
                 }
-            });
-
-            s.spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-
-                        let join_set = JoinSet::new();
-                        loop {
-                            
-                            if let Some(job) = job_queue.blocking_lock().pop_front() {
-
-                                let (mini_batch, group_id, senders) = job;
-
-                                if let Some(module_id) = {
-                                    let mut status = module_status.blocking_lock();
-                                    let opt = status[group_id].iter().position(|x| *x == ModuleStatus::Free);
-                                    if let Some(module_id) = opt {
-                                        status[group_id][module_id].occupy();
-                                    }
-                                    opt
-                                } 
-                                {
-
-                                    let (module, _) = self.shelf.table[group_id].get(module_id).unwrap();
-                                    let device = module.device();
-
-                                    join_set.spawn(async {
-                                        do_inference_job(&mini_batch, module, &senders);
-                                        module_status.blocking_lock()[group_id][module_id].free();
-
-                                    });
-
-                                } else {
-                                    let opt = join_set.join_next().await;
-                                }
-                            } else {
-                                let opt = join_set.join_next().await;
-                            }
-                        }
-                    })
-            });
-        })
+                else {
+                    self.process_batch(group_id)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 fn do_inference_job<P: PVModel>(
-    mini_batch: &Tensor,
+    mini_batch: Tensor,
     module_ref: &P,
-    senders: &Vec<Arc<Sender<Evaluation>>>,
-)   -> Result<()> {
+    senders: Vec<Arc<Sender<Evaluation>>>,
+    module_id: usize,
+    completion_sender: Sender<usize>)
+    -> Result<()> {
 
     let module = module_ref;
     let device = module.device();
-    let input = mini_batch.to(device);
+    let input = mini_batch.to_device(device);
     let evaluation = module.evaluate_t(&input, false);
     let cpu_evaluation = evaluation.0.to(Device::Cpu).split(1, 0)
         .into_iter()
-        .zip(evaluation.1.to(Device::Cpu).split(1, 0).into_iter());
+        .zip(evaluation.1.to(Device::Cpu).split(1, 0)
+    );
 
     for (sender, evaluation) in senders.iter().zip(cpu_evaluation) {
         sender.send(evaluation)
         .map_err(|e| eyre!("Failed to send back inference result: {:?}", e))?;
     }
 
+    completion_sender.send(module_id)
+    .map_err(|e| eyre!("Failed to send inference job completion message: {:?}", e))?;
+
     Ok(())
 }
 
 
 // play the game for the specified amount using the specified model, create the replay buffer
-pub fn self_play_new<P: PVModel>(
-    manager: InferenceManager<'_, P>,
+pub fn self_play_new<P: PVModel, const N: usize>(
+    manager: InferenceManager<'_, P, N>,
     request_sender: Sender<Request>,
     num_games: usize,
     mcts_config: &MCTSConfig,
@@ -794,8 +853,8 @@ pub fn self_play_new<P: PVModel>(
     let request_sender = Arc::new(request_sender);
     let model_id = 0;
 
-    let manager_channel = thread::spawn( move || {
-        manager.run()
+    let directer_channel = thread::spawn( move || {
+        directer.run()
     });
 
 
@@ -805,7 +864,7 @@ pub fn self_play_new<P: PVModel>(
             let sender = Arc::new(sender);
             let game = Game::default();
             let mut mcts_tree = MCTSTree::generate(game, *mcts_config);
-            let actor = NewActor::new(request_sender.clone());
+            let actor = Actor::new_with_model_id(request_sender.clone(), model_id);
             (sender, receiver, mcts_tree, actor)
         }, 
     |(
@@ -829,7 +888,7 @@ pub fn self_play_new<P: PVModel>(
             replay_buffer.append_from_episode(&mut episode);
     });
 
-    manager_channel.join().unwrap();
+    directer_channel.join().unwrap();
 
     Ok(())
 }

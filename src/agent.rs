@@ -82,6 +82,56 @@ pub trait Oracle {
     fn infer(&self, game: &Game, actions: Option<Vec<&MoveOnBoardEleven>>) -> Result<(Tensor, f32)>;
 }
 
+pub struct NewActor {
+    sender: Arc<Sender<Request>>,
+}
+
+impl Oracle for Actor {
+
+    // returns the distribution of the valid actions and the value
+    fn infer(&self, game: &Game, actions: Option<Vec<&MoveOnBoardEleven>>) -> Result<(Tensor, f32)> {
+        let (s, r) = unbounded::<Evaluation>();
+        let mut rng = thread_rng();
+        let k: u8 = rng.gen_range(0..4);
+        let query: Query = TBoardEleven::get_pnet_input(game, Rotation::Do(k), (Kind::Float, Device::Cpu)).get();
+        let request: Request = Request::new(query, Arc::new(s));
+        self.sender.send(request)
+            .map_err(|_| ErrReport::msg("Could not send the inference request"))?;
+
+        let (pre_dist, pre_value) = r.recv()?;
+        // Not sure, but the received result should have the shape
+        // [1,20,11,11] and [1,1]
+        // Calling squeeze just in case
+        let value: f32 = pre_value.squeeze().f_double_value(&[0])? as f32;
+        
+        // mask has shape [20,11,11]
+        let mask = if let Some(mbes) = actions {
+            let vbms: Vec<VectorBasedMove> = mbes.iter()
+                .map(|&mbe| VectorBasedMove::convert_from(mbe))
+                .collect::<Result<Vec<_>>>()?;
+            TAction::vec_vbm_one_hot_encode(&vbms)
+        } else {
+            let vbms: Vec<VectorBasedMove> = game.get_possible_actions()
+                .into_iter().map(|mbe| VectorBasedMove::convert_from(&mbe))
+                .collect::<Result<Vec<_>>>()?;
+            TAction::vec_vbm_one_hot_encode(&vbms)
+        };
+
+        let pre_dist = pre_dist.squeeze().rot90(-1 * k as i64, [-2,-1]);
+        let dist = &pre_dist * mask.get().to_kind(Kind::Float);
+        let sum: f64 = dist.sum(Kind::Float).double_value(&[0]);
+        let dist = dist.divide_scalar(sum);
+        Ok((dist, value))
+
+    }
+}
+
+impl NewActor {
+    pub fn new(sender: Arc<Sender<Request>>) -> Self {
+        Self { sender }
+    }
+}
+
 pub struct Actor {
     sender: Arc<Sender<(Request, usize)>>,
     // model id will be passed to the director along with the query to determine which batch to push it into.
