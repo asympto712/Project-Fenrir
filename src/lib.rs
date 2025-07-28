@@ -1,6 +1,6 @@
 use rand::prelude::*;
 use bitflags::bitflags;
-use std::{fmt::Display, ops::*};
+use std::{fmt::{Display, Debug}, ops::*};
 
 pub mod eleven;
 pub mod seven;
@@ -15,7 +15,7 @@ pub enum Direction{
 
 pub trait PositionalEncoding:
     TryFrom<u8> +
-    TryFrom<String> +
+    TryFrom<String, Error = String> +
     Display
 {
     const BOARD_SIZE: u8;
@@ -25,7 +25,7 @@ pub trait PositionalEncoding:
 
 pub trait MoveOnBoard:
     Display +
-    TryFrom<String>
+    TryFrom<String, Error = String>
 {
     type Position: PositionalEncoding;
     fn new(start: Self::Position, dst: Self::Position) -> Self;
@@ -61,6 +61,7 @@ pub trait BitBoard:
     const ONLY_PAD: Self;
     const ONLY_EDGES: Self;
     const CORNERS: Self;
+    const BOARD_SIZE: u8;
 
     // required method
     fn new() -> Self;

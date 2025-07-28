@@ -476,6 +476,7 @@ impl BitBoard for BoardEleven{
     const ONLY_PAD: BoardEleven = BoardEleven{par1: 0xffff_800_800_800_800, par2: 0xffff_800_800_800_800, par3: 0xfffffff_800_800_800};
     const ONLY_EDGES: BoardEleven = BoardEleven{par1: 0x401_401_401_7ff, par2: 0x401_401_401_401, par3: 0x7ff_401_401};
     const CORNERS: BoardEleven = BoardEleven{par1: 0x000_000_000_401, par2: 0x000_000_000_000, par3: 0x401_000_000};
+    const BOARD_SIZE: u8 = 11;
 
     type Movement = MoveOnBoardEleven;
     type Position = ElevenBoardPositionalEncoding;

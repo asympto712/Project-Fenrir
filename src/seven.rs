@@ -390,6 +390,7 @@ impl BitBoard for BoardSeven{
     const ONLY_PAD: BoardSeven = BoardSeven(0x80_80_80_80_80_80_80);
     const ONLY_EDGES: BoardSeven = BoardSeven(0x7f_41_41_41_41_41_7f);
     const CORNERS: BoardSeven = BoardSeven(0x41_00_00_00_00_00_41);
+    const BOARD_SIZE: u8 = 7;
 
     type Movement = MoveOnBoardSeven;
     type Position = SevenBoardPositionalEncoding;
