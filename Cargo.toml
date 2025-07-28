@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 rawbytes = "1.0.1"
 bitflags = "2.9.1"
-rand = "0.9.1"
+rand = {workspace = true}
+bincode = "2"
 
 [lib]
 crate-type = ["rlib"]
