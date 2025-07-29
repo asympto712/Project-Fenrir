@@ -11,6 +11,7 @@ use tch::nn;
 use tch::nn::linear;
 use tch::nn::VarStore;
 use tch::Device;
+use tch::Kind;
 use tch::Tensor;
 use tch::nn::ConvConfigND;
 use tch::nn::Module;
@@ -36,10 +37,20 @@ use std::fs;
 // and adjust the weight decay group in the optimizer accordingly.
 pub const NO_WEIGHT_DECAY_GROUP: usize = 1;
 
+pub const MOCK_MODEL_CONFIG: ModelConfig = ModelConfig{
+    policy_out_features: 0,
+    board_size: 0,
+    value_hidden_layer_unit_count: 0,
+    num_convblocks: 0,
+    in_features: 0,
+    conv_filters: 0,
+    kernel_size: 0,
+};
+
 pub trait PVModel {
-    pub fn new(vs: &nn::Path, config: ModelConfig) -> Self; 
-    pub fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation;
-    pub fn device(&self) -> Device;
+    fn new(vs: &nn::Path, config: &ModelConfig) -> Self; 
+    fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation;
+    fn device(&self) -> Device;
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -60,6 +71,17 @@ impl ModelConfig {
         let config_str = fs::read_to_string(path)?;
         let params: ModelConfig = toml::from_str(&config_str)?;
         Ok(params)
+    }
+    pub fn new(
+        policy_out_features: i64,
+        board_size: i64,
+        value_hidden_layer_unit_count: i64,
+        num_convblocks: usize,
+        in_features: i64,
+        conv_filters: i64,
+        kernel_size: i64,
+    ) -> Self {
+        Self { policy_out_features, board_size, value_hidden_layer_unit_count, num_convblocks, in_features, conv_filters, kernel_size}
     }
 }
 
@@ -94,14 +116,14 @@ fn res_block(
     vs: &nn::Path,
     features: i64,
     ksize: i64,
-) -> impl ModuleT {
+) -> impl ModuleT + use<> {
     
     // setting the weight and bias of batch norm as exception for weight decay
     let vs_no_weight_decay = vs.set_group(NO_WEIGHT_DECAY_GROUP);
     let conv1 = nn::conv2d(vs / "conv1", features, features, ksize, conv_config(ksize));
-    let bn1 = nn::batch_norm2d(vs_no_weight_decay / "bn1", features, bn_config());
+    let bn1 = nn::batch_norm2d(&(vs_no_weight_decay.clone() / "bn1"), features, bn_config());
     let conv2 = nn::conv2d(vs / "conv2", features,features, ksize, conv_config(ksize));
-    let bn2 = nn::batch_norm2d(vs_no_weight_decay / "bn2", features, bn_config());
+    let bn2 = nn::batch_norm2d(&(vs_no_weight_decay / "bn2"), features, bn_config());
     nn::func_t(move |xs, train| {
         let ys = xs.apply(&conv1).apply_t(&bn1, train).relu().apply(&conv2).apply_t(&bn2, train);
         (xs + ys).relu()
@@ -114,7 +136,7 @@ fn conv_block(
     in_features: i64,
     out_features: i64,
     ksize: i64,
-) -> impl ModuleT {
+) -> impl ModuleT + use<> {
 
     let vs_no_weight_decay = vs.set_group(NO_WEIGHT_DECAY_GROUP);
     let conv = nn::conv2d(vs / "conv1", in_features, out_features, ksize, conv_config(ksize));
@@ -131,10 +153,10 @@ fn base_tower(
 ) -> nn::SequentialT {
 
     let mut seq = nn::seq_t();
-    seq.add(conv_block(vs / "block0", config.in_features, config.conv_filters, config.kernel_size));
+    seq = seq.add(conv_block(&(vs / "block0"), config.in_features, config.conv_filters, config.kernel_size));
     for i in 1..=config.num_convblocks {
 
-        seq.add(res_block(vs / &format!("block{}", i), config.conv_filters, config.kernel_size));
+        seq = seq.add(res_block(&(vs / &format!("block{}", i)), config.conv_filters, config.kernel_size));
     }
     seq
 }
@@ -145,8 +167,8 @@ fn fenrir_policy_head(
 ) -> nn::SequentialT {
 
     nn::seq_t()
-        .add(conv_block(vs / "conv layer", config.conv_filters, config.conv_filters, config.kernel_size))
-        .add(conv_block(vs / "logit layer", config.conv_filters, config.policy_out_features, 1))
+        .add(conv_block(&(vs / "conv layer"), config.conv_filters, config.conv_filters, config.kernel_size))
+        .add(conv_block(&(vs / "logit layer"), config.conv_filters, config.policy_out_features, 1))
 }
 
 fn fenrir_value_head(
@@ -159,7 +181,7 @@ fn fenrir_value_head(
         .add_fn(|ts| ts.view([ts.size()[0], -1])) // (BS, N * N)
         .add(linear(vs / "linear", config.board_size * config.board_size, 256, Default::default()))
         .add_fn(|ts| ts.relu())
-        .add_fn(linear(vs / "linear2", 256, 1, Default::default()))
+        .add(linear(vs / "linear2", 256, 1, Default::default()))
         .add_fn(|ts| ts.tanh())
 }
 
@@ -172,12 +194,12 @@ struct GeneralPVDualModel {
 }
 
 impl PVModel for GeneralPVDualModel {
-    fn new(vs: &nn::Path, config: ModelConfig) -> Self {
+    fn new(vs: &nn::Path, config: &ModelConfig) -> Self {
         
-        let base = base_tower(vs / "base", &config);
-        let p_head = fenrir_policy_head(vs / "p-head", &config);
-        let v_head = fenrir_value_head(vs / "v-head", &config);
-        Self { base, p_head, v_head, config, device: vs.device()}
+        let base = base_tower(&(vs / "base"), &config);
+        let p_head = fenrir_policy_head(&(vs / "p-head"), &config);
+        let v_head = fenrir_value_head(&(vs / "v-head"), &config);
+        Self { base, p_head, v_head, config: config.clone(), device: vs.device()}
     }
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
@@ -186,7 +208,7 @@ impl PVModel for GeneralPVDualModel {
         let minus_side = v[0].contiguous();
         let based = minus_side.apply_t(&self.base, train);
         // (BS, Conv_filters, N, N)
-        let base_output = Tensor::cat(&[based, v[1]], 1);
+        let base_output = Tensor::cat(&[&based, &v[1]], 1);
         let base_output = base_output.contiguous(); // Again, not sure if needed
         let logits = base_output.apply_t(&self.p_head, train);
         let value = base_output.apply_t(&self.v_head, train);
@@ -208,7 +230,7 @@ impl PVModel for GeneralPVDualModel {
 }
 
 
-struct GeneralPVSepModel<'a> {
+struct GeneralPVSepModel {
     p_base: nn::SequentialT,
     v_base: nn::SequentialT,
     p_head: nn::SequentialT,
@@ -218,13 +240,13 @@ struct GeneralPVSepModel<'a> {
 }
 
 impl PVModel for GeneralPVSepModel {
-    fn new(vs: &nn::Path, config: ModelConfig) -> Self {
+    fn new(vs: &nn::Path, config: &ModelConfig) -> Self {
         
-        let p_base = base_tower(vs / "p-base", &config);
-        let v_base = base_tower(vs / "v-base", &config);
-        let p_head = fenrir_policy_head(vs / "p-head", &config);
-        let v_head = fenrir_value_head(vs / "v-head", &config);
-        Self { p_base, v_base, p_head, v_head, config, device: vs.device()}
+        let p_base = base_tower(&( vs / "p-base" ), &config);
+        let v_base = base_tower(&( vs / "v-base" ), &config);
+        let p_head = fenrir_policy_head(&( vs / "p-head" ), &config);
+        let v_head = fenrir_value_head(&( vs / "v-head" ), &config);
+        Self { p_base, v_base, p_head, v_head, config: config.clone(), device: vs.device()}
     }
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
@@ -320,9 +342,9 @@ pub struct PVNet {
 
 impl PVNet {
     pub fn model(vs: &nn::Path, config: &ModelConfig) -> Self {
-        let base_net = base_net(&(vs / "base"), config);
-        let policy_head = policy_head(&(vs / "policy_head"), config);
-        let value_head = value_head(&(vs / "value_head"), config);
+        let base_net = alpha_go_base_net(&(vs / "base"), config);
+        let policy_head = alpha_go_policy_head(&(vs / "policy_head"), config);
+        let value_head = alpha_go_value_head(&(vs / "value_head"), config);
 
         Self { base_net, policy_head, value_head } 
     }
@@ -339,15 +361,15 @@ impl PVNet {
 
 fn pnet(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
     let mut seq = nn::seq();
-    seq = seq.add(base_net(&(vs / "base"), config));
-    seq = seq.add(policy_head(&(vs / "head"), config));
+    seq = seq.add(alpha_go_base_net(&(vs / "base"), config));
+    seq = seq.add(alpha_go_policy_head(&(vs / "head"), config));
     seq
 }
 
 fn vnet(vs: &nn::Path, config: &ModelConfig) -> nn::Sequential {
     let mut seq = nn::seq();
-    seq = seq.add(base_net(&(vs / "base"), config));
-    seq = seq.add(value_head(&(vs / "head"), config));
+    seq = seq.add(alpha_go_base_net(&(vs / "base"), config));
+    seq = seq.add(alpha_go_value_head(&(vs / "head"), config));
     seq
 }
 

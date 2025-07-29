@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 #![allow(unused)]
 
+use std::borrow::{Borrow, BorrowMut};
 use std::collections::HashMap;
+use std::io::Write;
 
 use crate::model::*;
-use crate::model::PVModel::*;
+use crate::model::PVModel;
 use crate::replay_buffer::ReplayBuffer;
 
 use rand::rngs::ThreadRng;
@@ -17,7 +19,7 @@ use tch::{Kind, Device};
 #[cfg(feature = "torch")]
 use tch::nn::{Optimizer, OptimizerConfig};
 
-use color_eyre::eyre::{self, eyre, Context, ErrReport, Result};
+use color_eyre::eyre::{self, eyre, Context, ErrReport, OptionExt, Result};
 use rand::{prelude, thread_rng};
 
 
@@ -39,9 +41,9 @@ impl ModelSyncConfig {
 }
 
 pub struct LossValue {
-    pub total: f32,
-    pub cross_entropy: f32,
-    pub mse: f32,
+    pub total: f64,
+    pub cross_entropy: f64,
+    pub mse: f64,
 }
 
 impl LossValue {
@@ -50,19 +52,19 @@ impl LossValue {
     }
 }
 
-fn sync_grads<T: AsRef<[VarStore]>>(vss: T, names: Vec<String>, config: ModelSyncConfig) -> Result<()> {
+fn sync_grads<V: BorrowMut<VarStore>>(vss: &mut [V], names: &[String], config: ModelSyncConfig) -> Result<()> {
 
-    let n_model = vss.as_ref().len();
+    let n_model = vss.len();
     if n_model <= 1 {
-        return ErrReport::msg("no need to sync");
+        return Err(ErrReport::msg("no need to sync"));
     }
-    let n_model = tch::Scalar::float(n_model as f64);
     let device = Device::Cpu;
 
     for name in names.iter() {
 
-        let mut vs_iter = vss.as_ref().iter();
+        let mut vs_iter = vss.iter();
         let mut sum = vs_iter.next().unwrap()
+            .borrow()
             .variables()
             .get(name)
             .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?
@@ -72,6 +74,7 @@ fn sync_grads<T: AsRef<[VarStore]>>(vss: T, names: Vec<String>, config: ModelSyn
 
         for vs in vs_iter{
             sum += vs
+                .borrow()
                 .variables()
                 .get(name)
                 .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?
@@ -80,25 +83,29 @@ fn sync_grads<T: AsRef<[VarStore]>>(vss: T, names: Vec<String>, config: ModelSyn
                 .to(device);
         }
         
+        let denom = tch::Scalar::float(n_model as f64);
         let reduced_grad = match config.grad {
             SumOrAve::Ave => {
-                sum.divide_scalar(n_model)
+                sum.divide_scalar(denom)
             }
             SumOrAve::Sum => {
                 sum
             }
         };
 
-        for vs in vss.as_ref.iter(){
-            let mut grad = vs.variables()
-                .get(name)
-                .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?
-                .grad();
+        for vs in vss.iter_mut(){
 
-            reduced_grad.to_device(grad.device());
-            grad.copy_(&reduced_grad);
+            let borrow: &mut VarStore = vs.borrow_mut();
+            let value = reduced_grad.to_device(borrow.device());
+            borrow.variables()
+                .get_mut(name)
+                .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?
+                .grad()
+                .copy_(&value);
+
         }
     }
+    Ok(())
 }
 
 // The paper from facebook (https://arxiv.org/abs/1706.02677) claims that the syncing of 
@@ -113,19 +120,19 @@ fn sync_grads<T: AsRef<[VarStore]>>(vss: T, names: Vec<String>, config: ModelSyn
 // and I might have to observe the actual statistics of each neuron activation.
 // On the other hand, I might be better off using other normalization technique than BN, such as Group N or Layer N.
 // Using Layer Normalization will remove the need for this additional sync completely.
-fn sync_bn_stats<T: AsRef<[VarStore]>>(vss: T, names: Vec<String>) -> Result<()> {
+fn sync_bn_stats<V: BorrowMut<VarStore>>(vss: &mut [V], names: &[String]) -> Result<()> {
 
-    let n_model = vss.as_ref.len();
+    let n_model = vss.len();
     if n_model <= 1 {
-        return ErrReport::msg("no need to sync");
+        return Err(ErrReport::msg("no need to sync"));
     }
-    let n_model = tch::Scalar::float(n_model as f64);
     let device = Device::Cpu;
 
     for name in names.iter() {
 
-        let mut vs_iter = vss.as_ref.iter();
+        let mut vs_iter = vss.iter();
         let mut sum = vs_iter.next().unwrap()
+            .borrow()
             .variables()
             .get(name)
             .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?
@@ -134,6 +141,7 @@ fn sync_bn_stats<T: AsRef<[VarStore]>>(vss: T, names: Vec<String>) -> Result<()>
 
         for vs in vs_iter{
             sum += vs
+                .borrow()
                 .variables()
                 .get(name)
                 .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?
@@ -141,26 +149,29 @@ fn sync_bn_stats<T: AsRef<[VarStore]>>(vss: T, names: Vec<String>) -> Result<()>
                 .to(device);
         }
 
-        let mut ave = sum.divide_scalar(n_model);
+        let denom = tch::Scalar::float(n_model as f64);
+        let mut ave = sum.divide_scalar(denom);
 
-        for vs in vss.as_ref.iter(){
-            let mut stat = vs.variables()
-                .get(name)
-                .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?;
+        for vs in vss.iter_mut(){
 
-            ave.to_device(stat.device());
-            stat.copy_(&ave);
+            let borrow: &mut VarStore = vs.borrow_mut();
+            let value = ave.to_device(borrow.device());
+            borrow.variables()
+                .get_mut(name)
+                .ok_or_else(|| eyre!(format!("Couldn't find the variable {}", name)))?
+                .copy_(&value);
+
         }
     }
     Ok(())
 
 }
 
-fn get_trainable_var_names<T: AsRef<[VarStore]>>(vss: T) -> Result<Vec<String>> {
+fn get_trainable_var_names<V: Borrow<VarStore>>(vss: &[V]) -> Result<Vec<String>> {
 
-    let var_store = vss.as_ref()[0];
+    let var_store = vss[0].borrow();
     let len = var_store.len();
-    if !vss.as_ref().iter().all(|vs| vs.len() == len) {
+    if !vss.iter().all(|vs| vs.borrow().len() == len) {
         return Err(eyre!("input VarStores don't share the same length"));
     }
     let variables = var_store.variables();
@@ -170,18 +181,19 @@ fn get_trainable_var_names<T: AsRef<[VarStore]>>(vss: T) -> Result<Vec<String>> 
         // so far I've checked, these are the only name patterns used by tch for trainable variables
         if key.contains("weight") || key.contains("bias") {
 
-            for vs in vss.as_ref.iter(){
-                let ts = vs
+            for vs in vss.iter(){
+
+                let borrow: &VarStore = vs.borrow();
+                if !borrow
                     .variables()
                     .get(key.as_str())
-                    .ok_or_else(eyre!("variable {} does not exist in one of the VarStores", key))?;
+                    .ok_or(eyre!("variable {} does not exist in one of the VarStores", key))?
+                    .requires_grad() {
+                        return Err(eyre!("Variable {} does not track its gradient!", key));
+                    }
 
-                if ts.requires_grad() {
-                    names.push(key.clone());
-                } else {
-                    return Err(eyre!("Variable {} does not track its gradient!", key));
-                }
             }
+            names.push(key.clone());
 
         }
     }
@@ -189,11 +201,11 @@ fn get_trainable_var_names<T: AsRef<[VarStore]>>(vss: T) -> Result<Vec<String>> 
     Ok(names)
 }
 
-fn get_bn_mean_names<T: AsRef<[VarStore]>>(vss: T) -> Option<Vec<String>> {
+fn get_bn_mean_names<V: Borrow<VarStore>>(vss: &[V]) -> Option<Vec<String>> {
 
-    let var_store = vss.as_ref()[0];
+    let var_store = vss[0].borrow();
     let len = var_store.len();
-    if !vss.iter().all(|vs| vs.len() == len) {
+    if !vss.iter().all(|vs| vs.borrow().len() == len) {
         return None;
     }
     let variables = var_store.variables();
@@ -203,17 +215,13 @@ fn get_bn_mean_names<T: AsRef<[VarStore]>>(vss: T) -> Option<Vec<String>> {
         // so far I've checked, these are the only name patterns used by tch for trainable variables
         if key.contains("running_mean") {
 
-            for vs in vss.as_ref().iter(){
-                let opt = vs.variables().get(key.as_str());
-                match opt {
-                    Some(_) => {
-                        names.push(key.clone());
-                    },
-                    None => {
-                        return None;
-                    }
-                }
+            for vs in vss.iter(){
+                let borrow: &VarStore = vs.borrow();
+                if None == borrow.variables().get(key.as_str()) {
+                    return None;
+                } 
             }
+            names.push(key.clone());
 
         }
     }
@@ -222,11 +230,11 @@ fn get_bn_mean_names<T: AsRef<[VarStore]>>(vss: T) -> Option<Vec<String>> {
 
 }
 
-fn get_bn_var_names<T: AsRef<[VarStore]>>(vss: T) -> Option<Vec<String>> {
+fn get_bn_var_names<V: Borrow<VarStore>>(vss: &[V]) -> Option<Vec<String>> {
 
-    let var_store = vss.as_ref()[0];
+    let var_store = vss[0].borrow();
     let len = var_store.len();
-    if !vss.iter().all(|vs| vs.len() == len) {
+    if !vss.iter().all(|vs| vs.borrow().len() == len) {
         return None;
     }
     let variables = var_store.variables();
@@ -236,18 +244,13 @@ fn get_bn_var_names<T: AsRef<[VarStore]>>(vss: T) -> Option<Vec<String>> {
         // so far I've checked, these are the only name patterns used by tch for trainable variables
         if key.contains("running_var") {
 
-            for vs in vss.as_ref().iter(){
-                let opt = vs.variables().get(key.as_str());
-                match opt {
-                    Some(_) => {
-                        names.push(key.clone());
-                    },
-                    None => {
-                        return None;
-                    }
-                }
+            for vs in vss.iter(){
+                let borrow: &VarStore = vs.borrow();
+                if None == vs.borrow().variables().get(key.as_str()) {
+                    return None;
+                } 
             }
-
+            names.push(key.clone());
         }
     }
 
@@ -255,10 +258,9 @@ fn get_bn_var_names<T: AsRef<[VarStore]>>(vss: T) -> Option<Vec<String>> {
 
 }
 
-pub struct Trainer<P: PVModel> {
-    replicas: &mut Vec<(P, VarStore)>,
+pub struct Trainer<'a, P: PVModel> {
+    replicas: &'a mut Vec<(P, VarStore)>,
     optimizers: Vec<Optimizer>,
-    n_step: usize,
     mini_batch_size: usize,
     trainable_var_names: Vec<String>,
     bn_stats_names: Vec<String>,
@@ -267,9 +269,9 @@ pub struct Trainer<P: PVModel> {
     rng: ThreadRng,
 }
 
-impl<P: PVModel> Trainer<P> {
-    pub fn new<O: OptimizerConfig>(
-        replicas: &mut Vec<(P, VarStore)>,
+impl<'a, P: PVModel> Trainer<'a, P> {
+    pub fn new<O: OptimizerConfig + Clone>(
+        replicas: &'a mut Vec<(P, VarStore)>,
         config: O,
         lr: f64,
         weight_decay: f64,
@@ -281,11 +283,15 @@ impl<P: PVModel> Trainer<P> {
             return Err(eyre!("models has to have at least one element"));
         }
 
-        let optimizers = replicas.iter().map(|(module, vs)| {
-            let mut optim = config.build(vs, lr)?;
-            optim.set_weight_decay_group(NO_WEIGHT_DECAY_GROUP, weight_decay);
-            optim
-        }).collect::<Vec<_>>();
+        let optimizers= replicas.iter().map(|(module, vs)| {
+
+            if let Ok(mut optim) = config.clone().build(vs, lr) {
+                optim.set_weight_decay_group(NO_WEIGHT_DECAY_GROUP, weight_decay);
+                Ok(optim)
+            } else {
+                Err(eyre!("Failed to build OptimConfig"))
+            }
+        }).collect::<Result<Vec<_>>>()?;
 
         let vss = replicas.iter().map(|(_, vs)| {
             vs
@@ -294,12 +300,12 @@ impl<P: PVModel> Trainer<P> {
         let trainable_var_names = get_trainable_var_names(&vss)?;
 
         // Get batch norm layer stats names
-        let mut bn_stats_names = get_bn_mean_names(&vss)?;
-        bn_stats_names.extend(get_bn_var_names(&vss));
+        let mut bn_stats_names = get_bn_mean_names(&vss).ok_or_eyre("Could not get batch norm mean names")?;
+        bn_stats_names.extend(get_bn_var_names(&vss).ok_or_eyre("Could not get batch norm var names")?);
 
         let loss_record: Vec<LossValue> = vec![];
         let rng = thread_rng();
-        Self { replicas, optimizers, n_step, mini_batch_size, trainable_var_names, bn_stats_names, sync_config, loss_record, rng}
+        Ok(Self { replicas, optimizers, mini_batch_size, trainable_var_names, bn_stats_names, sync_config, loss_record, rng})
     }
 
     // Sample from the replay_buffer, calculate the forward pass on each replica and return the average loss value
@@ -314,7 +320,7 @@ impl<P: PVModel> Trainer<P> {
             // sample mini-batch from the replay buffer and do the forward pass
             let device = replica.device();
             let (mut position, mut policy, mut reward) 
-                = replay_buffer.sample_batch(self.mini_batch_size, (Kind::Float, Device::Cpu), &mut rng)?;
+                = replay_buffer.sample_batch(self.mini_batch_size, (Kind::Float, Device::Cpu), &mut self.rng).unwrap();
             position = position.to_device(device);
             policy = policy.to_device(device);
             reward = reward.to_device(device);
@@ -332,9 +338,9 @@ impl<P: PVModel> Trainer<P> {
             let mse = mse.to(Device::Cpu);
 
             //  add to the total losses
-            cross_entropy_loss += cross_entropy.double_value([0]);
-            mse_loss += mse.double_value([0]);
-            total_loss += loss.double_value([0]);
+            cross_entropy_loss += cross_entropy.double_value(&[0]);
+            mse_loss += mse.double_value(&[0]);
+            total_loss += loss.double_value(&[0]);
             
         }
 
@@ -342,30 +348,35 @@ impl<P: PVModel> Trainer<P> {
         return LossValue::loss_value( total_loss / denominator, cross_entropy_loss / denominator, mse_loss / denominator)
     }
 
-    fn sync_grads(&self) -> Result<()>{
+    fn sync_grads(&mut self) -> Result<()>{
 
         if self.replicas.len() == 1 {
-            Ok(())
+            return Ok(());
         }
-        let vss = self.replicas.iter().map(|(_, vs)| { vs }).collect::<Vec<_>>();
-        sync_grads(vss, self.trainable_var_names, self.sync_config)
+        let mut vss = self.replicas.iter_mut().map(|(_, vs)| { vs }).collect::<Vec<_>>();
+        sync_grads(vss.as_mut_slice(), self.trainable_var_names.as_slice(), self.sync_config)
     }
 
-    fn sync_bn_stats(&self) -> Result<()> {
+    fn sync_bn_stats(&mut self) -> Result<()> {
 
         if self.replicas.len() == 1 {
-            Ok(())
+            return Ok(());
         }
-        let vss = self.replicas.iter().map(|(_, vs)| { vs }).collect::<Vec<_>>();
-        sync_bn_stats(vss, self.bn_stats_names)
+        let mut vss = self.replicas.iter_mut().map(|(_, vs)| { vs }).collect::<Vec<_>>();
+        sync_bn_stats(vss.as_mut_slice(), self.bn_stats_names.as_slice())
     }
 
     fn step(&mut self, replay_buffer: &ReplayBuffer, sync_bn_stats: bool) -> Result<()> {
 
         if self.replicas.len() == 1 {
 
-            let batch = replay_buffer.sample_batch(self.mini_batch_size, (Kind::Float, Device::Cpu), &mut rng)?;
-            train_from_batch(self.replicas.get(0)?, self.optimizers.get(0)?, batch);
+            let batch = replay_buffer.sample_batch(self.mini_batch_size, (Kind::Float, Device::Cpu), &mut self.rng)?;
+            let loss_value = train_from_batch(
+                &self.replicas.get(0).ok_or_eyre("Could not get model replica")?.0,
+                self.optimizers.get_mut(0).ok_or_eyre("Could not mutably get optimizer")?,
+                batch
+            );
+            self.loss_record.push(loss_value);
 
         } else {
 
@@ -379,9 +390,10 @@ impl<P: PVModel> Trainer<P> {
                 optimizer.step();
             }
         }
+        Ok(())
     }
 
-    pub fn train<A: AsRef<ReplayBuffer>>(&mut self, n_steps: usize, sync_bn_stats_every: usize, replay_buffer: A) -> Result<()> {
+    pub fn train<B: Borrow<ReplayBuffer>>(&mut self, n_steps: usize, sync_bn_stats_every: usize, replay_buffer: B) -> Result<()> {
 
         for i in 0..n_steps {
             let sync_bn_stats: bool = 
@@ -389,7 +401,7 @@ impl<P: PVModel> Trainer<P> {
                 else if i == n_steps - 1 {true} 
                 else { false }
             ; 
-            self.step(replay_buffer.as_ref(), sync_bn_stats)?;
+            self.step(replay_buffer.borrow(), sync_bn_stats)?;
         }
         Ok(())
     }

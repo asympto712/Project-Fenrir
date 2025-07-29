@@ -13,7 +13,6 @@ use crate::model::{ModelConfig, PVModel};
 use crate::model::PVNet;
 use crate::model::Evaluation;
 use crate::agent::{self, Actor, MCTSConfig, MCTSTree, NewActor, PosteriorDist, Temperature};
-use crate::run::ModelSetupConfig;
 
 //external
 use tch::Tensor;
@@ -24,23 +23,26 @@ use tch::nn::VarStore;
 use color_eyre::eyre::{eyre, Context, ErrReport, OptionExt, Result};
 
 // multithreading-related
-use crossbeam::channel::{unbounded, Sender, Receiver};
+use crossbeam::channel::{unbounded, bounded, Receiver, Sender, TryRecvError};
 use rayon::{iter::{IntoParallelIterator, ParallelIterator}};
 use tokio::task::JoinSet;
 use mpi::datatype::MutView;
 
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 // std
 use std::path::Path;
 use std::thread::{self, current, JoinHandle};
 use std::sync::{Arc, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
-use std::ffi::OsString;
+use std::ffi::{OsString, OsStr};
 use std::path;
 use std::convert::AsRef;
 use std::borrow::Borrow;
 use std::io::{Read, Seek};
+use std::sync::Mutex as StdMutex;
 
 // needs experimenting
 const BATCHSIZE: i64 = 64;
@@ -118,9 +120,9 @@ impl Batch {
         self.requests.push(r);
     }
 
-    pub fn extend<T: AsRef<[Request]>>(&mut self, slice: T) {
-        self.requests.extend_from_slice(slice.as_ref());
-    }
+    // pub fn extend<T: AsRef<[Request]>>(&mut self, slice: T) {
+    //     self.requests.extend_from_slice(slice.as_ref());
+    // }
 
     // This will make the vr empty
     pub fn append(&mut self, vr: &mut Vec<Request>) {
@@ -179,9 +181,9 @@ pub struct Directer<P: PVModel> {
     model_lookup: HashMap::<String, usize>
 }
 
-impl<P: PVModel> Directer<P: PVModel> {
+impl<P: PVModel> Directer<P> {
     // Creates a new instance of Directer along with the Sender corresponding to its receiver.
-    pub fn new<P: PVModel, S: AsRef<OsString>>(config: &ModelConfig, new_model_count: i64, trained_models: Vec<(i64, S)>, batch_capacity: usize) -> Result<(Self, Sender<(Request, usize)>)> {
+    pub fn new<S: AsRef<OsStr>>(config: &ModelConfig, new_model_count: i64, trained_models: Vec<(i64, S)>, batch_capacity: usize) -> Result<(Self, Sender<(Request, usize)>)> {
 
         let mut device_allocation: Vec<Device> = vec![];
         let mut modules: Vec<P> = vec![];
@@ -198,7 +200,7 @@ impl<P: PVModel> Directer<P: PVModel> {
         let mut cuda_index: usize = 0;
         for (id_minus_one, (n, ostr)) in trained_models.iter().enumerate()
         {
-            let path = path::Path::new(ostr.as_ref());
+            let path = path::Path::new(ostr);
             debug_assert!(path.is_file());
             let mut module_indices = vec![];
             for _ in 0..*n
@@ -222,7 +224,7 @@ impl<P: PVModel> Directer<P: PVModel> {
                 module_indices.push(modules.len());
                 modules.push(net);
             }
-            model_lookup.insert(path.clone(), model_id);
+            model_lookup.insert(path.as_os_str().to_str().unwrap().to_string(), model_id);
             module_ind.push(module_indices);
             model_id += 1;
         }
@@ -472,7 +474,7 @@ impl<P: PVModel> Directer<P: PVModel> {
 
 
 // play the game for the specified amount using the specified model, create the replay buffer
-pub fn self_play(
+pub fn self_play<P: PVModel + Send + 'static>(
     model_opt: Option<String>,
     n_replica: usize,
     num_games: usize,
@@ -484,14 +486,14 @@ pub fn self_play(
 
     let (mut directer, sender) = match model_opt {
 
-        Some(ref model_name) => Directer::new(
+        Some(ref model_name) => Directer::<P>::new::<String>(
             model_config, 
             0,
-            vec![(n_replica, model_name.clone())],
+            vec![(n_replica.try_into().unwrap(), model_name.clone())],
             batch_capacity),
-        None => Directer::new(
+        None => Directer::<P>::new::<String>(
             model_config,
-            n_replica,
+            n_replica.try_into().unwrap(),
             vec![],
             batch_capacity)
 
@@ -541,45 +543,141 @@ pub fn self_play(
     Ok(())
 }
 
-// ModuleShelf stores the model replicas and its variable stores, grouped by the model they are derived from.
-pub struct ModuleShelf<P: PVModel, A: AsRef<P>> {
-    // This separates the model by group id
-    table: Vec<Vec<(A, VarStore)>>,
-    // This is a look up function for model_name (file_name) <-> group id
-    name_lookup: Vec<OsString>,
+// Trait that holds (references to) loaded modules.
+pub trait Shelf {
+    fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize>;
+    fn update_modules_from_stream<S: Read + Seek>(&mut self, group_id: usize, stream: &mut S) -> Result<()>;
+    fn get_group_sizes(&self) -> Vec<usize>;
 }
 
-impl<P: PVModel, A: AsRef<P>> ModuleShelf<P, A> {
+impl <S: Shelf + ?Sized> Shelf for &'_ mut S {
+    fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize> {
+        (**self).get_group_id(name)
+    }
+    fn update_modules_from_stream<R: Read + Seek>(&mut self, group_id: usize, stream: &mut R) -> Result<()> {
+        (**self).update_modules_from_stream(group_id, stream)
+    }
+    fn get_group_sizes(&self) -> Vec<usize> {
+        (**self).get_group_sizes()
+    }
+} 
 
-    pub fn module_shelf(table: Vec<Vec<(A, VarStore)>>, name_lookup: Vec<OsString>) -> Self{
-        Self { table, name_lookup }
+// ModuleShelf stores the model replicas and its variable stores, grouped by the model they are derived from.
+pub struct ModuleShelf<P: PVModel + Send, B: Borrow<P>> {
+    // This separates the model by group id
+    table: Vec<Vec<(B, VarStore)>>,
+    // This is a look up function for model_name (file_name) <-> group id
+    name_lookup: Vec<OsString>,
+    _marker: PhantomData<P>,
+}
+
+impl<P: PVModel + Send, B: Borrow<P>> ModuleShelf<P, B> {
+
+    pub fn module_shelf(table: Vec<Vec<(B, VarStore)>>, name_lookup: Vec<OsString>) -> Self{
+        Self { table, name_lookup, _marker: PhantomData}
     }
 
-    pub fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize>
-    {
-        self.name_lookup
-            .iter()
-            .position(|os_str| os_str.borrow() == name.borrow())
-    }
-
-    pub fn update_modules_from_stream<S: Read + Seek>(&mut self, group_id: usize, stream: &mut S) -> Result<()> {
-
-        for (_, vs) in self.table[group_id].iter_mut() {
-            vs.load_from_stream(stream).wrap_err("module update failed")?
-        }
-
-        Ok(())
-    }
-
-    pub fn get_group<'a>(&'a self, group_id: usize) -> Option<&'a Vec<(A, VarStore)>> {
+    pub fn get_group<'a>(&'a self, group_id: usize) -> Option<&'a Vec<(B, VarStore)>> {
         self.table.get(group_id)
     }
     
-    pub fn get_group_mut<'a>(&'a mut self, group_id: usize) -> Option<&'a mut Vec<(A, VarStore)>> {
+    pub fn get_group_mut<'a>(&'a mut self, group_id: usize) -> Option<&'a mut Vec<(B, VarStore)>> {
         self.table.get_mut(group_id)
     }
 }
 
+impl<P: PVModel + Send, B: Borrow<P>> Shelf for ModuleShelf<P, B> {
+
+    fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize> {
+        self.name_lookup
+            .iter()
+            .position(|os_str| os_str.as_os_str() == name.borrow())
+    }
+
+    fn get_group_sizes(&self) -> Vec<usize> {
+        self.table.iter().map(|group| {
+            group.len()
+        }).collect::<Vec<_>>()
+    }
+
+    fn update_modules_from_stream<S: Read + Seek>(&mut self, group_id: usize, stream: &mut S) -> Result<()> {
+        for (_, vs) in self.table[group_id].iter_mut() {
+            vs.load_from_stream(&mut *stream).wrap_err("module update failed")?
+        }
+        Ok(())
+    }
+}
+
+// Special type of Shelf with Module and VarStore are locked behind mutex. Intended use is for multithreaded scenarios
+pub struct LockedShelf<P: PVModel + Send> {
+    table: Vec<Vec<(StdMutex<P>, StdMutex<VarStore>)>>,
+    name_lookup: Vec<OsString>,
+}
+
+impl<P: PVModel + Send> LockedShelf<P> {
+
+    pub fn new(table: Vec<Vec<(StdMutex<P>, StdMutex<VarStore>)>>, name_lookup: Vec<OsString>) -> Self{
+        Self { table, name_lookup }
+    }
+
+    pub fn convert_from_shelf(shelf: ModuleShelf<P, P>) -> Self {
+        let name_lookup = shelf.name_lookup;
+        let wrapped_table = shelf.table.into_iter()
+            .map(|group| {
+                group.into_iter()
+                    .map(|(module, vs)| {
+                        (StdMutex::new(module), StdMutex::new(vs))
+                    }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>();
+
+        Self{
+            table: wrapped_table,
+            name_lookup
+        }
+    }
+
+    pub fn convert_into_shelf(self) -> ModuleShelf<P, P> {
+        let unlocked_table = self.table.into_iter()
+            .map(|group| {
+                group.into_iter()
+                    .map(|(wrapped_module, wrapped_var_store)| {
+                        (wrapped_module.into_inner().unwrap(), wrapped_var_store.into_inner().unwrap())
+                    }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>();
+        
+        ModuleShelf { table: unlocked_table, name_lookup: self.name_lookup, _marker: PhantomData }
+    }
+
+    pub fn get_group<'a>(&'a self, group_id: usize) -> Option<&'a Vec<(StdMutex<P>, StdMutex<VarStore>)>> {
+        self.table.get(group_id)
+    }
+    
+    pub fn get_group_mut<'a>(&'a mut self, group_id: usize) -> Option<&'a mut Vec<(StdMutex<P>, StdMutex<VarStore>)>> {
+        self.table.get_mut(group_id)
+    }
+}
+
+impl<P: PVModel + Send> Shelf for LockedShelf<P> {
+
+    fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize> {
+        self.name_lookup
+            .iter()
+            .position(|os_str| os_str.as_os_str() == name.borrow())
+    }
+
+    fn update_modules_from_stream<S: Read + Seek>(&mut self, group_id: usize, stream: &mut S) -> Result<()> {
+        for (_, vs) in self.table[group_id].iter_mut() {
+            vs.lock().unwrap().load_from_stream(&mut *stream).wrap_err("module update failed")?
+        }
+        Ok(())
+    }
+    
+    fn get_group_sizes(&self) -> Vec<usize> {
+        self.table.iter().map(|group| {
+            group.len()
+        }).collect::<Vec<_>>()
+    }
+}
 struct NewBatch {
     requests: VecDeque<Request>,
 }
@@ -595,19 +693,7 @@ impl NewBatch {
     }
 }
 
-// This struct collects the inference request during self-play and tournament, and batch them appropriately.
-// It is intended to be set up per machine
-pub struct InferenceManager<'a, P: PVModel> {
-
-    shelf: &'a mut ModuleShelf<P, P>,
-    batch: Vec<NewBatch>,
-    request_receivers: Vec<Receiver<Request>>,
-    status: Vec<Vec<ModuleStatus>>,
-    batch_size: usize,
-    job_queue:  VecDeque<Job>
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum ModuleStatus {
     Free,
     Occupied,
@@ -633,133 +719,183 @@ impl ModuleStatus {
         *self = Self::Occupied;
     }
 }
-//          input, group_id, evaluation_sender
+
+
+// This struct collects the inference request during self-play and tournament, and batch them appropriately.
+// It is intended to be set up per machine
+// _marker is for when one wants it to hold a reference to the shelf (so in case S: &T where T: Shelf)
+pub struct InferenceManager<'a, P: PVModel + Send, S: Shelf> {
+
+    shelf: S,
+    batch: Vec<NewBatch>,
+    request_receivers: Vec<Receiver<Request>>,
+    status: Vec<Vec<ModuleStatus>>,
+    batch_size: usize,
+    _marker: PhantomData<&'a P>,
+}
+
+//input, group_id, evaluation_sender
+// This implements Send, but not Sync, tch::Tensor: !Sync 
 type Job = (Tensor, usize, Vec<Arc<Sender<Evaluation>>>);
 
-impl<'a, P: PVModel> InferenceManager<'a, P> {
+impl<'a, P: PVModel + Send, S: Shelf> InferenceManager<'a, P, S> {
 
-    pub fn new(ref_shelf: &'a mut ModuleShelf<P, P>, batch_size: usize) -> (Self, Vec<Sender<Request>>) {
+    pub fn new(shelf: S, batch_size: usize) -> (Self, Vec<Sender<Request>>) {
 
-        let len = ref_shelf.table.len();
-        let batch = vec![NewBatch::new(); len];
-        let status = ref_shelf.table.iter().map(|x| {
-            vec![ModuleStatus::default(); x.len()]
+        let group_sizes = shelf.get_group_sizes();
+        let batch = group_sizes.iter().map(|_| NewBatch::new()).collect::<Vec<_>>();
+        let status = group_sizes.iter().map(|x| {
+            vec![ModuleStatus::default(); *x]
         }).collect::<Vec<Vec<ModuleStatus>>>();
 
-        let (request_senders, request_receivers): (Vec<_>, Vec<_>) = (0..len)
+        let (request_senders, request_receivers): (Vec<_>, Vec<_>) = group_sizes.iter()
             .map(|_| { unbounded::<Request>() })
             .unzip();
 
-        let job_queue = VecDeque::<Job>::new();
-
         (Self { 
-            shelf: ref_shelf,
+            shelf,
             batch,
             request_receivers,
             status,
             batch_size,
-            job_queue
+            _marker: PhantomData
         }, request_senders)
     }
 
     pub fn n_group(&self) -> usize {
         self.batch.len()
     }
+}
 
-    // Since tch Tensor does not implement Send + Sync, we utilize scoped threads to access module references.
-    pub fn run(&mut self) -> Result<()> {
 
-        use tokio::sync::Mutex;
+// Since InferenceManager will have PhantomData<&'a P> to make it versatile, and PhantomData inherits the trait of P, it is not Sync.
+// In reality it is Sync + Send 
+unsafe impl<P: PVModel + Send> Sync for InferenceManager<'_, P, &'_ mut LockedShelf<P>> {}
+unsafe impl<P: PVModel + Send> Send for InferenceManager<'_, P, &'_ mut LockedShelf<P>> {}
 
-        let job_queue = Arc::new(Mutex::new(self.job_queue));
-        let module_status = Arc::new(Mutex::new(self.status));
 
-        thread::scope(|s| {
-            
-            s.spawn(|| {
+impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
+
+    pub fn consume_and_run(self) -> Result<()> {
+
+        let (termination_sender, termination_receiver) = bounded(1);
+        let job_queue = Arc::new(StdMutex::new(VecDeque::<Job>::new()));
+
+        let batch = Arc::new(
+            self.batch.into_iter().map(|b| {
+            StdMutex::new(b)
+            }).collect::<Vec<_>>()
+        );
+
+        let module_status = Arc::new(
+            self.status.into_iter().map(|vs| {
+                StdMutex::new(vs)
+            }).collect::<Vec<_>>()
+        );
+
+        let locked_shelf = Arc::new(self.shelf);
+
+        thread::scope(|s| -> Result<()> {
+            // thread to listen to the incoming inference requests
+            let batch_clone = Arc::clone(&batch);
+            let job_queue_clone = Arc::clone(&job_queue);
+
+            let organizer = s.spawn(move || {
+
+                let req_rec_iter = self.request_receivers.into_iter();
+
                 loop{
 
-                    for (group_id, request_receiver) in self.request_receivers.iter().enumerate() {
+                    let mut all_disconnected: bool = true;
 
-                        if let Ok(request) = request_receiver.try_recv() {
-                            &mut self.batch[group_id].push_request(request);
+                    for (group_id, request_receiver) in req_rec_iter.clone().enumerate() {
 
-                            if self.batch[group_id].requests.len() > self.batch_size {
+                        match request_receiver.try_recv() {
+                            Ok(request) => {
 
-                                if group_id >= self.shelf.table.len() {
-                                    eprintln!("Group id out of bounds");
-                                    break;
+                                all_disconnected = false;
+                                let mut b = batch_clone[group_id].lock().unwrap();
+                                b.push_request(request);
+
+                                if b.requests.len() > self.batch_size {
+
+                                    let mini_batch_size = std::cmp::min(self.batch_size,b.requests.len());
+                                    if mini_batch_size == 0{
+                                        eprintln!("mini_batch size was set to 0");
+                                    }
+
+                                    let drain = b.requests.drain(0..mini_batch_size);
+                                    let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
+                                        (request.query, request.sender)
+                                    }).unzip();
+
+                                    let mini_batch = Tensor::stack(queries.as_slice(), 0);
+                                    job_queue_clone.lock().unwrap().push_back((mini_batch, group_id, senders));
                                 }
 
-                                let mini_batch_size = std::cmp::min(self.batch_size, self.batch[group_id].requests.len());
-                                if mini_batch_size == 0{
-                                    break;
-                                }
-
-                                let drain = self.batch[group_id].requests.drain(0..mini_batch_size);
-                                let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
-                                    (request.query, request.sender)
-                                }).unzip();
-
-                                let mini_batch = Tensor::stack(queries.as_slice(), 0);
-
-                                job_queue.blocking_lock().push_back((mini_batch, group_id, senders));
+                            },
+                            Err(TryRecvError::Empty) => {
+                                all_disconnected = false;
+                            },
+                            Err(TryRecvError::Disconnected) => {
+                                // Only in this case don't set all_disconnected = false.
+                                // If this happens for all of the receivers we will get true in the end
+                                ();
                             }
-                        } else {
-                            continue;
                         }
+                    }
+                    if all_disconnected { break; }
+                }
+                termination_sender.send(()).unwrap();
+            });
 
+            // thread(s) to do the inference job, communicating with GPUs
+            let module_status_clone = Arc::clone(&module_status);
+            let job_queue_clone2 = job_queue.clone();
+            let infer = s.spawn(move || -> Result<()> {
+
+                loop {
+                    while let Some(job) = job_queue_clone2.lock().unwrap().pop_front() {
+
+                        let (mini_batch, group_id, senders) = job;
+
+                        if let Some(module_id) = {
+
+                            let mut module_status_guard = module_status_clone[group_id].lock().unwrap();
+                            let opt = module_status_guard.iter().position(|x| *x == ModuleStatus::Free);
+                            // We need to change the status BEFORE other (potential) threads will try to access it
+                            if let Some(module_id) = opt {
+                                module_status_guard[module_id].occupy();
+                            }
+                            opt
+
+                        } {
+                            let module = locked_shelf.table[group_id][module_id].0.lock().unwrap();
+                            let result = do_inference_job(&mini_batch, &*module, &senders);
+                            module_status_clone[group_id].lock().unwrap()[module_id].free();
+                        } else {
+                            job_queue_clone2.lock().unwrap().push_front((mini_batch, group_id, senders));
+                            thread::sleep(Duration::from_micros(100));
+                        }
+                    }
+                    if let Ok(_) = termination_receiver.try_recv() {
+                        break Ok(());
                     }
                 }
             });
 
-            s.spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
+            let _ = organizer.join().map_err(|_| ErrReport::msg("Thread join failed"))?;
+            let _ = infer.join().map_err(|_| ErrReport::msg("Thread join failed"))??;
+            Ok(())
 
-                        let join_set = JoinSet::new();
-                        loop {
-                            
-                            if let Some(job) = job_queue.blocking_lock().pop_front() {
+        })?;
 
-                                let (mini_batch, group_id, senders) = job;
-
-                                if let Some(module_id) = {
-                                    let mut status = module_status.blocking_lock();
-                                    let opt = status[group_id].iter().position(|x| *x == ModuleStatus::Free);
-                                    if let Some(module_id) = opt {
-                                        status[group_id][module_id].occupy();
-                                    }
-                                    opt
-                                } 
-                                {
-
-                                    let (module, _) = self.shelf.table[group_id].get(module_id).unwrap();
-                                    let device = module.device();
-
-                                    join_set.spawn(async {
-                                        do_inference_job(&mini_batch, module, &senders);
-                                        module_status.blocking_lock()[group_id][module_id].free();
-
-                                    });
-
-                                } else {
-                                    let opt = join_set.join_next().await;
-                                }
-                            } else {
-                                let opt = join_set.join_next().await;
-                            }
-                        }
-                    })
-            });
-        })
+        Ok(())
     }
+
 }
 
-fn do_inference_job<P: PVModel>(
+fn do_inference_job<P: PVModel + Send>(
     mini_batch: &Tensor,
     module_ref: &P,
     senders: &Vec<Arc<Sender<Evaluation>>>,
@@ -781,10 +917,40 @@ fn do_inference_job<P: PVModel>(
     Ok(())
 }
 
+fn do_inference_job_sync<P: PVModel + Send>(
+    mini_batch: &Tensor,
+    module_ref: &Arc<StdMutex<&P>>,
+    senders: &Vec<Arc<Sender<Evaluation>>>,
+) -> Result<()> {
+
+    let evaluation = {
+        let module = module_ref.lock().unwrap();
+        let device = module.device();
+        let input = mini_batch.to(device);
+        let mut evaluation = module.evaluate_t(&input, false);
+        
+        // Move to CPU before releasing the lock
+        evaluation.0 = evaluation.0.to(Device::Cpu);
+        evaluation.1 = evaluation.1.to(Device::Cpu);
+        evaluation
+    }; // Lock is released here
+
+    let cpu_evaluation = evaluation.0.split(1, 0)
+        .into_iter()
+        .zip(evaluation.1.split(1, 0).into_iter());
+
+    for (sender, evaluation) in senders.iter().zip(cpu_evaluation) {
+        sender.send(evaluation)
+        .map_err(|e| eyre!("Failed to send back inference result: {:?}", e))?;
+    }
+
+    Ok(())
+}
+
 
 // play the game for the specified amount using the specified model, create the replay buffer
-pub fn self_play_new<P: PVModel>(
-    manager: InferenceManager<'_, P>,
+pub fn self_play_new<'a, P: PVModel + Send>(
+    manager: InferenceManager<'a, P, &'a mut LockedShelf<P>>,
     request_sender: Sender<Request>,
     num_games: usize,
     mcts_config: &MCTSConfig,
@@ -794,42 +960,48 @@ pub fn self_play_new<P: PVModel>(
     let request_sender = Arc::new(request_sender);
     let model_id = 0;
 
-    let manager_channel = thread::spawn( move || {
-        manager.run()
+    let ts = thread::scope::<'a>(|s| -> Result<()>{
+
+        let t = s.spawn( move || {
+            manager.consume_and_run()
+        });
+
+        (0..num_games).into_par_iter().for_each_init(
+            || {
+                let (sender, receiver) = unbounded::<Evaluation>();
+                let sender = Arc::new(sender);
+                let game = Game::default();
+                let mut mcts_tree = MCTSTree::generate(game, *mcts_config);
+                let actor = NewActor::new(request_sender.clone());
+                (sender, receiver, mcts_tree, actor)
+            }, 
+        |(
+                vp_sender,
+                vp_receiver,
+                mcts_tree,
+                actor
+            ), worker_idx| {
+
+                let mut episode: Episode = Episode::new();
+
+                while !mcts_tree.root_is_terminal() {
+                    let (game,_, posterior) = mcts_tree.get_policy_and_update::<NewActor>(&actor).unwrap();
+                    episode.append_wo_reward(&game, posterior);
+                }
+                let winner = mcts_tree.get_winner();
+                match winner {
+                    Side::Att => episode.give_reward(1i64),
+                    Side::Def => episode.give_reward(-1i64),
+                };
+                replay_buffer.append_from_episode(&mut episode);
+        });
+
+        drop(request_sender); // just in case
+
+        t.join().map_err(|_| ErrReport::msg("Thread join failed"))??;
+        Ok(())
+
     });
 
-
-    (0..num_games).into_par_iter().for_each_init(
-        || {
-            let (sender, receiver) = unbounded::<Evaluation>();
-            let sender = Arc::new(sender);
-            let game = Game::default();
-            let mut mcts_tree = MCTSTree::generate(game, *mcts_config);
-            let actor = NewActor::new(request_sender.clone());
-            (sender, receiver, mcts_tree, actor)
-        }, 
-    |(
-            vp_sender,
-            vp_receiver,
-            mcts_tree,
-            actor
-        ), worker_idx| {
-
-            let mut episode: Episode = Episode::new();
-
-            while !mcts_tree.root_is_terminal() {
-                let (game,_, posterior) = mcts_tree.get_policy_and_update(actor).unwrap();
-                episode.append_wo_reward(&game, posterior);
-            }
-            let winner = mcts_tree.get_winner();
-            match winner {
-                Side::Att => episode.give_reward(1i64),
-                Side::Def => episode.give_reward(-1i64),
-            };
-            replay_buffer.append_from_episode(&mut episode);
-    });
-
-    manager_channel.join().unwrap();
-
-    Ok(())
+    ts
 }

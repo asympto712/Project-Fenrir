@@ -16,16 +16,3 @@ pub mod run;
 pub mod utils;
 
 
-// internal
-use game::board::TaflBoardEleven;
-use game::game::Game;
-use bitboard::Direction;
-use bitboard::eleven::{MoveOnBoardEleven, ElevenBoardPositionalEncoding};
-
-// external
-#[cfg(feature = "torch")]
-use tch::Tensor;
-
-use color_eyre::eyre::{ErrReport, Result};
-
-

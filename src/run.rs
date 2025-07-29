@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use std::path::Path;
 use std::io::{Read, Seek, Cursor};
@@ -14,12 +14,13 @@ use crate::model::{self, ModelConfig};
 use crate::model::PVModel;
 use crate::replay_buffer::ReplayBuffer;
 use crate::run;
-use crate::self_play::{self, self_play_new, InferenceManager, ModuleShelf};
+use crate::self_play::{self, self_play_new, InferenceManager, LockedShelf, ModuleShelf};
 use crate::self_play::self_play;
 use crate::train::{self, ModelSyncConfig, Trainer};
 use crate::replay_buffer;
+use crate::self_play::Shelf;
 
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{eyre, OptionExt};
 use mpi::point_to_point::*;
 use mpi::topology::SimpleCommunicator;
 use mpi::traits::Communicator;
@@ -33,7 +34,9 @@ use tch::nn::ModuleT;
 use tch::nn::VarStore;
 use tch::vision::image::load;
 use tch::Device;
-use chrono::{Uts, Local};
+use chrono::{Utc, Local};
+
+const BUFFER_LEN: usize = 1024;
 
 #[derive(Debug, Clone)]
 struct FenrirConfig {
@@ -91,13 +94,13 @@ impl ModelSetupConfig {
             ));
         }
         
-        for ((name, model, vs), info) in loaded_model.into_iter().zip(self.modules.iter()) {
+        for ((name, model, vs), info) in loaded_model.into_iter().zip(self.module_load_infos.iter()) {
             
-            if let Some(i) = rank && info.rank != i {
+            if let Some(i) = rank && info.rank != Some(i) {
                 continue;
             }
 
-            if let Some(id) = name_lookup.iter().position(|&&s| s == name){
+            if let Some(id) = name_lookup.iter().position(|s| *s == name){
                 table.get_mut(id).unwrap().push((model, vs));
             } else {
                 // If this is the first time that the 'name' comes up, 
@@ -135,10 +138,10 @@ impl ModuleLoadInfo {
 
 fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> (OsString, P, VarStore) {
 
-    let path = Path::from(info.path);
+    let path = Path::new(&info.path);
     let mut vs = VarStore::new(info.device);
-    let module: P = P::new(&vs.root(), info.config);
-    vs.load(path);
+    let module: P = P::new(&vs.root(), &info.config);
+    vs.load(path).unwrap();
     (info.path.to_owned(), module, vs)
 
 }
@@ -146,8 +149,8 @@ fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> (OsString, P, VarStore) {
 fn load_module_from_stream<P: PVModel, S: Read + Seek>(info: &ModuleLoadInfo, stream: S) -> (OsString, P, VarStore) {
 
     let mut vs = VarStore::new(info.device);
-    let module: P = P::new(&vs.root(), info.config);
-    vs.load_from_stream(stream);
+    let module: P = P::new(&vs.root(), &info.config);
+    vs.load_from_stream(stream).unwrap();
     (info.path.to_owned(), module, vs)
 
 }
@@ -187,19 +190,22 @@ fn add_module_to_list<P: PVModel>(info: &ModuleLoadInfo, list: &mut Vec<(OsStrin
         Device::Cpu => {
             let (name, module, var_store) = load_module::<P>(&info);
             list.push((name, module, var_store));
+            Ok(())
         },
         Device::Cuda(i) => {
 
             if !available_cuda.contains(&info.device) {
                 return Err(eyre!("cuda allocation failed: Check the ModelSetupConfig again"));
             }
-            available_cuda.remove(i);
+            let device_index = available_cuda.iter().position(|&d| d == info.device).ok_or_eyre("Could not find the device")?;
+            available_cuda.remove(device_index);
             let (name, module, var_store) = load_module::<P>(&info);
             list.push((name, module, var_store));
+            Ok(())
             
         },
         _ => {
-            return Err(eyre!("unexpected device encountered"));
+            Err(eyre!("unexpected device encountered"))
         }
     }
 }
@@ -215,19 +221,22 @@ fn add_module_from_stream_to_list<P: PVModel, S: Seek + Read>(
         Device::Cpu => {
             let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream);
             list.push((name, module, var_store));
+            Ok(())
         },
         Device::Cuda(i) => {
 
             if !available_cuda.contains(&info.device) {
                 return Err(eyre!("cuda allocation failed: Check the ModelSetupConfig again"));
             }
-            available_cuda.remove(i);
+            let device_index = available_cuda.iter().position(|&d| d == info.device).ok_or_eyre("Could not find the device")?;
+            available_cuda.remove(device_index);
             let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream);
             list.push((name, module, var_store));
+            Ok(())
             
         },
         _ => {
-            return Err(eyre!("unexpected device encountered"));
+            Err(eyre!("unexpected device encountered"))
         }
     }
 }
@@ -238,9 +247,9 @@ fn setup_wo_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, 
     let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
 
     let n_cuda = tch::Cuda::device_count();
-    let mut available_cuda: Vec<Device>  = (0..n_cuda).map(|i| Device::Cuda(i)).collect();
+    let mut available_cuda: Vec<Device>  = (0..n_cuda).map(|i| Device::Cuda(i as usize)).collect();
 
-    for module_info in config.modules.iter() {
+    for module_info in config.module_load_infos.iter() {
         add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?;
     }
     Ok(loaded_models)
@@ -251,31 +260,31 @@ fn setup_w_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P
 
     use mpi::traits::Communicator;
     // mpi related setup
-    let universe = mpi::initialize()?;
+    let universe = mpi::initialize().ok_or_eyre("mpi initialization failed")?;
     let world = universe.world();
     let rank = world.rank();
     let size = world.size();
 
     let n_cuda = tch::Cuda::device_count();
-    let mut available_cuda: Vec<Device> = (0..n_cuda).map(|i| Device::Cuda(i)).collect();
+    let mut available_cuda: Vec<Device> = (0..n_cuda).map(|i| Device::Cuda(i as usize)).collect();
     let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
 
-    for module_info in config.modules.iter() {
+    for module_info in config.module_load_infos.iter() {
 
-        if module_info.rank != rank {
+        if module_info.rank != Some(rank) {
             continue;
         }
 
-        let path = Path::from(module_info.path);
+        let path = Path::new(&module_info.path);
 
         if path.exists() {
             add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?;
         } else if rank != 0 {
             let cursor = request_model_from_root(&world, 0, path.as_os_str().to_str().unwrap());
-            add_module_from_stream_to_list(module_info, loaded_models, available_cuda, cursor)?;
+            add_module_from_stream_to_list(module_info, &mut loaded_models, &mut available_cuda, cursor)?;
         } else {
             // If you are a root node and you can't find the file, then something has gone wrong.
-            return Err(eyre!("Could not find the file {} on the root node.", path.as_os_str()));
+            return Err(eyre!("Could not find the file {:?} on the root node.", path.as_os_str()));
         }
     }
 
@@ -293,12 +302,12 @@ fn request_model_from_root(world: &SimpleCommunicator, root: i32, path: &str) ->
     world.process_at_rank(root).send(path.as_bytes());
 
     let mut data: Vec<u8> = Vec::new();
-    let mut buffer = vec![0u8; 1024];
+    let mut buffer = vec![0u8; BUFFER_LEN];
     loop {
 
         let status = world.any_process().receive_into(&mut buffer);
         let just_a_byte = u8::equivalent_datatype();
-        let count = status.count(just_a_byte);
+        let count = status.count(just_a_byte) as usize;
         if count == 0 { break; }
         else {
             data.extend_from_slice(&buffer[..count]);
@@ -317,7 +326,7 @@ fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
     for rank in 1..size {
 
         let (v, status) = world.process_at_rank(rank).receive_vec::<u8>();
-        let filename = str::from_utf8(v)?;
+        let filename = std::str::from_utf8(&v)?;
 
         if filename == "NoMoreRequest" {
             continue;
@@ -327,10 +336,10 @@ fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
         if !path.exists() {
             return Err(eyre!("The requested file {} does not exist in the root rank", filename));
         }
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         let target = world.process_at_rank(status.source_rank());
 
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0u8; BUFFER_LEN];
         loop {
             let count = file.read(&mut buffer)?;
             if count == 0 {
@@ -353,7 +362,7 @@ fn now_into_filename() -> OsString {
     filename.into()
 }
 
-fn run_wo_mpi_sequential<P: PVModel>(config: &FenrirConfig, model_config: &ModelConfig, mcts_config: &MCTSConfig) -> Result<()> {
+fn run_wo_mpi_sequential<P: PVModel + Send + 'static>(config: &FenrirConfig, model_config: ModelConfig, mcts_config: MCTSConfig) -> Result<()> {
 
     assert!(!config.use_mpi);
 
@@ -362,36 +371,45 @@ fn run_wo_mpi_sequential<P: PVModel>(config: &FenrirConfig, model_config: &Model
 
     // Create a new model
     let vs = VarStore::new(Device::Cpu);
-    let new_model = P::new(vs.root(), model_config.clone());
-    let mut path: OsString = OsString::new().push("./test_models/").push(now_into_filename().as_os_str());
+    let new_model = P::new(&vs.root(), &model_config);
+    let mut path: OsString = {
+        let mut p = OsString::new();
+        p.push("./test_models/");
+        p.push(now_into_filename().as_os_str());
+        p
+    };
 
     let modules_load_infos = vec![ModuleLoadInfo::module_load_info(path.clone(), None, Device::Cpu, model_config.clone())];
     let model_setup_config = ModelSetupConfig::model_setup_config(false, modules_load_infos);
-    let loaded_modules = setup::<P>(model_setup_config)?;
+    let loaded_modules = setup::<P>(&model_setup_config)?;
     let (table, name_lookup) = model_setup_config.create_lookup_table(None, loaded_modules)?;
+
     let mut shelf = ModuleShelf::module_shelf(table, name_lookup);
     let replay_buffer = ReplayBuffer::new(config.replay_buffer_capacity);
     
-    let mut storage = Vec::<u8>::new();
+    let mut storage = Cursor::new(Vec::<u8>::new());
  
     for i in 0..2 {
 
+        let mut locked_shelf = LockedShelf::<P>::convert_from_shelf(shelf);
+
         if i != 0 {
-            shelf.update_modules_from_stream(0, Cursor::new(storage))?;
+            locked_shelf.update_modules_from_stream(0, &mut storage)?;
         }
 
-        let (manager, request_senders) = InferenceManager::<P>::new(&mut shelf, config.mini_batch_size);
+        let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.mini_batch_size);
 
         self_play_new(
             manager,
-            request_senders[0],
+            request_senders[0].clone(),
             config.n_self_play_games,
-            mcts_config,
-            replay_buffer
+            &mcts_config,
+            &replay_buffer
         )?;
 
-        let trainer = Trainer::<P>::new::<tch::nn::Sgd>(
-            shelf.get_group_mut(0),
+        shelf = LockedShelf::<P>::convert_into_shelf(locked_shelf);
+        let mut trainer = Trainer::<P>::new::<tch::nn::Sgd>(
+            shelf.get_group_mut(0).expect("shelf is empty"),
             tch::nn::sgd(config.momentum, 0.0f64, config.weight_decay, false),
             (config.learning_rate_schedule)(0),
             config.weight_decay,
@@ -399,11 +417,268 @@ fn run_wo_mpi_sequential<P: PVModel>(config: &FenrirConfig, model_config: &Model
             ModelSyncConfig::new(train::SumOrAve::Ave)
         )?;
 
-        trainer.train(config.n_training_step_per_cycle, config.n_training_step_per_cycle, replay_buffer)?;
-        trainer.save_to_stream(Cursor::new(&mut storage));
+        trainer.train(config.n_training_step_per_cycle, config.n_training_step_per_cycle, &replay_buffer)?;
+        trainer.save_to_stream(&mut storage);
 
         // path = OsString::new().push("./test_models/").push(now_into_filename().as_os_str());
         // loaded_modules[0].2.save(path)?;
         
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::fs;
+    use tempfile::TempDir;
+    use super::model::MOCK_MODEL_CONFIG;
+    
+    // Mock PVModel for testing
+    #[derive(Clone, Debug)]
+    struct MockPVModel {
+        device: Device,
+    }
+
+    impl Default for MockPVModel {
+        fn default() -> Self {
+            Self { device: Device::Cpu }
+        }
+    }
+    
+    impl PVModel for MockPVModel {
+        fn new(vs: &tch::nn::Path, config: &ModelConfig) -> Self {
+            Self { device: vs.device() }
+        }
+        
+        fn evaluate_t(&self, xs: &tch::Tensor, train: bool) -> (tch::Tensor, tch::Tensor) {
+            let batch_size = xs.size()[0];
+            (
+                tch::Tensor::zeros(&[batch_size, 64], tch::kind::FLOAT_CPU),
+                tch::Tensor::zeros(&[batch_size, 1], tch::kind::FLOAT_CPU)
+            )
+        }
+        
+        fn device(&self) -> Device {
+            self.device
+        }
+    }
+
+
+    #[test]
+    fn test_agz_lr_schedule() {
+        assert_eq!(agz_lr_schedule(0), 0.01);
+        assert_eq!(agz_lr_schedule(200000), 0.01);
+        assert_eq!(agz_lr_schedule(399999), 0.01);
+        assert_eq!(agz_lr_schedule(400000), 0.001);
+        assert_eq!(agz_lr_schedule(500000), 0.001);
+        assert_eq!(agz_lr_schedule(599999), 0.001);
+        assert_eq!(agz_lr_schedule(600000), 0.0001);
+        assert_eq!(agz_lr_schedule(1000000), 0.0001);
+    }
+
+    #[test]
+    fn test_model_setup_config_creation() {
+        let module_info = ModuleLoadInfo::module_load_info(
+            "test.pv".into(),
+            None,
+            Device::Cpu,
+            MOCK_MODEL_CONFIG,
+        );
+        let config = ModelSetupConfig::model_setup_config(false, vec![module_info]);
+        
+        assert!(!config.use_mpi);
+        assert_eq!(config.module_load_infos.len(), 1);
+        assert_eq!(config.module_load_infos[0].path, OsString::from("test.pv"));
+    }
+
+    #[test]
+    fn test_module_load_info_creation() {
+        let info = ModuleLoadInfo::module_load_info(
+            "model.pv".into(),
+            Some(0),
+            Device::Cuda(0),
+            MOCK_MODEL_CONFIG,
+        );
+        
+        assert_eq!(info.path, OsString::from("model.pv"));
+        assert_eq!(info.rank, Some(0));
+        assert_eq!(info.device, Device::Cuda(0));
+    }
+
+    #[test]
+    fn test_create_lookup_table_without_mpi() {
+        let loaded_models = vec![
+            ("model1.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)),
+            ("model2.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)),
+            ("model1.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)), // Duplicate name
+        ];
+        
+        let module_infos = vec![
+            ModuleLoadInfo::module_load_info("model1.pv".into(), None, Device::Cpu, MOCK_MODEL_CONFIG),
+            ModuleLoadInfo::module_load_info("model2.pv".into(), None, Device::Cpu, MOCK_MODEL_CONFIG),
+            ModuleLoadInfo::module_load_info("model1.pv".into(), None, Device::Cpu, MOCK_MODEL_CONFIG),
+        ];
+        
+        let config = ModelSetupConfig::model_setup_config(false, module_infos);
+        let result = config.create_lookup_table(None, loaded_models);
+        
+        assert!(result.is_ok());
+        let (table, name_lookup) = result.unwrap();
+        
+        // Should have 2 unique names
+        assert_eq!(name_lookup.len(), 2);
+        assert!(name_lookup.contains(&OsString::from("model1.pv")));
+        assert!(name_lookup.contains(&OsString::from("model2.pv")));
+        
+        // model1.pv should have 2 instances, model2.pv should have 1
+        assert_eq!(table.len(), 2);
+        let model1_idx = name_lookup.iter().position(|x| x == "model1.pv").unwrap();
+        let model2_idx = name_lookup.iter().position(|x| x == "model2.pv").unwrap();
+        assert_eq!(table[model1_idx].len(), 2);
+        assert_eq!(table[model2_idx].len(), 1);
+    }
+
+    #[test]
+    fn test_create_lookup_table_with_mpi_rank_filtering() {
+        let loaded_models = vec![
+            ("model1.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)),
+            ("model2.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)),
+            ("model3.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)),
+        ];
+        
+        let module_infos = vec![
+            ModuleLoadInfo::module_load_info("model1.pv".into(), Some(0), Device::Cpu, MOCK_MODEL_CONFIG),
+            ModuleLoadInfo::module_load_info("model2.pv".into(), Some(1), Device::Cpu, MOCK_MODEL_CONFIG),
+            ModuleLoadInfo::module_load_info("model3.pv".into(), Some(0), Device::Cpu, MOCK_MODEL_CONFIG),
+        ];
+        
+        let config = ModelSetupConfig::model_setup_config(true, module_infos);
+        let result = config.create_lookup_table(Some(0), loaded_models);
+        
+        assert!(result.is_ok());
+        let (table, name_lookup) = result.unwrap();
+        
+        // Should only have models for rank 0 (model1 and model3)
+        assert_eq!(name_lookup.len(), 2);
+        assert!(name_lookup.contains(&OsString::from("model1.pv")));
+        assert!(name_lookup.contains(&OsString::from("model3.pv")));
+        assert!(!name_lookup.contains(&OsString::from("model2.pv")));
+    }
+
+    #[test]
+    fn test_create_lookup_table_mpi_consistency_check() {
+
+        // Test inconsistency: use_mpi=true but rank=None
+        let loaded_models = vec![];
+        let module_infos = vec![];
+        let config = ModelSetupConfig::model_setup_config(true, module_infos);
+        let result = config.create_lookup_table::<MockPVModel>(None, loaded_models);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("inconsistency in mpi usage"));
+        
+        // Test inconsistency: use_mpi=false but rank=Some(0)
+        let loaded_models = vec![];
+        let module_infos = vec![];
+        let config = ModelSetupConfig::model_setup_config(false, module_infos);
+        let result = config.create_lookup_table::<MockPVModel>(Some(0), loaded_models);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("inconsistency in mpi usage"));
+    }
+
+    #[test] 
+    fn test_now_into_filename() {
+        let filename = now_into_filename();
+        let filename_str = filename.to_string_lossy();
+        
+        // Should end with .pv
+        assert!(filename_str.ends_with(".pv"));
+        
+        // Should have the format YYYYMMDD_HHMM.pv (at least)
+        assert!(filename_str.len() >= 14); // "20250126_1234.pv" = 16 chars
+        
+        // Should contain underscore
+        assert!(filename_str.contains('_'));
+        
+        // Should start with a digit (year)
+        assert!(filename_str.chars().next().unwrap().is_ascii_digit());
+    }
+
+    #[test]
+    #[cfg(not(feature = "mpi"))]
+    fn test_setup_without_mpi_feature_enabled() {
+        let module_infos = vec![
+            ModuleLoadInfo::module_load_info("test.pv".into(), None, Device::Cpu, MOCK_MODEL_CONFIG)
+        ];
+        let config = ModelSetupConfig::model_setup_config(true, module_infos);
+        
+        let result = setup::<MockPVModel>(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("MPI functionality requested"));
+    }
+
+    #[test]
+    fn test_setup_wo_mpi_with_nonexistent_file() {
+        let module_infos = vec![
+            ModuleLoadInfo::module_load_info("nonexistent.pv".into(), None, Device::Cpu, MOCK_MODEL_CONFIG)
+        ];
+        let config = ModelSetupConfig::model_setup_config(false, module_infos);
+        
+        let result = setup::<MockPVModel>(&config);
+        // This should fail because the file doesn't exist
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_module_info_with_different_devices() {
+        // Test CPU device
+        let cpu_info = ModuleLoadInfo::module_load_info(
+            "cpu_model.pv".into(),
+            None,
+            Device::Cpu,
+            MOCK_MODEL_CONFIG
+        );
+        assert_eq!(cpu_info.device, Device::Cpu);
+        
+        // Test CUDA device
+        let cuda_info = ModuleLoadInfo::module_load_info(
+            "cuda_model.pv".into(),
+            Some(0),
+            Device::Cuda(0),
+            MOCK_MODEL_CONFIG
+        );
+        assert_eq!(cuda_info.device, Device::Cuda(0));
+    }
+
+    #[test]
+    fn test_fenrir_config_with_agz_lr_schedule() {
+        let config = FenrirConfig {
+            n_self_play_nodes: 2,
+            n_train_nodes: 1,
+            n_model_replica_self_play: 4,
+            n_model_replica_train: 2,
+            use_mpi: false,
+            mini_batch_size: 64,
+            n_training_step_per_cycle: 1000,
+            n_self_play_games: 100,
+            n_games_per_tournament: 10,
+            model_update_threshold: 0.55,
+            concurrent_training: true,
+            replay_buffer_capacity: 50000,
+            run_time_hr: 2,
+            momentum: 0.9,
+            learning_rate_schedule: agz_lr_schedule,
+            weight_decay: 0.0001,
+        };
+        
+        // Test that the learning rate schedule function works
+        assert_eq!((config.learning_rate_schedule)(100000), 0.01);
+        assert_eq!((config.learning_rate_schedule)(500000), 0.001);
+        assert_eq!((config.learning_rate_schedule)(700000), 0.0001);
+        
+        assert!(!config.use_mpi);
+        assert_eq!(config.mini_batch_size, 64);
+        assert_eq!(config.momentum, 0.9);
     }
 }

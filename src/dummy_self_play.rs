@@ -892,3 +892,189 @@ pub fn self_play_new<P: PVModel, const N: usize>(
 
     Ok(())
 }
+
+// This struct collects the inference request during self-play and tournament, and batch them appropriately.
+// It is intended to be set up per machine
+pub struct InferenceManager<'a, P: PVModel> {
+
+    shelf: &'a mut ModuleShelf<P, P>,
+    batch: Vec<NewBatch>,
+    request_receivers: Vec<Receiver<Request>>,
+    status: Vec<Vec<ModuleStatus>>,
+    batch_size: usize,
+}
+
+impl<'a, P: PVModel> InferenceManager<'a, P> {
+
+    pub fn new(ref_shelf: &'a mut ModuleShelf<P, P>, batch_size: usize) -> (Self, Vec<Sender<Request>>) {
+
+        let len = ref_shelf.table.len();
+        let batch = (0..len).map(|_| NewBatch::new()).collect::<Vec<_>>();
+        let status = ref_shelf.table.iter().map(|x| {
+            vec![ModuleStatus::default(); x.len()]
+        }).collect::<Vec<Vec<ModuleStatus>>>();
+
+        let (request_senders, request_receivers): (Vec<_>, Vec<_>) = (0..len)
+            .map(|_| { unbounded::<Request>() })
+            .unzip();
+
+        (Self { 
+            shelf: ref_shelf,
+            batch,
+            request_receivers,
+            status,
+            batch_size,
+        }, request_senders)
+    }
+
+    pub fn n_group(&self) -> usize {
+        self.batch.len()
+    }
+
+    // Since tch Tensor does not implement Send + Sync, we utilize scoped threads to access module references.
+    pub fn run(&mut self) -> Result<()> {
+
+        let job_queue = Arc::new(StdMutex::new(VecDeque::<Job>::new()));
+        let module_status = Arc::new(StdMutex::new(self.status.clone()));
+
+        let wrapped_table: Vec<Vec<Arc<StdMutex<&P>>>> = self.shelf.table
+            .iter()
+            .map(|group| {
+                group.iter()
+                    .map(|(module, _)| Arc::new(StdMutex::new(module)))
+                    .collect()
+            })
+            .collect();
+
+        thread::scope(|s| {
+            
+            let job_queue_clone = job_queue.clone();
+            
+            s.spawn(move || {
+                loop{
+
+                    for (group_id, request_receiver) in self.request_receivers.iter().enumerate() {
+
+                        if let Ok(request) = request_receiver.try_recv() {
+                            &mut self.batch[group_id].push_request(request);
+
+                            if self.batch[group_id].requests.len() > self.batch_size {
+
+                                let mini_batch_size = std::cmp::min(self.batch_size, self.batch[group_id].requests.len());
+                                if mini_batch_size == 0{
+                                    break;
+                                }
+
+                                let drain = self.batch[group_id].requests.drain(0..mini_batch_size);
+                                let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
+                                    (request.query, request.sender)
+                                }).unzip();
+
+                                let mini_batch = Tensor::stack(queries.as_slice(), 0);
+
+                                job_queue_clone.lock().unwrap().push_back((mini_batch, group_id, senders));
+                            }
+                        } else {
+                            continue;
+                        }
+
+                    }
+                }
+            });
+
+            let job_queue2 = job_queue.clone();
+            let module_status2 = module_status.clone();
+            let wrapped_table_clone = wrapped_table.clone();
+
+            s.spawn(move || {
+                loop {
+                    
+                    if let Some(job) = job_queue2.lock().unwrap().pop_front() {
+
+                        let (mini_batch, group_id, senders) = job;
+
+                        if let Some(module_id) = {
+                            let mut status = module_status2.lock().unwrap();
+                            let opt = status[group_id].iter().position(|x| *x == ModuleStatus::Free);
+                            if let Some(module_id) = opt {
+                                status[group_id][module_id].occupy();
+                            }
+                            opt
+                        } 
+                        {
+
+                            let module_ref = wrapped_table_clone[group_id][module_id].clone();
+                        
+                            let result = do_inference_job_sync(&mini_batch, &module_ref, &senders);
+                            module_status2.lock().unwrap()[group_id][module_id].free();
+
+                            if let Err(e) = result {
+                                eprintln!("Inference job failed: {:?}", e);
+                            }
+
+                        } else {
+                            // No free modules, put job back
+                            job_queue2.lock().unwrap().push_front(job);
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+        });
+        Ok(())
+    }
+}
+
+fn do_inference_job<P: PVModel>(
+    mini_batch: &Tensor,
+    module_ref: &P,
+    senders: &Vec<Arc<Sender<Evaluation>>>,
+)   -> Result<()> {
+
+    let module = module_ref;
+    let device = module.device();
+    let input = mini_batch.to(device);
+    let evaluation = module.evaluate_t(&input, false);
+    let cpu_evaluation = evaluation.0.to(Device::Cpu).split(1, 0)
+        .into_iter()
+        .zip(evaluation.1.to(Device::Cpu).split(1, 0).into_iter());
+
+    for (sender, evaluation) in senders.iter().zip(cpu_evaluation) {
+        sender.send(evaluation)
+        .map_err(|e| eyre!("Failed to send back inference result: {:?}", e))?;
+    }
+
+    Ok(())
+}
+
+fn do_inference_job_sync<P: PVModel>(
+    mini_batch: &Tensor,
+    module_ref: &Arc<StdMutex<&P>>,
+    senders: &Vec<Arc<Sender<Evaluation>>>,
+) -> Result<()> {
+
+    let evaluation = {
+        let module = module_ref.lock().unwrap();
+        let device = module.device();
+        let input = mini_batch.to(device);
+        let mut evaluation = module.evaluate_t(&input, false);
+        
+        // Move to CPU before releasing the lock
+        evaluation.0 = evaluation.0.to(Device::Cpu);
+        evaluation.1 = evaluation.1.to(Device::Cpu);
+        evaluation
+    }; // Lock is released here
+
+    let cpu_evaluation = evaluation.0.split(1, 0)
+        .into_iter()
+        .zip(evaluation.1.split(1, 0).into_iter());
+
+    for (sender, evaluation) in senders.iter().zip(cpu_evaluation) {
+        sender.send(evaluation)
+        .map_err(|e| eyre!("Failed to send back inference result: {:?}", e))?;
+    }
+
+    Ok(())
+}

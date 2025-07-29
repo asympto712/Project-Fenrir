@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 
+use bincode::config::{Configuration, LittleEndian, Fixint};
 use color_eyre::owo_colors::OwoColorize;
 use game::game::{Game, GameState};
 use game::board::TaflBoardEleven;
@@ -10,6 +11,7 @@ use game::game::get_rep_counter_for_oldest;
 use game::game::Side;
 use bitboard::Direction;
 use bitboard::eleven::{ElevenBoardPositionalEncoding, BoardEleven, MoveOnBoardEleven};
+use libc::free;
 use rand::distributions::Uniform;
 
 use crate::agent::PosteriorDist;
@@ -40,7 +42,7 @@ use std::io::{prelude::*, BufReader};
 // That means, reward = +1 if (attacker won) and -1 if (defender won), 0 if (draw)
 type Reward = i64;
 
-const REPLAY_BUFFER_ENCODE_CONFIG: bincode::config::Configuration 
+const REPLAY_BUFFER_ENCODE_CONFIG: bincode::config::Configuration<LittleEndian, Fixint> 
     = bincode::config::standard()
     .with_little_endian()
     .with_fixed_int_encoding()
@@ -66,7 +68,7 @@ impl ElevenBoardForRB {
 
 }
 
-#[derive(Debug, Clone, Copy, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub enum EpisodeUnit {
     SPR(SPR),
     Sep
@@ -96,7 +98,7 @@ impl EpisodeUnit {
     }
 }
 
-#[derive(Debug, Copy, Clone, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct SPR {
     board: ElevenBoardForRB,
     state: GameState,
@@ -181,11 +183,12 @@ impl ReplayBuffer {
 
     // append to the replay_buffer from the episode.
     // This enforces the capacity, meaning the oldest episodes would be removed if necessary
-    pub fn extend_from_episode(&self, episode: &mut Episode) {
+    pub fn extend_from_episode(&self, episode: Episode) {
+
         let mut q = self.replay_buffer.lock().unwrap();
         let dif: i64 = self.capacity as i64 - q.len() as i64 - episode.len() as i64;
         if dif >= 0 {
-            q.append(&mut episode.episode);
+            q.extend(episode.episode);
         } else {
             let offset_opt 
                 = ReplayBuffer::get_next_sep_pos_exceeding_offset(&q, (-1 * dif) as usize);
@@ -260,7 +263,7 @@ impl ReplayBuffer {
                         .to_kind(options.0)
                         .to_device(options.1);
 
-                    let reward = Tensor::from_slice([spr.reward as f32])
+                    let reward = Tensor::from_slice(&[spr.reward as f32])
                         .to_kind(options.0)
                         .to_device(options.1);
 
@@ -357,13 +360,12 @@ impl ReplayBuffer {
     // This will be essential when retrieving data from a file
     pub fn save<R: RangeBounds<usize>, W: Write>(self, writer: &mut W, game_range: R) -> Result<()> {
         let mut v: Vec<SPR> = vec![];
-        let mut q = self.replay_buffer.lock()?;
+        let mut freed_history = self.replay_buffer.into_inner().map_err(|_| eyre!("Could not acquire lock for replay buffer"))?;
         let mut game_idx = 0;
         let mut pos: usize = 0;
-        let tot_len = q.len();
-        let mut eu_iter = q.into_iter();
+        let tot_len = freed_history.len();
 
-        for eu in eu_iter {
+        for eu in freed_history {
             match eu {
                 EpisodeUnit::SPR(spr) => {
                     v.push(spr);
@@ -373,14 +375,14 @@ impl ReplayBuffer {
                         continue;
                     }
                     let v_spr = std::mem::replace(&mut v, vec![]);
-                    if game_range.contains(game_idx) {
+                    if game_range.contains(&game_idx) {
                         write_one_episode(v_spr, writer)?;
                     }
                     game_idx += 1;
                 }
             }
         }
-        if game_range.contains(game_idx) {
+        if game_range.contains(&game_idx) {
             write_one_episode(v, writer)?;
         }
         Ok(())
@@ -397,11 +399,11 @@ impl ReplayBuffer {
         let mut episode_n_byte_buf: [u8;8] = [0;8];
         let mut episode_count = 0;
 
-        while episode_count < n_episodes && buf_reader.stream_position().is_ok() {
+        while episode_count < n_episodes && reader.stream_position().is_ok() {
             if pos < 8 {
                 break;
             }
-            pos = -8;
+            pos -= 8;
             reader.seek_relative(-8)?;
             reader.read_exact(&mut episode_n_byte_buf)?;
             let episode_n_byte: u64 = u64::from_le_bytes(episode_n_byte_buf);
@@ -411,7 +413,7 @@ impl ReplayBuffer {
             let mut data_buf = vec![0u8; episode_n_byte as usize];
             reader.read_exact(&mut data_buf)?;
 
-            let (mut v_spr, u) = bincode::decode_from_slice::<Vec<SPR>>(
+            let (mut v_spr, u) = bincode::decode_from_slice::<Vec<SPR>, Configuration<LittleEndian, Fixint>>(
                 data_buf.as_slice(), 
                 REPLAY_BUFFER_ENCODE_CONFIG
             )?;
