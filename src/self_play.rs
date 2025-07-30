@@ -2,17 +2,18 @@
 #![allow(dead_code)]
 #![cfg(feature = "torch")]
 
+use bincode::Decode;
 use color_eyre::owo_colors::OwoColorize;
 //internal
-use game::game::{Game, GameState, Side};
-use game::board::{TaflBoardEleven};
-use bitboard::eleven::{ElevenBoardPositionalEncoding, MoveOnBoardEleven};
+use game::game::{Game, GameLogic, GameState, Side};
+use bitboard::{BitBoard, PositionalEncoding, MoveOnBoard};
 use crate::{model, utils};
-use crate::replay_buffer::{self, Episode, EpisodeUnit, ReplayBuffer};
+use crate::replay_buffer::{self, BoardData, Episode, EpisodeUnit, ReplayBuffer, BoardPosForRB};
 use crate::model::{ModelConfig, PVModel};
 use crate::model::PVNet;
 use crate::model::Evaluation;
 use crate::agent::{self, Actor, MCTSConfig, MCTSTree, NewActor, PosteriorDist, Temperature};
+use crate::utils::{ActionTensor, BoardTensor, ModelInput, TAction, TBoard, VectorBasedMove};
 
 //external
 use tch::Tensor;
@@ -474,15 +475,18 @@ impl<P: PVModel> Directer<P> {
 
 
 // play the game for the specified amount using the specified model, create the replay buffer
-pub fn self_play<P: PVModel + Send + 'static>(
+pub fn self_play<P: PVModel + Send + 'static, D: BoardData>(
     model_opt: Option<String>,
     n_replica: usize,
     num_games: usize,
     batch_capacity: usize,
     model_config: &ModelConfig,
     mcts_config: &MCTSConfig,
-    replay_buffer: &ReplayBuffer,
-) -> Result<()>{
+    replay_buffer: &ReplayBuffer<D>,
+) -> Result<()>
+where TBoard<D::G>: ModelInput<D::G>,
+TAction<<<D as BoardData>::G as GameLogic>::B>: ActionTensor,
+{
 
     let (mut directer, sender) = match model_opt {
 
@@ -512,8 +516,8 @@ pub fn self_play<P: PVModel + Send + 'static>(
         || {
             let (sender, receiver) = unbounded::<Evaluation>();
             let sender = Arc::new(sender);
-            let game = Game::default();
-            let mut mcts_tree = MCTSTree::generate(game, *mcts_config);
+            let game = <D::G as Default>::default();
+            let mut mcts_tree = MCTSTree::<D::G>::generate(game, *mcts_config);
             let actor = Actor::new_with_model_id(request_sender.clone(), model_id);
             (sender, receiver, mcts_tree, actor)
         }, 
@@ -524,10 +528,10 @@ pub fn self_play<P: PVModel + Send + 'static>(
             actor
         ), worker_idx| {
 
-            let mut episode: Episode = Episode::new();
+            let mut episode: Episode<D> = Episode::<D>::new();
 
             while !mcts_tree.root_is_terminal() {
-                let (game,_, posterior) = mcts_tree.get_policy_and_update(actor).unwrap();
+                let (game,_, posterior) = mcts_tree.get_policy_and_update::<Actor>(actor).unwrap();
                 episode.append_wo_reward(&game, posterior);
             }
             let winner = mcts_tree.get_winner();
@@ -949,13 +953,16 @@ fn do_inference_job_sync<P: PVModel + Send>(
 
 
 // play the game for the specified amount using the specified model, create the replay buffer
-pub fn self_play_new<'a, P: PVModel + Send>(
+pub fn self_play_new<'a, P: PVModel + Send, D: BoardData>(
     manager: InferenceManager<'a, P, &'a mut LockedShelf<P>>,
     request_sender: Sender<Request>,
     num_games: usize,
     mcts_config: &MCTSConfig,
-    replay_buffer: &ReplayBuffer,
-) -> Result<()>{
+    replay_buffer: &ReplayBuffer<D>,
+) -> Result<()>
+where TBoard<D::G>: ModelInput<D::G>,
+TAction<<D::G as GameLogic>::B>: ActionTensor,
+{
 
     let request_sender = Arc::new(request_sender);
     let model_id = 0;
@@ -970,8 +977,8 @@ pub fn self_play_new<'a, P: PVModel + Send>(
             || {
                 let (sender, receiver) = unbounded::<Evaluation>();
                 let sender = Arc::new(sender);
-                let game = Game::default();
-                let mut mcts_tree = MCTSTree::generate(game, *mcts_config);
+                let game = <D::G as Default>::default();
+                let mut mcts_tree = MCTSTree::<D::G>::generate(game, *mcts_config);
                 let actor = NewActor::new(request_sender.clone());
                 (sender, receiver, mcts_tree, actor)
             }, 
@@ -982,7 +989,7 @@ pub fn self_play_new<'a, P: PVModel + Send>(
                 actor
             ), worker_idx| {
 
-                let mut episode: Episode = Episode::new();
+                let mut episode: Episode<D>= Episode::<D>::new();
 
                 while !mcts_tree.root_is_terminal() {
                     let (game,_, posterior) = mcts_tree.get_policy_and_update::<NewActor>(&actor).unwrap();

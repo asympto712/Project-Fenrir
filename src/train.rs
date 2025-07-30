@@ -7,7 +7,7 @@ use std::io::Write;
 
 use crate::model::*;
 use crate::model::PVModel;
-use crate::replay_buffer::ReplayBuffer;
+use crate::replay_buffer::{BoardData, ReplayBuffer, Sampler};
 
 use rand::rngs::ThreadRng;
 #[cfg(feature = "torch")]
@@ -309,7 +309,8 @@ impl<'a, P: PVModel> Trainer<'a, P> {
     }
 
     // Sample from the replay_buffer, calculate the forward pass on each replica and return the average loss value
-    fn forward_backward_pass(&mut self, replay_buffer: &ReplayBuffer) -> LossValue {
+    fn forward_backward_pass<D: BoardData>(&mut self, replay_buffer: &ReplayBuffer<D>) -> LossValue 
+    where ReplayBuffer<D>: Sampler {
 
         let mut cross_entropy_loss = 0.0f64;
         let mut mse_loss = 0.0f64;
@@ -366,7 +367,8 @@ impl<'a, P: PVModel> Trainer<'a, P> {
         sync_bn_stats(vss.as_mut_slice(), self.bn_stats_names.as_slice())
     }
 
-    fn step(&mut self, replay_buffer: &ReplayBuffer, sync_bn_stats: bool) -> Result<()> {
+    fn step<D: BoardData>(&mut self, replay_buffer: &ReplayBuffer<D>, sync_bn_stats: bool) -> Result<()> 
+    where ReplayBuffer<D>: Sampler {
 
         if self.replicas.len() == 1 {
 
@@ -393,7 +395,8 @@ impl<'a, P: PVModel> Trainer<'a, P> {
         Ok(())
     }
 
-    pub fn train<B: Borrow<ReplayBuffer>>(&mut self, n_steps: usize, sync_bn_stats_every: usize, replay_buffer: B) -> Result<()> {
+    pub fn train<D: BoardData, B: Borrow<ReplayBuffer<D>>>(&mut self, n_steps: usize, sync_bn_stats_every: usize, replay_buffer: B) -> Result<()> 
+    where ReplayBuffer<D>: Sampler {
 
         for i in 0..n_steps {
             let sync_bn_stats: bool = 

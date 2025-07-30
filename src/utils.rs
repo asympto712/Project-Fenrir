@@ -1,5 +1,7 @@
 #![allow(unused)]
 use std::borrow::Borrow;
+#[cfg(feature = "torch")]
+use std::marker::PhantomData;
 use std::process::id;
 
 // workspace
@@ -12,7 +14,7 @@ use bitboard::seven::{BoardSeven, MoveOnBoardSeven, SevenBoardPositionalEncoding
 
 // external
 use color_eyre::eyre::{ErrReport, Result};
-use rand::prelude;
+use rand::{prelude, RngCore};
 use bincode;
 use rand::thread_rng;
 use rand::Rng;
@@ -30,74 +32,31 @@ use crate::agent::PosteriorDist;
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct IndexPolicy(Vec<(i64, f32)>);
 
-impl<B: BitBoard> From<PosteriorDist<B>> for IndexPolicy {
-    fn from(value: PosteriorDist<B>) -> Self {
+
+impl IndexPolicy {
+    pub fn get(&self) -> &Vec<(i64, f32)> {
+        &self.0
+    }
+    pub fn from_posterior<B: BitBoard>(value: PosteriorDist<B>) -> Self {
         let v = value.into_iter()
             .map(|(movement, p)| {
-                let vbm = VectorBasedMove::convert_from(&movement).unwrap();
-                (vbm.to_index(), p)
+                let vbm = <VectorBasedMove as MoveRepresentation<B>>::convert_from(&movement).unwrap();
+                (<VectorBasedMove as DirectionalMove<B>>::to_index(&vbm), p)
             })
             .collect::<Vec<(i64, f32)>>();
         Self(v)
     }
 }
 
-impl IndexPolicy {
-    fn get(&self) -> &Vec<(i64, f32)> {
-        &self.0
-    }
-}
+pub trait DirectionalMove<B: BitBoard>: Clone {
 
+    fn from_index(i: i64) -> Self;
+    fn to_index(&self) -> i64;
+    fn rotate90(&self) -> Self;
+    fn rotate180(&self) -> Self;
+    fn rotate270(&self) -> Self;
 
-
-// Directional move. Assumes Periodical Boundary
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum MoveVector<B: BitBoard> {
-    S(u8),
-    E(u8),
-} 
-
-impl<B: BitBoard> MoveVector<B> {
-
-    pub fn movelen_lim() -> u8{
-        B::BOARD_SIZE - 1
-    }
-
-    pub fn from_index(i: i64) -> Self {
-        assert!(0 <= i && i < Self::movelen_lim() * 2);
-        if i < 10 { Self::S((i + 1).try_into().unwrap()) }
-        else { Self::E( (i + 1 - Self::movelen_lim()).try_into().unwrap())}
-    }
-
-    pub fn to_index(self) -> i64 {
-        match self {
-            MoveVector::S(i) => (i - 1).into(),
-            MoveVector::E(i) => (i + Self::movelen_lim() - 1).into()
-        }
-    }
-
-    pub fn rotate90(&self) -> Self {
-        match self {
-            MoveVector::S(n) => MoveVector::E(*n),
-            MoveVector::E(n) => MoveVector::S(Self::movelen_lim() + 1 - n),
-        }
-    }
-
-    pub fn rotate180(&self) -> Self {
-        match self {
-            MoveVector::S(n) => MoveVector::S(Self::movelen_lim() + 1 - n),
-            MoveVector::E(n) => MoveVector::E(Self::movelen_lim() + 1 - n),
-        }
-    }
-
-    pub fn rotate270(&self) -> Self {
-        match self {
-            MoveVector::S(n) => MoveVector::E(Self::movelen_lim() + 1 - n),
-            MoveVector::E(n) => MoveVector::S(*n),
-        }
-    }
-
-    pub fn rotate_from_i64(&self, k: i64) -> Self {
+    fn rotate_from_i64(&self, k: i64) -> Self {
         let k = k % 4;
         let k = if k < 0 { (4 + k) % 4 }
             else { k };
@@ -110,7 +69,7 @@ impl<B: BitBoard> MoveVector<B> {
         }
     }
 
-    pub fn rotate_from_usize(&self, k: usize) -> Self {
+    fn rotate_from_usize(&self, k: usize) -> Self {
         let k = k % 4;
         match k {
             0 => self.clone(),
@@ -121,27 +80,77 @@ impl<B: BitBoard> MoveVector<B> {
         }
     }
 
-    pub fn rotate_randomly(&self) -> Self {
-        let mut rng = thread_rng();
+    fn rotate_randomly<R>(&self, rng: &mut R) -> Self
+    where R: Rng 
+    {
         let k: usize = rng.gen_range(0..4);
         self.rotate_from_usize(k)
     }
 
-    pub fn rotate(&self, rot: Rotation) -> Self {
-        match rot {
+    fn rotate(&self, rot: Rotation) -> Self{
+        match rot{
             Rotation::No => self.clone(),
             Rotation::Do(k) => self.rotate_from_usize(k as usize),
-            Rotation::Random => self.rotate_randomly(),
+            Rotation::Random => {
+                let mut rng = rand::thread_rng();
+                self.rotate_randomly(&mut rng)
+            }
         }
     }
 }
 
 
+// Directional move. Assumes Periodical Boundary
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub struct VectorBasedMove<B: BitBoard> {
+enum MoveVector {
+    S(u8),
+    E(u8),
+} 
+
+impl<B: BitBoard> DirectionalMove<B> for MoveVector {
+
+    fn from_index(i: i64) -> Self {
+        assert!(0 <= i && i < B::movelen_lim() as i64 * 2);
+        if i < 10 { Self::S((i + 1).try_into().unwrap()) }
+        else { Self::E( (i as u8 + 1 - B::movelen_lim()).try_into().unwrap())}
+    }
+
+    fn to_index(&self) -> i64 {
+        match self {
+            MoveVector::S(i) => (i - 1).into(),
+            MoveVector::E(i) => (i + B::movelen_lim() - 1).into()
+        }
+    }
+
+    fn rotate90(&self) -> Self {
+        match self {
+            MoveVector::S(n) => MoveVector::E(*n),
+            MoveVector::E(n) => MoveVector::S(B::movelen_lim() + 1 - n),
+        }
+    }
+
+    fn rotate180(&self) -> Self {
+        match self {
+            MoveVector::S(n) => MoveVector::S(B::movelen_lim() + 1 - n),
+            MoveVector::E(n) => MoveVector::E(B::movelen_lim() + 1 - n),
+        }
+    }
+
+    fn rotate270(&self) -> Self {
+        match self {
+            MoveVector::S(n) => MoveVector::E(B::movelen_lim() + 1 - n),
+            MoveVector::E(n) => MoveVector::S(*n),
+        }
+    }
+}
+
+
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct VectorBasedMove {
     x: u8,
     y: u8,
-    v: MoveVector<B>
+    v: MoveVector,
 }
 
 pub fn board_coordinate_rotate<B: BitBoard>(x: u8, y: u8, k: u8) -> (u8, u8) {
@@ -161,15 +170,15 @@ pub trait MoveRepresentation<B: BitBoard> {
     fn convert_into(&self) -> B::Movement;
 }
 
-impl<B: BitBoard> VectorBasedMove<B>{
-    fn new(x: u8, y: u8, v: MoveVector<B>) -> Self {
+impl VectorBasedMove{
+    fn new(x: u8, y: u8, v: MoveVector) -> Self {
         Self {x, y, v}
     }
 }
-impl<B: BitBoard> MoveRepresentation<B> for VectorBasedMove<B> {
+impl<B: BitBoard> MoveRepresentation<B> for VectorBasedMove {
     fn convert_from(movement: &B::Movement) -> Result<Self>{
-        let start =  movement.start;
-        let dst = movement.dst;
+        let start =  movement.start();
+        let dst = movement.dst();
         let (x,y) = start.get_coordinate();
         let (xx, yy) = dst.get_coordinate();
         let (dx, dy) : (i64, i64) = (xx as i64 - x as i64, yy as i64 - y as i64);
@@ -182,11 +191,11 @@ impl<B: BitBoard> MoveRepresentation<B> for VectorBasedMove<B> {
         if dx == 0 {
             // That means dy is non-zero...
             let true_dy = if dy > 0 { dy } else { B::BOARD_SIZE as i64 + dy };
-            Ok(Self { x, y, v: MoveVector<B>::S(true_dy.try_into().unwrap())})
+            Ok(Self { x, y, v: MoveVector::S(true_dy.try_into().unwrap())})
         } else {
             // That means dy is zero..
             let true_dx = if dx > 0 { dx } else { B::BOARD_SIZE as i64 + dx };
-            Ok(Self { x, y, v: MoveVector<B>::E(true_dx.try_into().unwrap())})
+            Ok(Self { x, y, v: MoveVector::E(true_dx.try_into().unwrap())})
         }
     }
 
@@ -217,69 +226,38 @@ impl<B: BitBoard> MoveRepresentation<B> for VectorBasedMove<B> {
     }
 }
 
-impl<B: BitBoard> VectorBasedMove<B> {
-    pub fn from_index(idx: i64) -> Self {
+impl<B: BitBoard> DirectionalMove<B> for VectorBasedMove {
+
+    fn from_index(idx: i64) -> Self {
         assert!(idx >= 0);
         let n = B::BOARD_SIZE as i64;
         let i = idx / (n * n);
         let y = (idx % (n * n)) / n;
         let x = (idx % (n * n)) % n;
-        Self { x: x.try_into().unwrap(), y: y.try_into().unwrap(), v: MoveVector::<B>::from_index(i)}
+        Self { x: x.try_into().unwrap(), y: y.try_into().unwrap(), v: <MoveVector as DirectionalMove<B>>::from_index(i)}
     }
     
-    pub fn to_index(&self) -> i64 {
+    fn to_index(&self) -> i64 {
         let n = B::BOARD_SIZE;
-        ((self.x) as i64 + (self.y * n) as i64 + MoveVector::to_index(self.v) * (n * n) as i64).into()
+        ((self.x) as i64 + (self.y * n) as i64 + <MoveVector as DirectionalMove<B>>::to_index(&self.v) * (n * n) as i64).into()
     }
 
-    pub fn rotate(&self, rot: Rotation) -> Self {
-        match rot {
-            Rotation::No => self.clone(),
-            Rotation::Do(k) => self.rotate_from_usize(k as usize),
-            Rotation::Random => self.rotate_randomly()
-        }
-    }
-
-    pub fn rotate90(&self) -> Self {
+    fn rotate90(&self) -> Self {
         let (new_x, new_y) = board_coordinate_rotate::<B>(self.x, self.y, 1);
-        let new_v = self.v.rotate90();
+        let new_v = <MoveVector as DirectionalMove<B>>::rotate90(&self.v);
         Self { x: new_x, y: new_y, v: new_v }
     }
-    pub fn rotate180(&self) -> Self {
+
+    fn rotate180(&self) -> Self {
         let (new_x, new_y) = board_coordinate_rotate::<B>(self.x, self.y, 2);
-        let new_v = self.v.rotate180();
+        let new_v = <MoveVector as DirectionalMove<B>>::rotate180(&self.v);
         Self { x: new_x, y: new_y, v: new_v }
     }
-    pub fn rotate270(&self) -> Self {
+
+    fn rotate270(&self) -> Self {
         let (new_x, new_y) = board_coordinate_rotate::<B>(self.x, self.y, 3);
-        let new_v = self.v.rotate270();
+        let new_v = <MoveVector as DirectionalMove<B>>::rotate270(&self.v);
         Self { x: new_x, y: new_y, v: new_v }
-    }
-    pub fn rotate_from_i64(&self, k: i64) -> Self {
-        let k = k % 4;
-        let k = if k < 0 { k + 4 } else {k};
-        match k {
-            0 => self.clone(),
-            1 => self.rotate90(),
-            2 => self.rotate180(),
-            3 => self.rotate270(),
-            _ => panic!(),
-        }
-    }
-    pub fn rotate_from_usize(&self, k: usize) -> Self {
-        let k = k % 4;
-        match k {
-            0 => self.clone(),
-            1 => self.rotate90(),
-            2 => self.rotate180(),
-            3 => self.rotate270(),
-            _ => panic!(),
-        }
-    }
-    pub fn rotate_randomly(&self) -> Self {
-        let mut rng = thread_rng();
-        let k: usize = rng.gen_range(0..4);
-        self.rotate_from_usize(k)
     }
 }
 
@@ -309,28 +287,93 @@ impl Rotation {
 }
 
 #[cfg(feature = "torch")]
-#[derive(Debug)]
-pub struct TBoard<B: BitBoard>(tch::Tensor);
+pub trait BoardTensor: Sized{
+
+    type G: GameLogic;
+    // Board Size
+    const N: i64;
+
+    // Required methods
+    fn new(ts: Tensor) -> Self;
+    fn get_ref(&self) -> &Tensor;
+    fn get(self) -> Tensor;
+    fn get_mut(&mut self) -> &mut Tensor;
+    fn from_bitboard(b: &<Self::G as GameLogic>::B, options: (tch::Kind, tch::Device)) -> Self;
+
+    // Provided methods
+    fn from_game_board(b: &TaflBoard<<Self::G as GameLogic>::B>, options: (tch::Kind, tch::Device)) -> Self{
+        let ts1 = Self::from_bitboard(&b.bit_att, options);
+        let ts2 = Self::from_bitboard(&b.bit_def, options);
+        let ts3 = Self::from_bitboard(&b.bit_king, options);
+        let ts = Tensor::stack(&[ts1.get(), ts2.get(), ts3.get()], 0);
+        Self::new(ts)
+    }   
+
+    fn from_play_side(g: &Self::G, options: (tch::Kind, tch::Device)) -> Self {
+        let side: i64 = match g.current_side() {
+            Side::Att => 1,
+            Side::Def => 0,
+        };
+        let side: Tensor = Tensor::scalar_tensor(side, options);
+        let side: Tensor = side.broadcast_to([Self::N, Self::N]);
+        Self::new(side)
+    }
+
+    fn from_tot_move_count(g: &Self::G, options: (tch::Kind, tch::Device)) -> Self {
+        let tot_move_count: i64 = g.get_state().get_turn_count().into();
+        let tmc: Tensor = Tensor::scalar_tensor(tot_move_count, options);
+        let tmc: Tensor = tmc.broadcast_to([Self::N, Self::N]);
+        Self::new(tmc)
+    }
+
+    fn from_short_history(sh: &ShortHistory<<Self::G as GameLogic>::B>, options: (tch::Kind, tch::Device)) -> Self {
+        let ts: [Tensor; 4] = std::array::from_fn(|i| {
+
+            if let Some(b) = sh.get(i) {
+                Self::from_game_board(b, options).get()
+            } else {
+                Tensor::zeros([3,Self::N,Self::N], options)
+            }
+
+        });
+        let ts = Tensor::cat(&ts[..], 0);
+        Self::new(ts)
+    }
+}
 
 #[cfg(feature = "torch")]
-impl TBoard<BoardEleven> {
-    pub fn new(ts: tch::Tensor) -> Self {
-        Self(ts)
+#[derive(Debug)]
+pub struct TBoard<G: GameLogic>{
+    tensor: tch::Tensor,
+    _marker: PhantomData<G>,
+}
+
+#[cfg(feature = "torch")]
+impl BoardTensor for TBoard<Game> {
+
+    type G = Game;
+    const N: i64 = 11;
+
+    fn new(ts: tch::Tensor) -> Self {
+        Self{
+            tensor: ts,
+            _marker: PhantomData,
+        }
     }
 
-    pub fn get_ref(&self) -> &Tensor {
-        &self.0
+    fn get_ref(&self) -> &Tensor {
+        &self.tensor
     }
 
-    pub fn get(self) -> Tensor {
-        self.0
+    fn get(self) -> Tensor {
+        self.tensor
     }
 
-    pub fn get_mut(&mut self) -> &mut Tensor {
-        &mut self.0
+    fn get_mut(&mut self) -> &mut Tensor {
+        &mut self.tensor
     }
 
-    pub fn from_bitboard(b: &BoardEleven, options: (tch::Kind, tch::Device)) -> Self {
+    fn from_bitboard(b: &<Self::G as GameLogic>::B, options: (tch::Kind, tch::Device)) -> Self {
         use std::array;
 
         use bitboard::eleven::BLOCKLEN;
@@ -365,117 +408,49 @@ impl TBoard<BoardEleven> {
             }
         }
 
-        // }
         let ts = Tensor::from_slice::<f32>(&array);
         let tts = ts.view([11, 11]);
-        TBoardEleven(tts)
+        Self::new(tts)
     }
 
-    pub fn from_game_board(b: &TaflBoard<BoardEleven>, options: (tch::Kind, tch::Device)) -> Self {
-        let ts1 = TBoard::<BoardEleven>::from_bitboard(&b.bit_att, options);
-        let ts2 = TBoard::<BoardEleven>::from_bitboard(&b.bit_def, options);
-        let ts3 = TBoard::<BoardEleven>::from_bitboard(&b.bit_king, options);
-        let ts = Tensor::stack(&[ts1.0, ts2.0, ts3.0], 0);
-        TBoard::<BoardEleven>(ts)
-    }
+}
 
-    pub fn from_short_history(sh: &ShortHistory<BoardEleven>, options: (tch::Kind, tch::Device)) -> Self {
-        let ts: [Tensor; 4] = std::array::from_fn(|i| {
-
-            if let Some(b) = sh.get(i) {
-                TBoard::<BoardEleven>::from_game_board(b, options).0
-            } else {
-                Tensor::zeros([3,11,11], options)
-            }
-
-        });
-        let ts = Tensor::cat(&ts[..], 0);
-        TBoard::<BoardEleven>(ts)
-    }
-
-    pub fn from_tot_move_count(g: &Game, options: (tch::Kind, tch::Device)) -> Self {
-        let tot_move_count: i64 = g.state.get_turn_count().into();
-        let tmc: Tensor = Tensor::scalar_tensor(tot_move_count, options);
-        let tmc: Tensor = tmc.broadcast_to([11, 11]);
-        TBoard::<BoardEleven>(tmc)
-    }
-
-    pub fn from_play_side(g: &Game, options: (tch::Kind, tch::Device)) -> Self {
-        let side: i64 = match g.state.show_side() {
-            Side::Att => 1,
-            Side::Def => 0,
-        };
-        let side: Tensor = Tensor::scalar_tensor(side, options);
-        let side: Tensor = side.broadcast_to([11, 11]);
-        TBoard::<BoardEleven>(side)
-    }
-
+impl TBoard<Game>{
     pub fn from_repetition_count(g: &Game, options: (tch::Kind, tch::Device)) -> Self {
         let repetition_count: i64 = get_rep_counter_for_oldest(g.repetition_counter).into();
         let rc: Tensor = Tensor::scalar_tensor(repetition_count, options);
         let rc: Tensor = rc.broadcast_to([11, 11]);
-        TBoard::<BoardEleven>(rc)
-    }
-
-    pub fn get_pnet_input(g: &Game, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
-
-        let short_history = TBoard::<BoardEleven>::from_short_history(&g.short_history, options);
-        let rotated_short_history = short_history.0.rot90(rot.get_k().into(), [1,2]);
-        // (3 * 4, 11, 11)
-
-        let board = Self::from_game_board(&g.board, options);
-        let rotated_board: Tensor = board.0.rot90(rot.get_k().into(), [1,2]);
-        // (3, 11, 11)
-
-        let tmc = TBoard::<BoardEleven>::from_tot_move_count(g, options).0.unsqueeze(0);
-        // (1, 11, 11)
-        let rc = TBoard::<BoardEleven>::from_repetition_count(g, options).0.unsqueeze(0);
-        // (1, 11, 11)
-        let side = TBoard::<BoardEleven>::from_play_side(g, options).0.unsqueeze(0);
-        // (1, 11, 11)
-        let ts = Tensor::cat(&[rotated_board, rotated_short_history, tmc, rc, side], 0);
-        TBoard::<BoardEleven>(ts)
-        
-    }
-
-    pub fn get_vnet_input(g: &Game, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
-
-        let short_history = TBoard::<BoardEleven>::from_short_history(&g.short_history, options);
-        let rotated_short_history = short_history.0.rot90(rot.get_k().into(), [1,2]);
-        // (3 * 4, 11, 11)
-
-        let board = Self::from_game_board(&g.board, options);
-        let rotated_board: Tensor = board.0.rot90(rot.get_k().into(), [1,2]);
-        // (3, 11, 11)
-
-        let tmc = TBoard::<BoardEleven>::from_tot_move_count(g, options).0.unsqueeze(0);
-        // (1, 11, 11)
-        let rc = TBoard::<BoardEleven>::from_repetition_count(g, options).0.unsqueeze(0);
-        // (1, 11, 11)
-        let ts = Tensor::cat(&[rotated_board, rotated_short_history, tmc, rc], 0);
-        // (1, 11, 11)
-        TBoard::<BoardEleven>(ts)
+        Self::new(rc)
     }
 }
 
-impl TBoard<BoardSeven> {
-    pub fn new(ts: tch::Tensor) -> Self {
-        Self(ts)
+#[cfg(feature = "torch")]
+impl BoardTensor for TBoard<SimpleGame>{
+
+    type G = SimpleGame;
+    const N: i64 = 7;
+
+    fn new(ts: tch::Tensor) -> Self {
+        Self {
+            tensor: ts,
+            _marker: PhantomData
+        }
     }
 
-    pub fn get_ref(&self) -> &Tensor {
-        &self.0
+    fn get_ref(&self) -> &Tensor {
+        &self.tensor
     }
 
-    pub fn get(self) -> Tensor {
-        self.0
+    fn get(self) -> Tensor {
+        self.tensor
     }
 
-    pub fn get_mut(&mut self) -> &mut Tensor {
-        &mut self.0
+    fn get_mut(&mut self) -> &mut Tensor {
+        &mut self.tensor
     }
 
-    pub fn from_bitboard(b: &BoardSeven, options: (tch::Kind, tch::Device)) -> Self {
+    fn from_bitboard(b: &<Self::G as GameLogic>::B, options: (tch::Kind, tch::Device)) -> Self {
+
         use std::array;
 
         let ts = Tensor::zeros([7 * 7], options);
@@ -489,94 +464,132 @@ impl TBoard<BoardSeven> {
         }
 
         let ts = Tensor::from_slice::<f32>(&array);
-        let tts = ts.view([11, 11]);
-        Self(tts)
-    }
-
-    pub fn from_game_board(b: &TaflBoard<BoardSeven>, options: (tch::Kind, tch::Device)) -> Self {
-        let ts1 = TBoard::<BoardSeven>::from_bitboard(&b.bit_att, options);
-        let ts2 = TBoard::<BoardSeven>::from_bitboard(&b.bit_def, options);
-        let ts3 = TBoard::<BoardSeven>::from_bitboard(&b.bit_king, options);
-        let ts = Tensor::stack(&[ts1.0, ts2.0, ts3.0], 0);
-        Self(ts)
-    }
-
-    pub fn from_tot_move_count(g: &SimpleGame, options: (tch::Kind, tch::Device)) -> Self {
-        let tot_move_count: i64 = g.state.get_turn_count().into();
-        let tmc: Tensor = Tensor::scalar_tensor(tot_move_count, options);
-        let tmc: Tensor = tmc.broadcast_to([11, 11]);
-        Self(tmc)
-    }
-
-    pub fn from_play_side(g: &SimpleGame, options: (tch::Kind, tch::Device)) -> Self {
-        let side: i64 = match g.state.show_side() {
-            Side::Att => 1,
-            Side::Def => 0,
-        };
-        let side: Tensor = Tensor::scalar_tensor(side, options);
-        let side: Tensor = side.broadcast_to([11, 11]);
-        Self(side)
-    }
-
-    // output shape is (5, 7, 7)
-    pub fn get_pnet_input(g: &SimpleGame, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
-
-        let board = Self::from_game_board(&g.board, options);
-        let rotated_board: Tensor = board.0.rot90(rot.get_k().into(), [1,2]);
-        // (3, 7, 7)
-
-        let tmc = TBoard::<BoardEleven>::from_tot_move_count(g, options).0.unsqueeze(0);
-        // (1, 7, 7)
-        let side = TBoard::<BoardEleven>::from_play_side(g, options).0.unsqueeze(0);
-        // (1, 7, 7)
-        let ts = Tensor::cat(&[rotated_board, tmc, side], 0);
-        Self(ts)
-    }
-
-    pub fn get_vnet_input(g: &SimpleGame, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
-
-        let board = Self::from_game_board(&g.board, options);
-        let rotated_board: Tensor = board.0.rot90(rot.get_k().into(), [1,2]);
-        // (3, 7, 7)
-
-        let tmc = TBoard::<BoardEleven>::from_tot_move_count(g, options).0.unsqueeze(0);
-        // (1, 7, 7)
-        let ts = Tensor::cat(&[rotated_board, tmc], 0);
-        Self(ts)
+        let tts = ts.view([7, 7]);
+        Self::new(tts)
     }
 
 }
 
-pub struct TAction<B: BitBoard>(Tensor);
+
+pub trait ModelInput<G: GameLogic>: BoardTensor {
+    fn get_pnet_input(g: &G, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self;
+    fn get_vnet_input(g: &G, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self;
+}
+
+impl ModelInput<Game> for TBoard<Game> {
+    
+
+    fn get_pnet_input(g: &Game, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
+
+        let short_history = <Self as BoardTensor>::from_short_history(&g.short_history, options);
+        let rotated_short_history = short_history.tensor.rot90(rot.get_k().into(), [1,2]);
+        // (3 * 4, 11, 11)
+
+        let board = <Self as BoardTensor>::from_game_board(&g.board, options);
+        let rotated_board: Tensor = board.tensor.rot90(rot.get_k().into(), [1,2]);
+        // (3, 11, 11)
+
+        let tmc = <Self as BoardTensor>::from_tot_move_count(g, options).tensor.unsqueeze(0);
+        // (1, 11, 11)
+        let rc = Self::from_repetition_count(g, options).tensor.unsqueeze(0);
+        // (1, 11, 11)
+        let side = <Self as BoardTensor>::from_play_side(g, options).tensor.unsqueeze(0);
+        // (1, 11, 11)
+        let ts = Tensor::cat(&[rotated_board, rotated_short_history, tmc, rc, side], 0);
+        Self::new(ts)
+    }
+
+    fn get_vnet_input(g: &Game, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
+
+        let short_history = <Self as BoardTensor>::from_short_history(&g.short_history, options);
+        let rotated_short_history = short_history.tensor.rot90(rot.get_k().into(), [1,2]);
+        // (3 * 4, 11, 11)
+
+        let board = <Self as BoardTensor>::from_game_board(&g.board, options);
+        let rotated_board: Tensor = board.tensor.rot90(rot.get_k().into(), [1,2]);
+        // (3, 11, 11)
+
+        let tmc = <Self as BoardTensor>::from_tot_move_count(g, options).tensor.unsqueeze(0);
+        // (1, 11, 11)
+        let rc = Self::from_repetition_count(g, options).tensor.unsqueeze(0);
+        // (1, 11, 11)
+        let ts = Tensor::cat(&[rotated_board, rotated_short_history, tmc, rc], 0);
+        // (1, 11, 11)
+        Self::new(ts)
+    }
+}
+
+impl ModelInput<SimpleGame> for TBoard<SimpleGame> {
+
+    fn get_pnet_input(g: &SimpleGame, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
+
+        let board = <Self as BoardTensor>::from_game_board(&g.get_board(), options);
+        let rotated_board: Tensor = board.tensor.rot90(rot.get_k().into(), [1,2]);
+        // (3, 7, 7)
+
+        let tmc = <Self as BoardTensor>::from_tot_move_count(g, options).tensor.unsqueeze(0);
+        // (1, 7, 7)
+        let side = <Self as BoardTensor>::from_play_side(g, options).tensor.unsqueeze(0);
+        // (1, 7, 7)
+        let ts = Tensor::cat(&[rotated_board, tmc, side], 0);
+        Self::new(ts)
+    }
+
+    fn get_vnet_input(g: &SimpleGame, rot: Rotation, options: (tch::Kind, tch::Device)) -> Self {
+
+        let board = <Self as BoardTensor>::from_game_board(&g.get_board(), options);
+        let rotated_board: Tensor = board.tensor.rot90(rot.get_k().into(), [1,2]);
+        // (3, 7, 7)
+
+        let tmc = <Self as BoardTensor>::from_tot_move_count(g, options).tensor.unsqueeze(0);
+        // (1, 7, 7)
+        let ts = Tensor::cat(&[rotated_board, tmc], 0);
+        Self::new(ts)
+    }
+
+}
+
+pub struct TAction<B: BitBoard>{
+    tensor: Tensor,
+    _marker: PhantomData<B>,
+}
 
 impl<B: BitBoard> TAction<B> {
+
+    pub fn new(ts: Tensor) -> Self {
+        Self{
+            tensor: ts,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn get(&self) -> &Tensor {
-        &self.0
+        &self.tensor
     }
 
     pub fn inner(self) -> Tensor {
-        self.0
+        self.tensor
     }
 
     // returns the actions indicated by the non-zero indices in self. 
     // will this work for Boolean Tensor ??
-    pub fn to_vbm(&self) -> Vec<VectorBasedMove<B>> {
-        let mut vbms: Vec<VectorBasedMove<B>> = vec![];
-        let ts = self.0.flatten(0, -1);
+    pub fn to_vbm(&self) -> Vec<VectorBasedMove> {
+        let mut vbms: Vec<VectorBasedMove> = vec![];
+        let ts = self.tensor.flatten(0, -1);
         let nonzero_locations: Tensor = ts.nonzero().flatten(0, -1);
         // should be a Tensor of size [N]. e.g. [0, 1, 3, 6, ...]
 
         let vec = Vec::<i64>::try_from(nonzero_locations).unwrap();
         for idx in vec {
-            vbms.push(VectorBasedMove::from_index(idx));
+            vbms.push(<VectorBasedMove as DirectionalMove<B>>::from_index(idx));
         }
         vbms
     }
 
     // take the actions with highest probabilities
     // Tensor is assumed to be of shape (bs, action_size, board_size, board_size)
-    pub fn get_move_from(&self) -> Result<Vec<VectorBasedMove<B>>>{
-        let ts = &self.0;
+    pub fn get_move_from(&self) -> Result<Vec<VectorBasedMove>>{
+        let ts = &self.tensor;
         let batch_size = ts.size()[0];
         let tts = ts.view([batch_size, -1]);
         let idxs = Tensor::zeros([batch_size], (tch::Kind::Int64, tts.device()));
@@ -585,125 +598,139 @@ impl<B: BitBoard> TAction<B> {
         // size = (bs)
         debug_assert_eq!(idxs.size(), [batch_size]);
         let v: Vec<i64> = Vec::try_from(idxs)?;
-        let v = v.into_iter().map(|idx| VectorBasedMove::<B>::from_index(idx)).collect();
+        let v = v.into_iter().map(|idx| <VectorBasedMove as DirectionalMove<B>>::from_index(idx)).collect();
         Ok(v)
     }
-
 }
 
-impl TAction<BoardEleven> {
-    pub fn vbm_one_hot_encode(vbm: &VectorBasedMove<BoardEleven>) -> Self {
-        let index = vbm.to_index();
+pub trait ActionTensor {
+    fn vbm_one_hot_encode(vbm: &VectorBasedMove) -> Self;
+    fn vec_vbm_one_hot_encode(vbms: &Vec<VectorBasedMove>) -> Self;
+    fn iter_vbm_one_hot_encode<T>(vbms: &T) -> Self
+        where for<'a> &'a T: IntoIterator<Item = VectorBasedMove>;
+    fn vec_vbm_one_hot_encode_boolean(vbms: &Vec<VectorBasedMove>) -> Self;
+    fn from_index_policy(idx_policy: &IndexPolicy) -> Self;
+}
+
+impl ActionTensor for TAction<BoardEleven> {
+    fn vbm_one_hot_encode(vbm: &VectorBasedMove) -> Self {
+        let index = <VectorBasedMove as DirectionalMove<BoardEleven>>::to_index(vbm);
         let mut arr: [i64; 11 * 11 * 20] = [0; 11 * 11 * 20];
         arr[index as usize] = 1;
         let ts = Tensor::from_slice(&arr);
         let ts = ts.view([20,11,11]);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn vec_vbm_one_hot_encode(vbms: &Vec<VectorBasedMove<BoardEleven>>) -> Self {
+    fn vec_vbm_one_hot_encode(vbms: &Vec<VectorBasedMove>) -> Self {
         let mut arr: [i64; 11 * 11 * 20] = [0; 11 * 11 * 20];
         let indices = vbms.iter()
-            .map(|a| a.to_index());
+            .map(|a| <VectorBasedMove as DirectionalMove<BoardEleven>>::to_index(a));
         for index in indices {
             arr[index as usize] = 1;
         }
         let ts = Tensor::from_slice(&arr[..]);
         let ts = ts.view([20,11,11]);
         debug_assert!(ts.kind() == Kind::Int64);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn iter_vbm_one_hot_encode<T>(vbms: &T) -> Self
-    where for<'a> &'a T: IntoIterator<Item = VectorBasedMove<BoardEleven>>,
+    fn iter_vbm_one_hot_encode<T>(vbms: &T) -> Self
+    where for<'a> &'a T: IntoIterator<Item = VectorBasedMove>,
     {
         let mut arr: [i64; 11 * 11 * 20] = [0; 11 * 11 * 20];
         let indices = vbms.into_iter()
-            .map(|a| a.to_index());
+            .map(|a| <VectorBasedMove as DirectionalMove<BoardEleven>>::to_index(&a));
         for index in indices {
             arr[index as usize] = 1;
         }
         let ts = Tensor::from_slice(&arr[..]);
         let ts = ts.view([20,11,11]);
         debug_assert!(ts.kind() == Kind::Int64);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn vec_vbm_one_hot_encode_boolean(vbms: &Vec<VectorBasedMove<BoardEleven>>) -> Self {
+    fn vec_vbm_one_hot_encode_boolean(vbms: &Vec<VectorBasedMove>) -> Self {
         let mut arr: [bool; 11 * 11 * 20] = [false; 11 * 11 * 20];
         let indices = vbms.iter()
-            .map(|a| a.to_index());
+            .map(|a| <VectorBasedMove as DirectionalMove<BoardEleven>>::to_index(a));
         for index in indices {
             arr[index as usize] = true;
         }
         let ts = Tensor::from_slice(&arr[..]);
         let ts = ts.view([20,11,11]);
         debug_assert!(ts.kind() == Kind::Bool);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn from_index_policy(idx_policy: &IndexPolicy) -> Self {
+    fn from_index_policy(idx_policy: &IndexPolicy) -> Self {
         let mut slice = &mut [0.0f32; 20 * 11 * 11];
         for (idx, value) in idx_policy.get() {
             slice[*idx as usize] = *value;
         }
         let mut ts = Tensor::from_slice(slice);
         ts.view([20, 11, 11]);
-        Self(ts)
+        Self::new(ts)
     }
+
 }
 
-impl TAction<BoardSeven> {
-    pub fn vbm_one_hot_encode(vbm: &VectorBasedMove<BoardSeven>) -> Self {
-        let index = vbm.to_index();
+
+impl ActionTensor for TAction<BoardSeven> {
+    fn vbm_one_hot_encode(vbm: &VectorBasedMove) -> Self {
+        let index = <VectorBasedMove as DirectionalMove<BoardSeven>>::to_index(vbm);
         let mut arr: [i64; 7 * 7 * 12] = [0; 7 * 7 * 12];
         arr[index as usize] = 1;
         let ts = Tensor::from_slice(&arr);
         let ts = ts.view([12,7,7]);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn vec_vbm_one_hot_encode(vbms: &Vec<VectorBasedMove<BoardEleven>>) -> Self {
+
+    fn vec_vbm_one_hot_encode(vbms: &Vec<VectorBasedMove>) -> Self {
         let mut arr: [i64; 7 * 7 * 12] = [0; 7 * 7 * 12];
         let indices = vbms.iter()
-            .map(|a| a.to_index());
+            .map(|a| <VectorBasedMove as DirectionalMove<BoardSeven>>::to_index(a));
         for index in indices {
             arr[index as usize] = 1;
         }
         let ts = Tensor::from_slice(&arr[..]);
         let ts = ts.view([12,7,7]);
         debug_assert!(ts.kind() == Kind::Int64);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn iter_vbm_one_hot_encode<T>(vbms: &T) -> Self
-    where for<'a> &'a T: IntoIterator<Item = VectorBasedMove<BoardEleven>>,
+
+    fn iter_vbm_one_hot_encode<T>(vbms: &T) -> Self
+    where for<'a> &'a T: IntoIterator<Item = VectorBasedMove>,
     {
         let mut arr: [i64; 7 * 7 * 12] = [0; 7 * 7 * 12];
         let indices = vbms.into_iter()
-            .map(|a| a.to_index());
+            .map(|a| <VectorBasedMove as DirectionalMove<BoardSeven>>::to_index(&a));
         for index in indices {
             arr[index as usize] = 1;
         }
         let ts = Tensor::from_slice(&arr[..]);
         let ts = ts.view([12,7,7]);
         debug_assert!(ts.kind() == Kind::Int64);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn vec_vbm_one_hot_encode_boolean(vbms: &Vec<VectorBasedMove<BoardEleven>>) -> Self {
+
+    fn vec_vbm_one_hot_encode_boolean(vbms: &Vec<VectorBasedMove>) -> Self {
         let mut arr: [bool; 7 * 7 * 12] = [false; 7 * 7 * 12];
         let indices = vbms.iter()
-            .map(|a| a.to_index());
+            .map(|a| <VectorBasedMove as DirectionalMove<BoardSeven>>::to_index(a));
         for index in indices {
             arr[index as usize] = true;
         }
         let ts = Tensor::from_slice(&arr[..]);
         let ts = ts.view([12,7,7]);
         debug_assert!(ts.kind() == Kind::Bool);
-        Self(ts)
+        Self::new(ts)
     }
-    pub fn from_index_policy(idx_policy: &IndexPolicy) -> Self {
+
+    fn from_index_policy(idx_policy: &IndexPolicy) -> Self {
         let mut slice = &mut [0.0f32; 12 * 7 * 7];
         for (idx, value) in idx_policy.get() {
             slice[*idx as usize] = *value;
         }
         let mut ts = Tensor::from_slice(slice);
         ts.view([12, 7, 7]);
-        Self(ts)
+        Self::new(ts)
     }
 }
 
@@ -711,7 +738,7 @@ impl TAction<BoardSeven> {
 #[cfg(feature = "torch")]
 // take the actions with highest probabilities
 // Tensor is assumed to be of shape (bs, action_size, board_size, board_size)
-pub fn get_move_from_tensor(ts: &Tensor) -> Result<Vec<VectorBasedMove>>{
+pub fn get_move_from_tensor<B: BitBoard>(ts: &Tensor) -> Result<Vec<VectorBasedMove>>{
     let batch_size = ts.size()[0];
     let tts = ts.view([batch_size, -1]);
     let idxs = Tensor::zeros([batch_size], (tch::Kind::Int64, tts.device()));
@@ -720,7 +747,7 @@ pub fn get_move_from_tensor(ts: &Tensor) -> Result<Vec<VectorBasedMove>>{
     // size = (bs)
     debug_assert_eq!(idxs.size(), [batch_size]);
     let v: Vec<i64> = Vec::try_from(idxs)?;
-    let v = v.into_iter().map(|idx| VectorBasedMove::from_index(idx)).collect();
+    let v = v.into_iter().map(|idx| <VectorBasedMove as DirectionalMove<B>>::from_index(idx)).collect();
     Ok(v)
 }
 
@@ -763,7 +790,7 @@ mod tests {
     #[test]
     fn get_move_from_tensor_works() {
         let ts = Tensor::rand([10, 20, 11, 11], (tch::Kind::Float, tch::Device::Cpu));
-        let moves = get_move_from_tensor(&ts).unwrap();
+        let moves = get_move_from_tensor::<BoardEleven>(&ts).unwrap();
         let moves: Vec<MoveOnBoardEleven> = moves.into_iter().map(|a| a.convert_into()).collect();
         println!("{:?}", moves);
     }
@@ -774,7 +801,7 @@ mod tests {
         let mut rng = thread_rng();
         let b = BoardEleven::random(&mut rng);
         println!("{}", b);
-        let tb = TBoardEleven::from_bitboard(&b, (tch::Kind::Float, tch::Device::Cpu));
+        let tb = TBoard::<Game>::from_bitboard(&b, (tch::Kind::Float, tch::Device::Cpu));
         println!("{:?}", tb);
         assert!(tb.0.is_contiguous());
     }
@@ -783,9 +810,9 @@ mod tests {
     #[test]
     fn tboard_eleven_from_taflboard_works() {
         let mut rng = thread_rng();
-        let b = TaflBoardEleven::generate_random_board(&mut rng);
+        let b = TaflBoard::<BoardEleven>::generate_random_board(&mut rng);
         println!("{}", b);
-        let tb = TBoardEleven::from_game_board(&b, (tch::Kind::Float, tch::Device::Cpu));
+        let tb = TBoard::<Game>::from_game_board(&b, (tch::Kind::Float, tch::Device::Cpu));
         assert_eq!(tb.0.size(), [3,11,11]);
         assert!(tb.0.is_contiguous());
     }
@@ -798,7 +825,7 @@ mod tests {
         let mut game = Game::default();
         let device = if tch::Cuda::is_available() { tch::Device::Cuda(0)} else {tch::Device::Cpu};
         let kind = tch::Kind::Float;
-        let vnet_input = TBoardEleven::get_vnet_input(&game, Rotation::No, (kind, device));
+        let vnet_input = TBoard::<Game>::get_vnet_input(&game, Rotation::No, (kind, device));
         assert_eq!(vnet_input.0.size(), [17, 11, 11]);
         assert!(vnet_input.0.is_contiguous());
         println!("{:?}", vnet_input.0);
@@ -812,7 +839,7 @@ mod tests {
         let mut game = Game::default();
         let device = if tch::Cuda::is_available() { tch::Device::Cuda(0)} else {tch::Device::Cpu};
         let kind = tch::Kind::Float;
-        let pnet_input = TBoardEleven::get_pnet_input(&game, Rotation::No, (kind, device));
+        let pnet_input = TBoard::<Game>::get_pnet_input(&game, Rotation::No, (kind, device));
         assert_eq!(pnet_input.0.size(), [18, 11, 11]);
         assert!(pnet_input.0.is_contiguous());
         println!("{:?}", pnet_input.0);

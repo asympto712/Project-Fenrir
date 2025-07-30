@@ -9,16 +9,17 @@ use std::path::Path;
 use std::io::{Read, Seek, Cursor};
 use std::convert::AsRef;
 
+use game::game::GameLogic;
 use crate::agent::MCTSConfig;
 use crate::model::{self, ModelConfig};
 use crate::model::PVModel;
-use crate::replay_buffer::ReplayBuffer;
+use crate::replay_buffer::{BoardData, GameSPR, ReplayBuffer, SimpleGameSPR, Sampler};
 use crate::run;
 use crate::self_play::{self, self_play_new, InferenceManager, LockedShelf, ModuleShelf};
 use crate::self_play::self_play;
 use crate::train::{self, ModelSyncConfig, Trainer};
-use crate::replay_buffer;
 use crate::self_play::Shelf;
+use crate::utils::{ActionTensor, BoardTensor, ModelInput, TAction, TBoard};
 
 use color_eyre::eyre::{eyre, OptionExt};
 use mpi::point_to_point::*;
@@ -362,7 +363,15 @@ fn now_into_filename() -> OsString {
     filename.into()
 }
 
-fn run_wo_mpi_sequential<P: PVModel + Send + 'static>(config: &FenrirConfig, model_config: ModelConfig, mcts_config: MCTSConfig) -> Result<()> {
+fn run_wo_mpi_sequential<P: PVModel + Send + 'static, D: BoardData>(
+    config: &FenrirConfig,
+    model_config: ModelConfig,
+    mcts_config: MCTSConfig
+) -> Result<()> 
+where
+ReplayBuffer<D>: Sampler,
+TBoard<<D as BoardData>::G>: ModelInput<D::G>,
+TAction<<D::G as GameLogic>::B>: ActionTensor, {
 
     assert!(!config.use_mpi);
 
@@ -371,7 +380,7 @@ fn run_wo_mpi_sequential<P: PVModel + Send + 'static>(config: &FenrirConfig, mod
 
     // Create a new model
     let vs = VarStore::new(Device::Cpu);
-    let new_model = P::new(&vs.root(), &model_config);
+    let new_model = <P as PVModel>::new(&vs.root(), &model_config);
     let mut path: OsString = {
         let mut p = OsString::new();
         p.push("./test_models/");
@@ -385,7 +394,7 @@ fn run_wo_mpi_sequential<P: PVModel + Send + 'static>(config: &FenrirConfig, mod
     let (table, name_lookup) = model_setup_config.create_lookup_table(None, loaded_modules)?;
 
     let mut shelf = ModuleShelf::module_shelf(table, name_lookup);
-    let replay_buffer = ReplayBuffer::new(config.replay_buffer_capacity);
+    let replay_buffer = ReplayBuffer::<D>::new(config.replay_buffer_capacity);
     
     let mut storage = Cursor::new(Vec::<u8>::new());
  
@@ -399,7 +408,7 @@ fn run_wo_mpi_sequential<P: PVModel + Send + 'static>(config: &FenrirConfig, mod
 
         let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.mini_batch_size);
 
-        self_play_new(
+        self_play_new::<P,D>(
             manager,
             request_senders[0].clone(),
             config.n_self_play_games,
@@ -417,7 +426,7 @@ fn run_wo_mpi_sequential<P: PVModel + Send + 'static>(config: &FenrirConfig, mod
             ModelSyncConfig::new(train::SumOrAve::Ave)
         )?;
 
-        trainer.train(config.n_training_step_per_cycle, config.n_training_step_per_cycle, &replay_buffer)?;
+        trainer.train::<D, _>(config.n_training_step_per_cycle, config.n_training_step_per_cycle, &replay_buffer)?;
         trainer.save_to_stream(&mut storage);
 
         // path = OsString::new().push("./test_models/").push(now_into_filename().as_os_str());

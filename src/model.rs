@@ -21,9 +21,6 @@ use serde::Deserialize;
 use color_eyre::eyre::ErrReport;
 use color_eyre::eyre::Result;
 
-//internal
-use game::board::TaflBoardEleven;
-use bitboard::eleven::MoveOnBoardEleven;
 
 use std::collections::HashMap;
 use std::fmt::format;
