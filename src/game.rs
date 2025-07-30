@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 use crate::board::TaflBoard;
 use bitboard::Direction;
@@ -193,13 +193,14 @@ pub type MoveResult<B> = (Option<ReasonForTermination>, Option<Vec<<B as BitBoar
 pub type MoveResultWithSelf<T, B> = Result<(T, Option<ReasonForTermination>, Option<Vec<<B as BitBoard>::Movement>>), InvalidActionError>;
 pub type SimpleMoveResult<B> = Result<MoveResult<B>, InvalidActionError>;
 
-pub trait GameLogic: Sized{
-    type B: BitBoard;
+pub trait GameLogic: Sized + Default + Clone + std::fmt::Debug{
+    type B: BitBoard + std::fmt::Debug;
 
     fn get_board(&self) -> &TaflBoard<Self::B>;
     fn get_board_mut(&mut self) -> &mut TaflBoard<Self::B>;
     fn get_state(&self) -> &GameState;
     fn get_state_mut(&mut self) -> &mut GameState;
+    fn ghastly() -> Self;
     fn current_side(&self) -> Side{
         self.get_state().show_side()
     }
@@ -569,23 +570,6 @@ impl Game{
         Self::from_board(board, Side::Att)
     }
 
-    // only for cheap creation of dummy variable
-    #[inline]
-    pub fn ghastly() -> Self {
-        let board = TaflBoard::<BoardEleven>::new(
-            BoardEleven::ghastly(),
-            BoardEleven::ghastly(),
-            BoardEleven::ghastly(),
-            BoardEleven::ghastly()
-        );
-        Self { 
-            board,
-            state: GameState(0),
-            short_history: ShortHistory::new(),
-            repetition_counter: 0
-        }
-    }
-
     // When the action would result in the repetition, returns true. If not, (even when the action is invalid), returns false.
     pub fn move_would_result_in_repetition(&self, side: Side, piece_type: Option<PieceType>, action: &<BoardEleven as BitBoard>::Movement) -> bool {
 
@@ -642,6 +626,23 @@ impl GameLogic for Game{
 
     fn get_state_mut(&mut self) -> &mut GameState {
         &mut self.state
+    }
+
+    // only for cheap creation of dummy variable
+    #[inline]
+    fn ghastly() -> Self {
+        let board = TaflBoard::<BoardEleven>::new(
+            BoardEleven::ghastly(),
+            BoardEleven::ghastly(),
+            BoardEleven::ghastly(),
+            BoardEleven::ghastly()
+        );
+        Self { 
+            board,
+            state: GameState(0),
+            short_history: ShortHistory::new(),
+            repetition_counter: 0
+        }
     }
 
     fn invalid_action_check_advanced(&self, e: &mut InvalidActionError, p: &PieceType, action: &<Self::B as BitBoard>::Movement, _opt: &Option<Direction>) {
@@ -1169,20 +1170,6 @@ impl SimpleGame {
         Self::from_board(board, Side::Att)
     }
 
-    // only for cheap creation of dummy variable
-    #[inline]
-    pub fn ghastly() -> Self {
-        let board = TaflBoard::<BoardSeven>::new(
-            BoardSeven::ghastly(),
-            BoardSeven::ghastly(),
-            BoardSeven::ghastly(),
-            BoardSeven::ghastly()
-        );
-        Self { 
-            board,
-            state: GameState(0),
-        }
-    }
 }
 
 impl GameLogic for SimpleGame {
@@ -1199,6 +1186,21 @@ impl GameLogic for SimpleGame {
     fn get_state_mut(&mut self) -> &mut GameState {
         &mut self.state
     }
+    // only for cheap creation of dummy variable
+    #[inline]
+    fn ghastly() -> Self {
+        let board = TaflBoard::<BoardSeven>::new(
+            BoardSeven::ghastly(),
+            BoardSeven::ghastly(),
+            BoardSeven::ghastly(),
+            BoardSeven::ghastly()
+        );
+        Self { 
+            board,
+            state: GameState(0),
+        }
+    }
+
     fn do_action_unchecked(&self, action: &<Self::B as BitBoard>::Movement, piece_type: Option<PieceType>) -> Self {
         let side = self.state.show_side();
 
