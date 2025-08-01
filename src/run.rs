@@ -10,11 +10,13 @@ use std::io::{Read, Seek, Cursor};
 use std::convert::AsRef;
 
 use game::game::GameLogic;
+use serde::Deserialize;
 use crate::agent::MCTSConfig;
 use crate::model::{self, ModelConfig};
 use crate::model::PVModel;
 use crate::replay_buffer::{BoardData, GameSPR, ReplayBuffer, SimpleGameSPR, Sampler};
 use crate::run;
+use crate::schedule::lr_sch_initialize;
 use crate::self_play::{self, self_play_new, InferenceManager, LockedShelf, ModuleShelf};
 use crate::self_play::self_play;
 use crate::train::{self, ModelSyncConfig, Trainer};
@@ -40,7 +42,27 @@ use chrono::{Utc, Local};
 const BUFFER_LEN: usize = 1024;
 
 #[derive(Debug, Clone)]
-struct FenrirConfig {
+pub struct FenrirConfig{
+    pub n_self_play_nodes: usize,
+    pub n_train_nodes: usize,
+    pub n_model_replica_self_play: usize,
+    pub n_model_replica_train: usize,
+    pub use_mpi: bool,
+    pub mini_batch_size: usize,
+    pub n_training_step_per_cycle: usize,
+    pub n_self_play_games: usize,
+    pub n_games_per_tournament: usize,
+    pub model_update_threshold: f32,
+    pub concurrent_training: bool,
+    pub replay_buffer_capacity: usize,
+    pub run_time_hr: u64,
+    pub momentum: f64,
+    pub weight_decay: f64,
+    pub learning_rate_schedule: fn(usize) -> f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FenrirConfigWrapper {
     n_self_play_nodes: usize,
     n_train_nodes: usize,
     n_model_replica_self_play: usize,
@@ -55,8 +77,33 @@ struct FenrirConfig {
     replay_buffer_capacity: usize,
     run_time_hr: u64,
     momentum: f64,
-    learning_rate_schedule: fn(usize) -> f64,
     weight_decay: f64,
+    learning_rate_schedule: String,
+}
+
+impl From<FenrirConfigWrapper> for FenrirConfig {
+    fn from(value: FenrirConfigWrapper) -> Self {
+        let mut table = lr_sch_initialize();
+        let learning_rate_schedule = table.remove(&value.learning_rate_schedule).unwrap();
+        Self {
+            n_self_play_nodes: value.n_self_play_nodes,
+            n_train_nodes: value.n_train_nodes,
+            n_model_replica_self_play: value.n_model_replica_self_play,
+            n_model_replica_train: value.n_model_replica_train,
+            use_mpi: value.use_mpi,
+            mini_batch_size: value.mini_batch_size,
+            n_training_step_per_cycle: value.n_training_step_per_cycle,
+            n_self_play_games: value.n_self_play_games,
+            n_games_per_tournament: value.n_games_per_tournament,
+            model_update_threshold: value.model_update_threshold,
+            concurrent_training: value.concurrent_training,
+            replay_buffer_capacity: value.replay_buffer_capacity,
+            run_time_hr: value.run_time_hr,
+            momentum: value.momentum,
+            weight_decay: value.weight_decay,
+            learning_rate_schedule,
+        }
+    }
 }
 
 const fn agz_lr_schedule(n_steps: usize) -> f64 {
@@ -68,13 +115,31 @@ const fn agz_lr_schedule(n_steps: usize) -> f64 {
 }
 
 // Set up related stuff
-struct ModelSetupConfig{
+#[derive(Debug)]
+pub struct ModelSetupConfig{
     use_mpi: bool,
     module_load_infos: Vec<ModuleLoadInfo>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ModelSetupConfigWrapper {
+    use_mpi: bool,
+    module_load_infos: Vec<ModuleLoadInfoWrapper>,
+}
+
+impl From<ModelSetupConfigWrapper> for ModelSetupConfig {
+    fn from(value: ModelSetupConfigWrapper) -> Self {
+        let use_mpi = value.use_mpi;
+        let module_load_infos: Vec<ModuleLoadInfo> = value.module_load_infos.into_iter().map(|x| x.into()).collect::<Vec<_>>();
+        Self {
+            use_mpi,
+            module_load_infos
+        }
+    }
+}
+
 impl ModelSetupConfig {
-    fn model_setup_config(use_mpi: bool, module_load_infos: Vec<ModuleLoadInfo>) -> Self {
+    pub fn model_setup_config(use_mpi: bool, module_load_infos: Vec<ModuleLoadInfo>) -> Self {
         Self {
             use_mpi,
             module_load_infos
@@ -82,7 +147,7 @@ impl ModelSetupConfig {
     }
     // This takes the output of the setup function (loaded models along with their var stores and their path names), and create correspondence between their names and their group id.
     // This function operates locally (inside each mpi node)
-    fn create_lookup_table<P: PVModel>(&self, rank: Option<i32>, loaded_model: Vec<(OsString, P, VarStore)>) -> 
+    pub fn create_lookup_table<P: PVModel>(&self, rank: Option<i32>, loaded_model: Vec<(OsString, P, VarStore)>) -> 
     Result<(Vec<Vec<(P, VarStore)>>, Vec<OsString>)> {
         
         let mut table: Vec<Vec<(P, VarStore)>> = vec![];
@@ -115,7 +180,8 @@ impl ModelSetupConfig {
     }
 }
 
-struct ModuleLoadInfo {
+#[derive(Debug)]
+pub struct ModuleLoadInfo {
     // path to the file that stores the model weight
     path: OsString,
     // only specify when using mpi
@@ -126,8 +192,41 @@ struct ModuleLoadInfo {
     config: ModelConfig,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ModuleLoadInfoWrapper {
+    path: String,
+    rank: Option<i32>,
+    device: DeviceWrapper,
+    config: ModelConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", content = "details")]
+enum DeviceWrapper {
+    Cpu,
+    Cuda(usize),
+}
+
+impl From<ModuleLoadInfoWrapper> for ModuleLoadInfo {
+    fn from(value: ModuleLoadInfoWrapper) -> Self {
+        let path: OsString = value.path.into();
+        let rank = value.rank;
+        let device: Device = match value.device {
+            DeviceWrapper::Cpu => Device::Cpu,
+            DeviceWrapper::Cuda(i) => Device::Cuda(i)
+        };
+        let config = value.config;
+        Self {
+            path,
+            rank,
+            device,
+            config
+        }
+    }
+}
+
 impl ModuleLoadInfo {
-    fn module_load_info(path: OsString, rank: Option<i32>, device: Device, config: ModelConfig) -> Self {
+    pub fn module_load_info(path: OsString, rank: Option<i32>, device: Device, config: ModelConfig) -> Self {
         Self{
             path,
             rank,
@@ -137,26 +236,26 @@ impl ModuleLoadInfo {
     }
 }
 
-fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> (OsString, P, VarStore) {
+pub fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> Result<(OsString, P, VarStore)> {
 
     let path = Path::new(&info.path);
     let mut vs = VarStore::new(info.device);
     let module: P = P::new(&vs.root(), &info.config);
-    vs.load(path).unwrap();
-    (info.path.to_owned(), module, vs)
+    vs.load(path)?;
+    Ok((info.path.to_owned(), module, vs))
 
 }
 
-fn load_module_from_stream<P: PVModel, S: Read + Seek>(info: &ModuleLoadInfo, stream: S) -> (OsString, P, VarStore) {
+pub fn load_module_from_stream<P: PVModel, S: Read + Seek>(info: &ModuleLoadInfo, stream: S) -> Result<(OsString, P, VarStore)> {
 
     let mut vs = VarStore::new(info.device);
     let module: P = P::new(&vs.root(), &info.config);
-    vs.load_from_stream(stream).unwrap();
-    (info.path.to_owned(), module, vs)
+    vs.load_from_stream(stream)?;
+    Ok((info.path.to_owned(), module, vs))
 
 }
 
-fn setup<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>>{
+pub fn setup<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>>{
 
     #[cfg(not(feature = "mpi"))]
     {
@@ -189,7 +288,7 @@ fn add_module_to_list<P: PVModel>(info: &ModuleLoadInfo, list: &mut Vec<(OsStrin
     match info.device {
 
         Device::Cpu => {
-            let (name, module, var_store) = load_module::<P>(&info);
+            let (name, module, var_store) = load_module::<P>(&info)?;
             list.push((name, module, var_store));
             Ok(())
         },
@@ -200,7 +299,7 @@ fn add_module_to_list<P: PVModel>(info: &ModuleLoadInfo, list: &mut Vec<(OsStrin
             }
             let device_index = available_cuda.iter().position(|&d| d == info.device).ok_or_eyre("Could not find the device")?;
             available_cuda.remove(device_index);
-            let (name, module, var_store) = load_module::<P>(&info);
+            let (name, module, var_store) = load_module::<P>(&info)?;
             list.push((name, module, var_store));
             Ok(())
             
@@ -220,7 +319,7 @@ fn add_module_from_stream_to_list<P: PVModel, S: Seek + Read>(
     match info.device {
 
         Device::Cpu => {
-            let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream);
+            let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream)?;
             list.push((name, module, var_store));
             Ok(())
         },
@@ -231,7 +330,7 @@ fn add_module_from_stream_to_list<P: PVModel, S: Seek + Read>(
             }
             let device_index = available_cuda.iter().position(|&d| d == info.device).ok_or_eyre("Could not find the device")?;
             available_cuda.remove(device_index);
-            let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream);
+            let (name, module, var_store) = load_module_from_stream::<P, S>(&info, stream)?;
             list.push((name, module, var_store));
             Ok(())
             
@@ -357,7 +456,7 @@ fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
     Ok(())
 }
 
-fn now_into_filename() -> OsString {
+pub fn now_into_filename() -> OsString {
     let now = Local::now();
     let filename = format!("{}.pv", now.format("%Y%m%d_%H%M"));
     filename.into()
@@ -398,7 +497,7 @@ TAction<<D::G as GameLogic>::B>: ActionTensor, {
     
     let mut storage = Cursor::new(Vec::<u8>::new());
  
-    for i in 0..2 {
+    for i in 0..1 {
 
         let mut locked_shelf = LockedShelf::<P>::convert_from_shelf(shelf);
 

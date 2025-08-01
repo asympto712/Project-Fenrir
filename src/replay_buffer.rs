@@ -454,12 +454,12 @@ impl ReplayBuffer<GameSPR> {
                         .to_device(options.1);
 
                     let cur_board = spr.board.to_tboard(options).get();
-                    let mut past = true;
+                    let mut past = if idx > 0 {true} else {false}; // fail-safe logic to ensure that subtract with overflow won't happen
                     let mut short_history: [Option<Tensor>; 4] = std::array::from_fn(|i| {
 
                         let ts = if past {
 
-                            if let Some(eu) = q.get(idx - i - 1) {
+                            if (idx - 1 - i) > 0 && let Some(eu) = q.get(idx - i - 1) {
                                 if let EpisodeUnit::SPR(spr) = eu {
                                     spr.board.to_tboard(options).get()
                                 } else {
@@ -572,14 +572,14 @@ impl ReplayBuffer<SimpleGameSPR> {
 
                     let tot_move_count: i64 = spr.state.get_turn_count().into();
                     let tmc: Tensor = Tensor::scalar_tensor(tot_move_count, options);
-                    let tmc: Tensor = tmc.broadcast_to([1, 11, 11]);
+                    let tmc: Tensor = tmc.broadcast_to([1, 7, 7]);
 
                     let side: i64 = match spr.state.show_side() {
                         Side::Att => 1,
                         Side::Def => 0,
                     };
                     let side: Tensor = Tensor::scalar_tensor(side, options);
-                    let side: Tensor = side.broadcast_to([1, 11, 11]);
+                    let side: Tensor = side.broadcast_to([1, 7, 7]);
 
                     let position = Tensor::cat(&[
                         cur_board,
@@ -774,7 +774,7 @@ mod tests {
             let game = create_mock_game();
             let posterior = create_mock_posterior::<BoardEleven>();
             
-            episode.append_wo_reward::<Game>(&game, posterior);
+            episode.append_wo_reward(&game, posterior);
             assert_eq!(episode.len(), 2); // Sep + SPR
             
             match &episode.episode[1] {
@@ -789,8 +789,8 @@ mod tests {
             let game = create_mock_game();
             let posterior = create_mock_posterior::<BoardEleven>();
             
-            episode.append_wo_reward::<Game>(&game, posterior.clone());
-            episode.append_wo_reward::<Game>(&game, posterior);
+            episode.append_wo_reward(&game, posterior.clone());
+            episode.append_wo_reward(&game, posterior);
             
             episode.give_reward(50);
             
@@ -820,7 +820,7 @@ mod tests {
             let game = create_mock_game();
             let posterior = create_mock_posterior::<BoardEleven>();
             
-            episode.append_wo_reward::<Game>(&game, posterior);
+            episode.append_wo_reward(&game, posterior);
             let initial_len = episode.len();
             
             buffer.extend_from_episode(episode);
@@ -836,7 +836,7 @@ mod tests {
             let game = create_mock_game();
             let posterior = create_mock_posterior::<BoardEleven>();
             
-            episode.append_wo_reward::<Game>(&game, posterior);
+            episode.append_wo_reward(&game, posterior);
             let initial_len = episode.len();
             
             buffer.append_from_episode(&mut episode);
@@ -853,7 +853,7 @@ mod tests {
             let game = create_mock_game();
             let posterior = create_mock_posterior::<BoardEleven>();
             
-            episode.append_wo_reward::<Game>(&game, posterior);
+            episode.append_wo_reward(&game, posterior);
             buffer.extend_from_episode(episode);
             
             // Verify buffer has content
@@ -917,8 +917,8 @@ mod tests {
             // Add more episodes than capacity
             for _ in 0..3 {
                 let mut episode: Episode<GameSPR> = Episode::new();
-                episode.append_wo_reward::<Game>(&game, posterior.clone());
-                episode.append_wo_reward::<Game>(&game, posterior.clone());
+                episode.append_wo_reward(&game, posterior.clone());
+                episode.append_wo_reward(&game, posterior.clone());
                 buffer.extend_from_episode(episode);
             }
             
@@ -938,7 +938,7 @@ mod tests {
             // Add some episodes
             for i in 0..3 {
                 let mut episode: Episode<GameSPR> = Episode::new();
-                episode.append_wo_reward::<Game>(&game, posterior.clone());
+                episode.append_wo_reward(&game, posterior.clone());
                 episode.give_reward(i as i64 * 10);
                 buffer.extend_from_episode(episode);
             }
@@ -1018,7 +1018,8 @@ mod tests {
             assert_eq!(tensor.size(), [3, 11, 11]);
             assert_eq!(tensor.kind(), Kind::Float);
             // Should be all zeros for Sep
-            let sum: f32 = tensor.sum(Kind::Float).into();
+            // sum will reduce it to 0-dim tensor, so we need to unsqueeze it?
+            let sum = tensor.sum(Kind::Float).unsqueeze(0).double_value(&[0]);
             assert_eq!(sum, 0.0);
         }
 
@@ -1041,7 +1042,7 @@ mod tests {
             assert_eq!(reward.size(), [1]);       // Should be scalar tensor
             
             // Check reward value
-            let reward_value: f32 = reward.into();
+            let reward_value = reward.unsqueeze(0).double_value(&[0]);
             assert_eq!(reward_value, 100.0);
         }
 
@@ -1143,14 +1144,14 @@ mod tests {
             let expected_channels = 3 + 1 + 1; // board + tmc + side (no history or repetition counter)
             assert_eq!(position.size()[0], expected_channels as i64);
             
-            let reward_value: f32 = reward.into();
+            let reward_value = reward.unsqueeze(0).double_value(&[0]);
             assert_eq!(reward_value, 75.0);
         }
 
         #[test]
         fn test_tensor_device_and_kind_consistency() {
             let game = create_mock_game();
-            let posterior = create_mock_posterior::<BoardSeven>();
+            let posterior = create_mock_posterior::<BoardEleven>();
             let spr = GameSPR::reward_initialized(&game, posterior, 123);
             let buffer_data = vec![EpisodeUnit::SPR(spr)];
             

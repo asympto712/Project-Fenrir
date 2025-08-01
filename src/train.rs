@@ -10,6 +10,7 @@ use crate::model::PVModel;
 use crate::replay_buffer::{BoardData, ReplayBuffer, Sampler};
 
 use rand::rngs::ThreadRng;
+use serde::Deserialize;
 #[cfg(feature = "torch")]
 use tch::nn::{self, VarStore, Variables, Path};
 #[cfg(feature = "torch")]
@@ -23,13 +24,14 @@ use color_eyre::eyre::{self, eyre, Context, ErrReport, OptionExt, Result};
 use rand::{prelude, thread_rng};
 
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(tag = "type")]
 pub enum SumOrAve {
     Sum,
     Ave,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct ModelSyncConfig{
     grad: SumOrAve
 }
@@ -40,10 +42,17 @@ impl ModelSyncConfig {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
 pub struct LossValue {
     pub total: f64,
     pub cross_entropy: f64,
     pub mse: f64,
+}
+
+impl std::fmt::Display for LossValue{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ce: {}, mse: {}, tot: {} ", self.cross_entropy, self.mse, self.total)
+    }
 }
 
 impl LossValue {
@@ -378,6 +387,10 @@ impl<'a, P: PVModel> Trainer<'a, P> {
                 self.optimizers.get_mut(0).ok_or_eyre("Could not mutably get optimizer")?,
                 batch
             );
+
+            if cfg!(test) {
+                print!("{loss_value}");
+            }
             self.loss_record.push(loss_value);
 
         } else {

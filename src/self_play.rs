@@ -517,7 +517,7 @@ TAction<<<D as BoardData>::G as GameLogic>::B>: ActionTensor,
             let (sender, receiver) = unbounded::<Evaluation>();
             let sender = Arc::new(sender);
             let game = <D::G as Default>::default();
-            let mut mcts_tree = MCTSTree::<D::G>::generate(game, *mcts_config);
+            let mut mcts_tree = MCTSTree::<D::G>::generate(game, mcts_config.clone());
             let actor = Actor::new_with_model_id(request_sender.clone(), model_id);
             (sender, receiver, mcts_tree, actor)
         }, 
@@ -978,7 +978,7 @@ TAction<<D::G as GameLogic>::B>: ActionTensor,
                 let (sender, receiver) = unbounded::<Evaluation>();
                 let sender = Arc::new(sender);
                 let game = <D::G as Default>::default();
-                let mut mcts_tree = MCTSTree::<D::G>::generate(game, *mcts_config);
+                let mut mcts_tree = MCTSTree::<D::G>::generate(game, mcts_config.clone());
                 let actor = NewActor::new(request_sender.clone());
                 (sender, receiver, mcts_tree, actor)
             }, 
@@ -989,13 +989,26 @@ TAction<<D::G as GameLogic>::B>: ActionTensor,
                 actor
             ), worker_idx| {
 
+                dbg!(worker_idx);
+                if cfg!(test) {
+                    println!("current number of threads: {}",rayon::current_num_threads());
+                }
+
                 let mut episode: Episode<D>= Episode::<D>::new();
 
                 while !mcts_tree.root_is_terminal() {
-                    let (game,_, posterior) = mcts_tree.get_policy_and_update::<NewActor>(&actor).unwrap();
+
+                    let (game,_action, posterior) = mcts_tree.get_policy_and_update::<NewActor>(&actor).unwrap();
                     episode.append_wo_reward(&game, posterior);
+
+                    if cfg!(test) {
+                        print!("{_action}->");
+                    }
                 }
                 let winner = mcts_tree.get_winner();
+
+                dbg!(winner);
+
                 match winner {
                     Side::Att => episode.give_reward(1i64),
                     Side::Def => episode.give_reward(-1i64),

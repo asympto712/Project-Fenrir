@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::fmt::format;
 // std
 use std::fs;
+use std::path::Path;
 
 // It seems like theoretically, applying weight decay such as L2 regularization does not make much sense,
 // although the degradation effect (or lack thereof) on the actual performance by doing so is debatable.
@@ -64,7 +65,7 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    pub fn load_from_toml(path: &str) -> Result<Self>{
+    pub fn load_from_toml<P: AsRef<Path>>(path: P) -> Result<Self>{
         let config_str = fs::read_to_string(path)?;
         let params: ModelConfig = toml::from_str(&config_str)?;
         Ok(params)
@@ -182,7 +183,7 @@ fn fenrir_value_head(
         .add_fn(|ts| ts.tanh())
 }
 
-struct GeneralPVDualModel {
+pub struct GeneralPVDualModel {
     base: nn::SequentialT,
     p_head: nn::SequentialT,
     v_head: nn::SequentialT,
@@ -227,7 +228,7 @@ impl PVModel for GeneralPVDualModel {
 }
 
 
-struct GeneralPVSepModel {
+pub struct GeneralPVSepModel {
     p_base: nn::SequentialT,
     v_base: nn::SequentialT,
     p_head: nn::SequentialT,

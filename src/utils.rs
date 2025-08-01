@@ -665,7 +665,7 @@ impl ActionTensor for TAction<BoardEleven> {
             slice[*idx as usize] = *value;
         }
         let mut ts = Tensor::from_slice(slice);
-        ts.view([20, 11, 11]);
+        ts = ts.view([20, 11, 11]);
         Self::new(ts)
     }
 
@@ -729,7 +729,7 @@ impl ActionTensor for TAction<BoardSeven> {
             slice[*idx as usize] = *value;
         }
         let mut ts = Tensor::from_slice(slice);
-        ts.view([12, 7, 7]);
+        ts = ts.view([12, 7, 7]);
         Self::new(ts)
     }
 }
@@ -754,8 +754,9 @@ pub fn get_move_from_tensor<B: BitBoard>(ts: &Tensor) -> Result<Vec<VectorBasedM
 #[cfg(test)]
 mod tests {
 
+    use super::*;
+
     // internal
-    use game::board::TaflBoardEleven;
     use game::game::Game;
     use game::game::ShortHistory;
     use bitboard::Direction;
@@ -781,7 +782,7 @@ mod tests {
         let d = mbe.dst.get_coordinate();
         println!("{:?}", s);
         println!("{:?}", d);
-        let vbm: VectorBasedMove = VectorBasedMove::convert_from(&mbe).unwrap();
+        let vbm: VectorBasedMove = <VectorBasedMove as MoveRepresentation<BoardEleven>>::convert_from(&mbe).unwrap();
         let intended_vbm = VectorBasedMove::new(2, 3, MoveVector::S(3));
         assert_eq!(vbm, intended_vbm);
     }
@@ -791,7 +792,10 @@ mod tests {
     fn get_move_from_tensor_works() {
         let ts = Tensor::rand([10, 20, 11, 11], (tch::Kind::Float, tch::Device::Cpu));
         let moves = get_move_from_tensor::<BoardEleven>(&ts).unwrap();
-        let moves: Vec<MoveOnBoardEleven> = moves.into_iter().map(|a| a.convert_into()).collect();
+        let moves: Vec<MoveOnBoardEleven> = moves
+            .into_iter()
+            .map(|a| <VectorBasedMove as MoveRepresentation<BoardEleven>>::convert_into(&a))
+            .collect();
         println!("{:?}", moves);
     }
 
@@ -803,7 +807,7 @@ mod tests {
         println!("{}", b);
         let tb = TBoard::<Game>::from_bitboard(&b, (tch::Kind::Float, tch::Device::Cpu));
         println!("{:?}", tb);
-        assert!(tb.0.is_contiguous());
+        assert!(tb.tensor.is_contiguous());
     }
 
     #[cfg(feature = "torch")]
@@ -813,8 +817,8 @@ mod tests {
         let b = TaflBoard::<BoardEleven>::generate_random_board(&mut rng);
         println!("{}", b);
         let tb = TBoard::<Game>::from_game_board(&b, (tch::Kind::Float, tch::Device::Cpu));
-        assert_eq!(tb.0.size(), [3,11,11]);
-        assert!(tb.0.is_contiguous());
+        assert_eq!(tb.tensor.size(), [3,11,11]);
+        assert!(tb.tensor.is_contiguous());
     }
 
     #[cfg(feature = "torch")]
@@ -826,9 +830,9 @@ mod tests {
         let device = if tch::Cuda::is_available() { tch::Device::Cuda(0)} else {tch::Device::Cpu};
         let kind = tch::Kind::Float;
         let vnet_input = TBoard::<Game>::get_vnet_input(&game, Rotation::No, (kind, device));
-        assert_eq!(vnet_input.0.size(), [17, 11, 11]);
-        assert!(vnet_input.0.is_contiguous());
-        println!("{:?}", vnet_input.0);
+        assert_eq!(vnet_input.tensor.size(), [17, 11, 11]);
+        assert!(vnet_input.tensor.is_contiguous());
+        println!("{:?}", vnet_input.tensor);
     }
 
     #[cfg(feature = "torch")]
@@ -840,26 +844,26 @@ mod tests {
         let device = if tch::Cuda::is_available() { tch::Device::Cuda(0)} else {tch::Device::Cpu};
         let kind = tch::Kind::Float;
         let pnet_input = TBoard::<Game>::get_pnet_input(&game, Rotation::No, (kind, device));
-        assert_eq!(pnet_input.0.size(), [18, 11, 11]);
-        assert!(pnet_input.0.is_contiguous());
-        println!("{:?}", pnet_input.0);
+        assert_eq!(pnet_input.tensor.size(), [18, 11, 11]);
+        assert!(pnet_input.tensor.is_contiguous());
+        println!("{:?}", pnet_input.tensor);
     }
 
     #[cfg(feature = "torch")]
     #[test]
     fn move_vector_rotation_fidelity_check() {
         let mv: MoveVector = MoveVector::E(3);
-        let rotated90 = mv.rotate90();
-        let rotated180 = mv.rotate180();
-        let rotated270 = mv.rotate270();
-        assert_eq!(rotated90.rotate90(), rotated180);
-        assert_eq!(rotated90.rotate180(), rotated270);
-        assert_eq!(rotated90.rotate270(), mv);
-        assert_eq!(rotated180.rotate90(), rotated270);
-        assert_eq!(rotated180.rotate180(), mv);
-        assert_eq!(rotated270.rotate90(), mv);
-        assert_eq!(rotated270.rotate180(), rotated90);
-        assert_eq!(rotated270.rotate270(), rotated180);
+        let rotated90 = <MoveVector as DirectionalMove<BoardEleven>>::rotate90(&mv);
+        let rotated180 = <MoveVector as DirectionalMove<BoardEleven>>::rotate180(&mv);
+        let rotated270 = <MoveVector as DirectionalMove<BoardEleven>>::rotate270(&mv);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate90(&rotated90), rotated180);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate180(&rotated90), rotated270);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate270(&rotated90), mv);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate90(&rotated180), rotated270);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate180(&rotated180), mv);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate90(&rotated270), mv);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate180(&rotated270), rotated90);
+        assert_eq!(<MoveVector as DirectionalMove<BoardEleven>>::rotate270(&rotated270), rotated180);
 
     }
 
@@ -870,13 +874,13 @@ mod tests {
         vec_vbm.push(VectorBasedMove::new(2, 3, MoveVector::E(3)));
         vec_vbm.push(VectorBasedMove::new(10, 2, MoveVector::S(3)));
         vec_vbm.push(VectorBasedMove::new(0, 6, MoveVector::E(10)));
-        let ta: TAction = TAction::vec_vbm_one_hot_encode(&vec_vbm);
+        let ta = TAction::<BoardEleven>::vec_vbm_one_hot_encode(&vec_vbm);
         let translated_back: Vec<VectorBasedMove> = ta.to_vbm();
         println!("{:?}", translated_back);
         for vbm in &vec_vbm {
             assert!(translated_back.contains(vbm));
         }
-        let bool_ta: TAction = TAction::vec_vbm_one_hot_encode_boolean(&vec_vbm);
+        let bool_ta = TAction::<BoardEleven>::vec_vbm_one_hot_encode_boolean(&vec_vbm);
         let translated_back_from_bool_ta: Vec<VectorBasedMove> = bool_ta.to_vbm();
         println!("{:?}", translated_back_from_bool_ta);
         for vbm in &vec_vbm {
@@ -889,8 +893,8 @@ mod tests {
     #[test]
     fn vbm_to_and_from_index_works() {
         let vbm: VectorBasedMove = VectorBasedMove::new(2, 3, MoveVector::E(3));
-        let index = vbm.to_index();
-        let vbm_back = VectorBasedMove::from_index(index);
+        let index = <VectorBasedMove as DirectionalMove<BoardEleven>>::to_index(&vbm);
+        let vbm_back = <VectorBasedMove as DirectionalMove<BoardEleven>>::from_index(index);
         assert_eq!(vbm, vbm_back);
     }
 
@@ -898,7 +902,7 @@ mod tests {
     #[test]
     fn tensor_get_nonzero_works() {
         let vbm: VectorBasedMove = VectorBasedMove::new(2, 3, MoveVector::E(3));
-        let index = vbm.to_index();
+        let index = <VectorBasedMove as DirectionalMove<BoardEleven>>::to_index(&vbm);
         let mut arr: [i64; 20*11*11] = [0i64; 20*11*11];
         arr[index as usize] = 1;
         let ts = Tensor::from_slice(&arr[..]);
