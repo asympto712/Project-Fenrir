@@ -4,6 +4,7 @@
 
 use bincode::Decode;
 use color_eyre::owo_colors::OwoColorize;
+use game::board::TaflBoard;
 //internal
 use game::game::{Game, GameLogic, GameState, Side};
 use bitboard::{BitBoard, PositionalEncoding, MoveOnBoard};
@@ -486,6 +487,7 @@ pub fn self_play<P: PVModel + Send + 'static, D: BoardData>(
 ) -> Result<()>
 where TBoard<D::G>: ModelInput<D::G>,
 TAction<<<D as BoardData>::G as GameLogic>::B>: ActionTensor,
+TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 {
 
     let (mut directer, sender) = match model_opt {
@@ -962,6 +964,7 @@ pub fn self_play_new<'a, P: PVModel + Send, D: BoardData>(
 ) -> Result<()>
 where TBoard<D::G>: ModelInput<D::G>,
 TAction<<D::G as GameLogic>::B>: ActionTensor,
+TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 {
 
     let request_sender = Arc::new(request_sender);

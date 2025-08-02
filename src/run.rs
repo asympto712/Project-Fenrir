@@ -10,6 +10,7 @@ use std::io::{Read, Seek, Cursor};
 use std::convert::AsRef;
 
 use game::game::GameLogic;
+use game::board::TaflBoard;
 use serde::Deserialize;
 use crate::agent::MCTSConfig;
 use crate::model::{self, ModelConfig};
@@ -470,7 +471,8 @@ fn run_wo_mpi_sequential<P: PVModel + Send + 'static, D: BoardData>(
 where
 ReplayBuffer<D>: Sampler,
 TBoard<<D as BoardData>::G>: ModelInput<D::G>,
-TAction<<D::G as GameLogic>::B>: ActionTensor, {
+TAction<<D::G as GameLogic>::B>: ActionTensor,
+TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display {
 
     assert!(!config.use_mpi);
 

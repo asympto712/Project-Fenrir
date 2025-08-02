@@ -8,6 +8,7 @@ use rand::Rng;
 use rand::seq::index::sample_weighted;
 
 use rv::traits::Mode;
+use serde::Deserialize;
 // external
 use tch::Tensor;
 use tch::Kind;
@@ -27,6 +28,7 @@ use crate::utils::{MoveRepresentation, TBoard, Rotation, TAction, VectorBasedMov
 use crate::model::Evaluation;
 use crate::model::PVNet;
 use crate::self_play::{Batch, Directer, Request, Query};
+use crate::schedule::*;
 use game::board::TaflBoard;
 use game::game::{Game, SimpleGame, GameState, GameLogic, Side, ShortHistory, get_rep_counter_for_oldest};
 use bitboard::Direction;
@@ -43,35 +45,28 @@ use rayon::{iter::{IntoParallelIterator, ParallelIterator}};
 
 // std
 use std::rc::Rc;
+use std::rc::Weak;
 
-pub type PosteriorDist<B: BitBoard> = Vec<(<B as BitBoard>::Movement, f32)>;
+pub type PosteriorDist<B> = Vec<(<B as BitBoard>::Movement, f32)>;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MCTSConfig {
     c_puct: f32,
     n_sim: usize,
     dirichlet_alpha: f64,
     dirichlet_epsilon: f32,
-    temp_schedule_target_policy: fn(usize) -> Temperature,
-    temp_schedule_move_selection: fn(usize) -> Temperature
+    temp_schedule_target_policy: String,
+    temp_schedule_move_selection: String,
 }
 
 impl Default for MCTSConfig {
     fn default() -> Self {
         let c_puct: f32 = 0.3;
-        let n_sim: usize = 1600;
+        let n_sim: usize = 2;
         let dirichlet_alpha: f64 = 0.03;
         let dirichlet_epsilon: f32 = 0.25;
-        fn temp_schedule_target_policy(i: usize) -> Temperature {
-            Temperature::Temp(1.0)
-        }
-        fn temp_schedule_move_selection(i: usize) -> Temperature {
-            if i < 30 {
-                Temperature::Temp(1.0)
-            } else {
-                Temperature::Zero
-            }
-        }
+        let temp_schedule_target_policy = "AlphaGoZero".to_string();
+        let temp_schedule_move_selection = "AlphaGoZero".to_string();
         MCTSConfig { 
             c_puct,
             n_sim,
@@ -237,7 +232,8 @@ pub struct Node<G: GameLogic> {
     visit_count: f32,
 }
 
-impl<G: GameLogic> Node<G> {
+impl<G: GameLogic> Node<G>
+where TaflBoard<G::B>: std::fmt::Display {
     pub fn new(game: &G, actions: Vec<<G::B as BitBoard>::Movement>, edges: Vec<Option<Edge<G>>>) -> Result<Self> {
 
         if actions.len() != edges.len() {
@@ -453,7 +449,8 @@ pub struct Edge<G: GameLogic> {
     visit_count: f32,
 }
 
-impl<G: GameLogic> Edge<G> {
+impl<G: GameLogic> Edge<G>
+where TaflBoard<G::B>: std::fmt::Display {
     fn new(child: Rc<Node<G>>, prior: f32, acc_value: f32, q_value: f32, visit_count: f32) -> Self {
         Self {
             child,
@@ -462,6 +459,10 @@ impl<G: GameLogic> Edge<G> {
             acc_value,
             visit_count,
         }
+    }
+
+    fn get_child_mut(&mut self) -> &mut Rc<Node<G>> {
+        &mut self.child
     }
 
     fn from_node_action_id(node: &Node<G>, action_idx: usize, prior: f32) -> Result<Self> {
@@ -476,6 +477,24 @@ impl<G: GameLogic> Edge<G> {
             reason,
             next_actions
         ) = node.game.do_move_and_update_whole(action, None, true)?;
+
+        if cfg!(test) {
+            // print!("{:?} ", reason);
+            // print!("expansion from {} ", action);
+            // println!("{}", new_game.get_board());
+            // println!("{}", new_game.get_state());
+            // for a in new_game.get_possible_actions() {
+            //     print!("{} ", a);
+            // }
+            // if let Some(ref actions) = next_actions {
+            //     println!("actions returned by do_move_and_update_whole");
+            //     for a in actions.iter() {
+            //         print!("{} ", a);
+            //     }
+            // } else {
+            //     println!("do_move_and_update_whole returned no action");
+            // }
+        }
         
         let next_actions = next_actions
             .unwrap_or(vec![]);
@@ -521,7 +540,8 @@ pub struct MCTSTree<G: GameLogic> {
 
 impl<G: GameLogic> Default for MCTSTree<G>
 where TBoard<G>: ModelInput<G>,
-TAction<G::B>: ActionTensor {
+TAction<G::B>: ActionTensor,
+TaflBoard<G::B>: std::fmt::Display {
     fn default() -> Self {
         let game: G = G::default();
         let config: MCTSConfig = MCTSConfig::default();
@@ -530,7 +550,8 @@ TAction<G::B>: ActionTensor {
 }
 
 impl<G: GameLogic> MCTSTree<G> where TBoard<G>: ModelInput<G>,
-TAction<G::B>: ActionTensor {
+TAction<G::B>: ActionTensor,
+TaflBoard<G::B>: std::fmt::Display{
 
     pub fn generate(game: G, config: MCTSConfig) -> Self {
         let actions = game.get_possible_actions();
@@ -540,8 +561,10 @@ TAction<G::B>: ActionTensor {
         let c_puct = config.c_puct;
         let alpha = config.dirichlet_alpha;
         let epsilon = config.dirichlet_epsilon;
-        let temp_schedule_target_policy = config.temp_schedule_target_policy;
-        let temp_schedule_move_selection = config.temp_schedule_move_selection;
+        let mut temp_sch_tp_table = temp_sch_tp_initialize();
+        let mut temp_sch_ms_table = temp_sch_ms_initialize();
+        let temp_schedule_target_policy = temp_sch_tp_table.remove(&config.temp_schedule_target_policy).unwrap();
+        let temp_schedule_move_selection = temp_sch_ms_table.remove(&config.temp_schedule_move_selection).unwrap();
         MCTSTree::<G>{
             root: root.into(),
             turn_count,
@@ -591,34 +614,125 @@ TAction<G::B>: ActionTensor {
         Some((cur_node, path))
     }
 
-    fn traverse_and_as_ref_mut(&mut self) -> Option<(Rc<Node<G>>, Vec<usize>)> {
+    // fn traverse_and_as_ref_mut(&mut self) -> Option<(Rc<Node<G>>, Vec<usize>)> {
+    fn traverse_and_as_ref_mut(&mut self) -> Option<(&mut Node<G>, Vec<usize>)> {
 
-        let mut cur_node = self.root.clone();
+        // let mut cur_node = self.root.clone();
+        let mut cur_node = &mut self.root;
 
         let mut path: Vec<usize> = vec![];
         let mut depth_count = 0;
 
-        while !cur_node.is_leaf() {
+        loop {
 
-            let best_action_idx = if depth_count == 0 {
-                cur_node.select_action_critically_w_noise(self.c_puct, self.alpha, self.epsilon)
-            } else {
-                cur_node.select_action_critically(self.c_puct)
-            };
+            dbg!(depth_count);
 
-            match best_action_idx {
-                Some(idx) => {
-                    if let Some(edge) = cur_node.get_edge(idx) {
-                        cur_node = edge.child.clone();
-                        path.push(idx);
-                    } else { return None; }
-                }
-                None => {return None;}
+            // First, check if current node is a leaf
+            if cur_node.is_leaf() {
+                dbg!("leaf node reached");
+                return Some((Rc::get_mut(cur_node)?, path));
             }
 
+            // Get the best action index first
+            let best_idx = if depth_count == 0 {
+                cur_node.select_action_critically_w_noise(self.c_puct, self.alpha, self.epsilon)?
+            } else {
+                cur_node.select_action_critically(self.c_puct)?
+            };
+
+            // if cfg!(test) {
+            //     for (e, a) in cur_node.edges.iter().zip(cur_node.actions.iter()) {
+            //         if let Some(edge) = e {
+            //             print!("edge c.p.t. {}: acc_value is {}, prior is {}, visit count is {} ", a, edge.acc_value, edge.prior, edge.visit_count);
+            //         } else {
+            //             print!("no edge c.p.t {} ", a);
+            //         }
+            //     }
+            // }
+            
+            dbg!(best_idx);
+            if cfg!(test) {
+                println!("selected action: {}", cur_node.actions[best_idx]);
+            }
+
+            // Check if the edge exists and if the child is a leaf
+            // We need to do this check without holding onto the edge reference
+            let (edge_exists, child_is_leaf) = {
+                if let Some(edge) = cur_node.get_edge(best_idx) {
+                    (true, edge.child.is_leaf())
+                } else {
+                    (false, false)
+                }
+            };
+
+            if !edge_exists {
+                break;
+            }
+
+            path.push(best_idx);
             depth_count += 1;
+
+            if child_is_leaf {
+                dbg!();
+                // Now we can safely get mutable access since we're not holding any immutable references
+                let mut_edge = Rc::get_mut(cur_node)?.get_edge_mut(best_idx)?;
+                return Some((Rc::get_mut(mut_edge.get_child_mut())?, path));
+            } else {
+                // Move to the next node
+                let mut_edge = Rc::get_mut(cur_node)?.get_edge_mut(best_idx)?;
+                cur_node = mut_edge.get_child_mut();
+            }
         }
-        Some((cur_node, path))
+
+        None
+
+        // while !cur_node.is_leaf() {
+
+        //     let best_action_idx = if depth_count == 0 {
+        //         cur_node.select_action_critically_w_noise(self.c_puct, self.alpha, self.epsilon)
+        //     } else {
+        //         cur_node.select_action_critically(self.c_puct)
+        //     };
+
+        //     match best_action_idx {
+        //         Some(idx) => {
+        //             if let Some(edge) = cur_node.get_edge(idx) {
+        //                 cur_node = edge.child.clone();
+        //                 path.push(idx);
+        //             } else { return None; }
+        //         }
+        //         None => {return None;}
+        //     }
+
+        //     depth_count += 1;
+        // }
+        // Some((cur_node, path))
+
+        // loop {
+
+        //     let best_action_idx = if depth_count == 0 {
+        //         cur_node.select_action_critically_w_noise(self.c_puct, self.alpha, self.epsilon)
+        //     } else {
+        //         cur_node.select_action_critically(self.c_puct)
+        //     };
+
+        //     match best_action_idx {
+        //         Some(idx) => {
+        //             if let Some(edge) = cur_node.get_edge(idx) {
+        //                 path.push(idx);
+        //                 let mut_edge = Rc::get_mut(cur_node).unwrap().get_edge_mut(idx).unwrap();
+        //                 if edge.child.is_leaf() {
+        //                     return Some((Rc::get_mut(mut_edge.get_child_mut())?, path));
+        //                 } else {
+        //                     cur_node = edge.get_child_mut();
+        //                 }
+        //             } else { return None; }
+        //         }
+        //         None => {return None;}
+        //     }
+
+        //     depth_count += 1;
+        // }
     }
 
     fn expand_from_leaf<O: Oracle<G>>(leaf: &mut Node<G>, actor: &O) -> Result<f32> {
@@ -632,27 +746,41 @@ TAction<G::B>: ActionTensor {
             return Ok(value)
         }
 
+        if cfg!(test) {
+            // for a in leaf.actions.iter() {
+            //     print!("{} ", a);
+            // }
+        }
+        debug_print_board(&leaf.game);
+
         let actions: Vec<&<G::B as BitBoard>::Movement> = leaf.actions.iter().collect();
         let (dist, value) = actor.infer(&leaf.game, Some(actions))?;
         let priors = get_vec_priors::<G::B>(&dist, &leaf.actions)?;
+
+        if cfg!(test) {
+            println!("{:?}", priors);
+        }
 
         leaf.expand(priors)?;
         Ok(value)
     }
 
     fn backup(&mut self, value: f32, path: Vec<usize>) -> Result<()>{
+
+        // dbg!();
         let edges_to_update = path.into_iter()
-            .fold(self.root.clone(), |mut rc_node, action_idx| {
-                let node = Rc::get_mut(&mut rc_node).unwrap();
+            .fold(&mut self.root, |rc_node, action_idx| {
+                let node = Rc::get_mut(rc_node).unwrap();
                 let player: Side = node.game.get_state().show_side();
                 let edge = node.get_edge_mut(action_idx).unwrap();
+                // dbg!();
                 edge.visit_count += 1.0;
                 edge.acc_value += match player{
                     Side::Att => value,
                     Side::Def => -1.0 * value,
                 };
                 edge.q_value = edge.acc_value / edge.visit_count;
-                edge.child.clone()
+                &mut edge.child
             });
         Ok(())
     }
@@ -757,6 +885,11 @@ TAction<G::B>: ActionTensor {
         // now this should work, as self is the only one who holds reference to the root
         let cur_root= Rc::get_mut(&mut self.root)
             .ok_or_eyre("try_unwrap operation failed at trim_root")?;
+
+        if cfg!(test) {
+            println!("root board {}", cur_root.game.get_board());
+            println!("number of actions from root: {}", cur_root.actions.len());
+        }
         let chosen_action = cur_root.actions
             .drain(..)
             .nth(action_id)
@@ -778,13 +911,21 @@ TAction<G::B>: ActionTensor {
 
     fn search_expand_backup<O: Oracle<G>>(&mut self, actor: &O) -> Result<()> {
 
-        let (mut rc_leaf, path) = self.traverse_and_as_ref_mut()
+        // let (mut rc_leaf, path) = self.traverse_and_as_ref_mut()
+        //     .ok_or_eyre("Traversing the MCTS tree didn't work")?;
+
+        // let leaf = Rc::get_mut(&mut rc_leaf)
+        //     .ok_or_eyre("Cannot get mutable reference to leaf node")?;
+
+        let (leaf, path) = self.traverse_and_as_ref_mut()
             .ok_or_eyre("Traversing the MCTS tree didn't work")?;
 
-        let leaf = Rc::get_mut(&mut rc_leaf)
-            .ok_or_eyre("Cannot get mutable reference to leaf node")?;
+        if cfg!(test) {
+            println!("{:?}", path);
+        }
 
         let value = Self::expand_from_leaf::<O>(leaf, actor)?;
+        dbg!(value);
 
         self.backup(value, path)?;
 
@@ -799,8 +940,20 @@ TAction<G::B>: ActionTensor {
             self.search_expand_backup::<O>(actor)?;
         }
 
+        // let (posterior, action_id) 
+        // = self.get_posterior_w_sampled_action_index_destructively()?;
+
         let (posterior, action_id) 
-        = self.get_posterior_w_sampled_action_index_destructively()?;
+        = self.get_posterior_w_sampled_action_index()?;
+
+        if cfg!(test) {
+            dbg!();
+            for (a, x) in posterior.iter() {
+                print!("{}, {}", a, x);
+                println!();
+            }
+        }
+        dbg!(action_id);
 
         let (game, action) = self.trim_root(action_id)?;
         self.turn_count += 1;
@@ -810,7 +963,22 @@ TAction<G::B>: ActionTensor {
 
 }
 
-#[derive(Clone, Copy, Debug)]
+#[cfg(debug_assertions)]
+fn debug_print_board<G: GameLogic>(game: &G) 
+where 
+    TaflBoard<G::B>: std::fmt::Display 
+{
+    if cfg!(test) {
+        println!("{}", game.get_board());
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_print_board<G: GameLogic>(_game: &G) {
+    // Do nothing in release mode
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub enum Temperature {
     Temp(f32),
     Zero
@@ -824,8 +992,40 @@ pub enum Temperature {
 mod tests {
     use super::*;
     use game::game::Game;
-    use game::board::TaflBoardEleven;
     use std::rc::Rc;
+
+    struct DummyActor{}
+
+    impl<G: GameLogic> Oracle<G> for DummyActor 
+    where 
+    TBoard<G>: ModelInput<G>,
+    TAction<G::B>: ActionTensor, {
+        fn infer(&self, game: &G, actions: Option<Vec<&<G::B as BitBoard>::Movement>>) -> Result<(Tensor, f32)> {
+
+            if let Some(actions) = actions {
+            if !actions.is_empty() {
+                let a = actions[0];
+                let vbm = <VectorBasedMove as MoveRepresentation<G::B>>::convert_from(a)?;
+                let ta = <TAction<G::B> as ActionTensor>::vbm_one_hot_encode(&vbm);
+                Ok((ta.inner(), 0.0f32))
+            } else {
+                let ta = <TAction::<G::B> as ActionTensor>::vec_vbm_one_hot_encode(&vec![]);
+                Ok((ta.inner(), 0.0f32))
+            }
+            } else {
+                let actions = game.get_possible_actions();
+                if !actions.is_empty() {
+                    let a = &actions[0];
+                    let vbm = <VectorBasedMove as MoveRepresentation<G::B>>::convert_from(a)?;
+                    let ta = <TAction<G::B> as ActionTensor>::vbm_one_hot_encode(&vbm);
+                    Ok((ta.inner(), 0.0f32))
+                } else {
+                    let ta = <TAction::<G::B> as ActionTensor>::vec_vbm_one_hot_encode(&vec![]);
+                    Ok((ta.inner(), 0.0f32))
+                }
+            }
+        }
+    }
 
     #[test]
     fn trim_root_works() {
@@ -847,6 +1047,23 @@ mod tests {
         assert_eq!(game, original_game);
         assert_eq!(action, original_action);
         println!("{:?}", tree);
+    }
+
+    #[test]
+    fn mcts_works() {
+        let mut tree = MCTSTree::<Game>::default();
+        let actor = DummyActor{};
+        while !tree.root_is_terminal() {
+            let result = tree.get_policy_and_update::<DummyActor>(&actor);
+            let (game, action, posterior) = result.unwrap();
+            println!("{}", game.board);
+            println!("{action}");
+        }
+    }
+
+    #[test]
+    fn traverse_and_as_ref_mut_works() {
+        let mut tree = MCTSTree::<Game>::default();
     }
 }
 
