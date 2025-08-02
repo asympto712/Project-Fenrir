@@ -196,6 +196,8 @@ pub type SimpleMoveResult<B> = Result<MoveResult<B>, InvalidActionError>;
 pub trait GameLogic: Sized + Default + Clone + std::fmt::Debug{
     type B: BitBoard + std::fmt::Debug;
 
+    fn _assert_display() where TaflBoard<Self::B>: std::fmt::Display {}
+
     fn get_board(&self) -> &TaflBoard<Self::B>;
     fn get_board_mut(&mut self) -> &mut TaflBoard<Self::B>;
     fn get_state(&self) -> &GameState;
@@ -357,17 +359,28 @@ pub trait GameLogic: Sized + Default + Clone + std::fmt::Debug{
 
         self.update_repetition_counter();
         
-        // Check for game termination
-        let value = if let Some(r) = self.update_if_lost(side) {
-            Ok((Some(r), None))
-        } else if let (Some(rr), v) = self.update_victory(side, pass_next_moves) {
-            Ok((Some(rr), v))
-        } else { Ok((None, None))
-        };
+        // // Check for game termination
+        // let value = if let Some(r) = self.update_if_lost(side) {
+        //     Ok((Some(r), None))
+        // } else if let (Some(rr), v) = self.update_victory(side, pass_next_moves) {
+        //     Ok((Some(rr), v))
+        // } else { Ok((None, None))
+        // };new_game
 
         self.forward_turn();
 
-        value
+        if let Some(reason) = self.update_if_lost(side) {
+            return Ok((Some(reason), None));
+        } else {
+            let (r, v) = self.update_victory(side, pass_next_moves);
+            if r.is_none() {
+                return Ok((None, v));
+            } else {
+                return Ok((Some(r.unwrap()), v));
+            }
+        }
+
+        // value
 
     }
     fn do_move_and_update_whole(&self, action: &<Self::B as BitBoard>::Movement, piece_type: Option<PieceType>, pass_next_moves: bool) 
@@ -876,6 +889,7 @@ impl GameLogic for Game{
                     }
                 }
                 if pass_next_moves {
+                    // dbg!();
                     def_possible_moves.append(&mut king_possible_moves);
                     (opt, Some(def_possible_moves))
                 } else {
@@ -909,6 +923,7 @@ impl GameLogic for Game{
                     opt = Some(KingEscaped)
                 }
                 if pass_next_moves {
+                    // dbg!();
                     (opt, Some(att_possible_moves))
                 } else {
                     (opt, None)
@@ -980,16 +995,28 @@ impl GameLogic for Game{
         self.repetition_counter = new_repetition_counter;
         
         // Check for game termination
-        let value = if let Some(r) = self.update_if_lost(side) {
-            Ok((Some(r), None))
-        } else if let (Some(rr), v) = self.update_victory(side, pass_next_moves) {
-            Ok((Some(rr), v))
-        } else { Ok((None, None))
-        };
+        // let value = if let Some(r) = self.update_if_lost(side) {
+        //     Ok((Some(r), None))
+        // } else if let (Some(rr), v) = self.update_victory(side, pass_next_moves) {
+        //     Ok((Some(rr), v))
+        // } else { Ok((None, None))
+        // };
 
         self.forward_turn();
 
-        value
+        if let Some(reason) = self.update_if_lost(side) {
+            return Ok((Some(reason), None));
+        } else {
+            let (r, v) = self.update_victory(side, pass_next_moves);
+            if r.is_none() {
+                return Ok((None, v));
+            } else {
+                return Ok((Some(r.unwrap()), v));
+            }
+        }
+
+        // value
+
     }
 
     // TODO! unit-test
@@ -1046,16 +1073,29 @@ impl GameLogic for Game{
         };
         
         // Check for game termination
-        let postfix = if let Some(r) = new_game.update_if_lost(side) {
-            (Some(r), None)
-        } else if let (Some(rr), v) = new_game.update_victory(side, pass_next_moves) {
-            (Some(rr), v)
-        } else { (None, None)
-        };
+        // let postfix = if let Some(r) = new_game.update_if_lost(side) {
+        //     dbg!();
+        //     (Some(r), None)
+        // } else if let (Some(rr), v) = new_game.update_victory(side, pass_next_moves) {
+        //     dbg!();
+        //     (Some(rr), v)
+        // } else { (None, None)
+        // };
 
         new_game.forward_turn();
 
-        Ok((new_game, postfix.0, postfix.1))
+        if let Some(reason) = new_game.update_if_lost(side) {
+            return Ok((new_game, Some(reason), None));
+        } else {
+            let (r, v) = new_game.update_victory(side, pass_next_moves);
+            if r.is_none() {
+                return Ok((new_game, None, v));
+            } else {
+                return Ok((new_game, Some(r.unwrap()), v));
+            }
+        }
+
+        // Ok((new_game, postfix.0, postfix.1))
 
     }
 

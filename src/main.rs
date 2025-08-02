@@ -599,7 +599,7 @@ fn draw_small_board<B: BitBoard>(board: &TaflBoard<B>, title: String, area: Rect
     Ok(())
 }
 
-fn extract_row_from_small_board<B: BitBoard>(board: &TaflBoard<B>, row_ind: u8) -> Line {
+fn extract_row_from_small_board<B: BitBoard>(board: &TaflBoard<B>, row_ind: u8) -> Line<'_> {
     let mut row = Line::default();
     for col_ind in 0..B::BOARD_SIZE as usize{
         let pos = <B::Position as PositionalEncoding>::new(col_ind as u8,row_ind);
