@@ -1,0 +1,7 @@
+policy_out_features = 12
+board_size = 7
+value_hidden_layer_unit_count = 32
+num_convblocks = 2
+in_features = 5
+conv_filters = 3
+kernel_size = 3
