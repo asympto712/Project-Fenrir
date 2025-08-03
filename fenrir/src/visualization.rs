@@ -9,25 +9,26 @@ use rand::prelude::*;
 
 use crate::agent::{MCTSTree, self};
 use game::game::GameLogic;
+use game::board::TaflBoard;
 
 #[derive(Debug)]
-struct TreeNode {
-    visit_count: f32,
-    children: Vec<Rc<TreeNode>>,
+pub struct TreeNode {
+    pub visit_count: f32,
+    pub children: Vec<Rc<TreeNode>>,
 }
 
 impl TreeNode {
-    fn create_leaf(visit_count: f32) -> Self{
+    pub fn create_leaf(visit_count: f32) -> Self{
         Self {
             visit_count, // corresponds to the visit count of the edge leading to the node from the upstream
             children: vec![]
         }
     }
-    fn breadth(&self) -> usize {
+    pub fn breadth(&self) -> usize {
         self.children.len()
     }
 
-    fn generate<R>(n_child_lim: usize, recurse: usize, rng: &mut R) -> Self
+    pub fn generate<R>(n_child_lim: usize, recurse: usize, rng: &mut R) -> Self
     where R: rand::Rng{
         let n_children = rng.gen_range(0..=n_child_lim);
 
@@ -48,7 +49,7 @@ impl TreeNode {
         }
     }
 
-    fn pre_draw(&self) -> DrawTreeNode {
+    pub fn pre_draw(&self) -> DrawTreeNode {
         if self.children.is_empty() {
             let width = 1;
             DrawTreeNode{
@@ -78,13 +79,14 @@ impl TreeNode {
         }
     }
 
-    fn from_mcts_node<G: GameLogic>(original: &agent::Node<G>) -> Self {
+    pub fn from_mcts_node<G: GameLogic>(original: &agent::Node<G>) -> Self
+    where TaflBoard<<G as GameLogic>::B>: std::fmt::Display {
         let children = original.edges
             .iter()
-            .filter(|x| x.is_some_and(|edge| agent::Edge::n(&edge) != 0))
+            .filter(|x| x.as_ref().is_some_and(|edge| agent::Edge::n(&edge) > 0.0))
             .map(|x| {
                 let child_rc = agent::Edge::get_child(x.as_ref().unwrap()).clone();
-                Rc::new(Self::from_mcts_node(child_rc))
+                Rc::new(Self::from_mcts_node(child_rc.as_ref()))
             })
             .collect::<Vec<_>>();
 
@@ -98,8 +100,8 @@ impl TreeNode {
 }
 
 #[derive(Debug)]
-struct Tree {
-    root: Rc<TreeNode>
+pub struct Tree {
+    pub root: Rc<TreeNode>
 }
 
 impl Tree {
@@ -123,7 +125,7 @@ impl Tree {
         Self { root: Rc::new(root) }
     }
 
-    fn pre_draw(&self) -> DrawTree {
+    pub fn pre_draw(&self) -> DrawTree {
         let depth = self.depth();
         let root = self.root.pre_draw();
         DrawTree{
@@ -132,31 +134,32 @@ impl Tree {
         }
     }
 
-    fn from_mcts_tree<G: GameLogic>(tree: &MCTSTree<G>) -> Self {
-        let root = TreeNode::from_mcts_node(tree.root);
+    pub fn from_mcts_tree<G: GameLogic>(tree: &MCTSTree<G>) -> Self
+    where TaflBoard<<G as GameLogic>::B>: std::fmt::Display {
+        let root = TreeNode::from_mcts_node(tree.root.as_ref());
         Self { root: Rc::new(root) }
     }
 }
 
 #[derive(Debug)]
-struct DrawTreeNode {
+pub struct DrawTreeNode {
     visit_count: f32,
     width: i64,
     children: Vec<Rc<DrawTreeNode>>,
 }
 
 impl DrawTree {
-    fn draw(&self, filename: &str, size: XY) {
+    pub fn draw(&self, filename: &str, size: XY) {
 
         let mut document = Document::new().set("viewBox", (0,0,size.x, size.y));
-        let dy: f64 = size.y / self.depth as f64;
-        let dx: f64 = size.x / self.root.width as f64;
+        let dy: f32 = size.y / self.depth as f32;
+        let dx: f32 = size.x / self.root.width as f32;
 
         let mut queue: VecDeque<(Rc<DrawTreeNode>, XY, XY, f32)> = VecDeque::new();
         queue.push_front((
             self.root.clone(),
             XY::new(0.0, 0.0),
-            XY::new(dx * self.root.width as f64 / 2.0, 0.0),
+            XY::new(dx * self.root.width as f32 / 2.0, 0.0),
             self.root.visit_count,
         ));
         while !queue.is_empty() {
@@ -165,11 +168,11 @@ impl DrawTree {
                 .iter()
                 .fold((vec![], offset.x),|(mut v, offset_x), node| {
                     let dst = XY::new(
-                        offset_x + dx * node.width as f64 / 2.0,
+                        offset_x + dx * node.width as f32 / 2.0,
                         offset.y + dy
                     );
                     v.push(dst);
-                    (v, offset_x + node.width as f64 * dx)
+                    (v, offset_x + node.width as f32 * dx)
                 });
 
             let mut offset_x = offset.x;
@@ -193,7 +196,7 @@ impl DrawTree {
                     child.visit_count,
                 ));
 
-                offset_x += child.width as f64 * dx;
+                offset_x += child.width as f32 * dx;
             }
         }
         svg::save(filename, &document).unwrap();
@@ -201,18 +204,18 @@ impl DrawTree {
 }
 
 #[derive(Debug)]
-struct DrawTree {
+pub struct DrawTree {
     depth: i64,
     root: Rc<DrawTreeNode>
 }
 
-struct XY {
-    x: f64,
-    y: f64,
+pub struct XY {
+    x: f32,
+    y: f32,
 }
 
 impl XY {
-    fn new(x: f64, y: f64) -> Self {
+    pub fn new(x: f32, y: f32) -> Self {
         Self{
             x,
             y
@@ -220,18 +223,33 @@ impl XY {
     }
 }
 
-#[test]
-fn tree_draw_works() {
-    let leaf1 = TreeNode::create_leaf(1.0);
-    let leaf2 = TreeNode::create_leaf(2.0);
-    let leaf3 = TreeNode::create_leaf(3.0);
-    let root = TreeNode {
-        visit_count: 6,
-        children: vec![Rc::new(leaf1), Rc::new(leaf2), Rc::new(leaf3)]
-    };
-    let tree: Tree = Tree { root: Rc::new(root) };
-    assert_eq!(tree.depth(), 1);
-    let draw_tree = tree.pre_draw();
-    draw_tree.draw("./graphs/tmp/test.svg", XY::new(200.0, 200.0));
+impl<G: GameLogic> MCTSTree<G>
+where TaflBoard<G::B>: std::fmt::Display {
+    pub fn draw(&self, filename: &str, size: XY) {
+        let tree = Tree::from_mcts_tree(&self);
+        let draw_tree = tree.pre_draw();
+        draw_tree.draw(filename, size);
+    }
+}
 
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn tree_draw_works() {
+        let leaf1 = TreeNode::create_leaf(1.0);
+        let leaf2 = TreeNode::create_leaf(2.0);
+        let leaf3 = TreeNode::create_leaf(3.0);
+        let root = TreeNode {
+            visit_count: 6.0,
+            children: vec![Rc::new(leaf1), Rc::new(leaf2), Rc::new(leaf3)]
+        };
+        let tree: Tree = Tree { root: Rc::new(root) };
+        assert_eq!(tree.depth(), 1);
+        let draw_tree = tree.pre_draw();
+        draw_tree.draw("test.svg", XY::new(200.0, 200.0));
+
+    }
 }

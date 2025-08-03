@@ -258,12 +258,14 @@ where TaflBoard<G::B>: std::fmt::Display {
     }
 
     fn expand_selectively(&mut self, action_idx: usize, prior: f32) -> Result<()>{
+        self.visit_count += 1.0;
         let new_edge = Edge::<G>::from_node_action_id(self, action_idx, prior)?;
         self.edges[action_idx] = Some(new_edge);
         Ok(())
     }
 
     fn expand(&mut self, priors: Vec<f32>) -> Result<()> {
+        self.visit_count += 1.0;
         let edges: Result<Vec<_>> = self.actions.iter()
             .zip(priors)
             .map(|(a, prior)| Edge::<G>::from_node_action(self, a, prior).map(Some))
@@ -533,7 +535,7 @@ where TaflBoard<G::B>: std::fmt::Display {
 #[derive(Debug)]
 pub struct MCTSTree<G: GameLogic> {
     pub root: Rc<Node<G>>,
-    turn_count: usize,
+    pub turn_count: usize,
     n_sim: usize,
     c_puct: f32,
     alpha: f64,
@@ -775,7 +777,7 @@ TaflBoard<G::B>: std::fmt::Display{
         let edges_to_update = path.into_iter()
             .fold(&mut self.root, |rc_node, action_idx| {
                 let node = Rc::get_mut(rc_node).unwrap();
-                node.visit_count += 1;
+                node.visit_count += 1.0;
                 let player: Side = node.game.get_state().show_side();
                 let edge = node.get_edge_mut(action_idx).unwrap();
                 // dbg!();
@@ -798,7 +800,7 @@ TaflBoard<G::B>: std::fmt::Display{
     }
 
 
-    fn get_posterior_w_sampled_action_index(&self) 
+    pub fn get_posterior_w_sampled_action_index(&self) 
     -> Result<(PosteriorDist<G::B>, usize)>
     {
 
@@ -873,7 +875,7 @@ TaflBoard<G::B>: std::fmt::Display{
         self.root.get_edge_id_w_highest_visit_count()
     }
 
-    fn trim_root(&mut self, action_id: usize) -> Result<(G, <G::B as BitBoard>::Movement)> {
+    pub fn trim_root(&mut self, action_id: usize) -> Result<(G, <G::B as BitBoard>::Movement)> {
 
         dbg!(Rc::strong_count(&self.root));
         dbg!(Rc::weak_count(&self.root));
@@ -914,7 +916,7 @@ TaflBoard<G::B>: std::fmt::Display{
         Ok((cur_game, chosen_action))
     }
 
-    fn search_expand_backup<O: Oracle<G>>(&mut self, actor: &O) -> Result<()> {
+    pub fn search_expand_backup<O: Oracle<G>>(&mut self, actor: &O) -> Result<()> {
 
         // let (mut rc_leaf, path) = self.traverse_and_as_ref_mut()
         //     .ok_or_eyre("Traversing the MCTS tree didn't work")?;
@@ -1064,11 +1066,6 @@ mod tests {
             println!("{}", game.board);
             println!("{action}");
         }
-    }
-
-    #[test]
-    fn traverse_and_as_ref_mut_works() {
-        let mut tree = MCTSTree::<Game>::default();
     }
 }
 

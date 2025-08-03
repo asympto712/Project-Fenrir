@@ -1,5 +1,5 @@
 target/
 .vscode/
-test_data/models/
-graphs/tmp/
+test_data/models/*
+graphs/tmp/*
 .errorviz-version

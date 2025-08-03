@@ -20,7 +20,7 @@ fn test_run_wo_mpi_sequential() {
     type P = GeneralPVDualModel;
     type D = GameSPR;
 
-    std::fs::create_dir_all(Path::new("./test_data").join("models"));
+    std::fs::create_dir_all(Path::new("./test_data").join("models")).unwrap();
 
     let path = Path::new("./test_data").join("test_config1.toml");
     let comp_config: CompConfig = load_comp_config(path);
