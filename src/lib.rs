@@ -16,7 +16,10 @@ pub enum Direction{
 pub trait PositionalEncoding:
     TryFrom<u8> +
     TryFrom<String, Error = String> +
-    Display
+    Display + 
+    std::fmt::Debug +
+    Clone + 
+    Copy
 {
     const BOARD_SIZE: u8;
     fn new(x: u8, y: u8) -> Self;
@@ -24,6 +27,9 @@ pub trait PositionalEncoding:
 }
 
 pub trait MoveOnBoard:
+    std::fmt::Debug +
+    Clone +
+    Copy +
     Display +
     TryFrom<String, Error = String>
 {
@@ -42,6 +48,7 @@ pub trait Shift{
 
 pub trait BitBoard:
     PartialEq +
+    Clone + 
     Copy +
     Default + 
     TryFrom<String> +
@@ -81,6 +88,10 @@ pub trait BitBoard:
     fn tile_is_empty_at(&self, position: &Self::Position) -> bool;
 
     // provided method
+    fn movelen_lim() -> u8 {
+        Self::BOARD_SIZE - 1
+    }
+
     fn mask_board() -> Self{
         Self::BLACKMASK
     }

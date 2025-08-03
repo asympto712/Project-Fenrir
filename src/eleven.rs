@@ -12,10 +12,10 @@ pub const BOARDELEVENPART2: usize = 96;
 pub const BOARDELEVENPART3: usize = 132;
 
 // These denote the number of bits that blocks occupy INCLUDING the padding
-const BLOCKLEN: [u8;3] = [BLOCK1LEN, BLOCK2LEN, BLOCK3LEN];
-const BLOCK1LEN: u8 = 48;
-const BLOCK2LEN: u8 = 48;
-const BLOCK3LEN: u8 = 36;
+pub const BLOCKLEN: [u8;3] = [BLOCK1LEN, BLOCK2LEN, BLOCK3LEN];
+pub const BLOCK1LEN: u8 = 48;
+pub const BLOCK2LEN: u8 = 48;
+pub const BLOCK3LEN: u8 = 36;
 
 #[allow(dead_code)]
 const PRESET1: &str = "10001010110\n00100111101\n00100111111\n00001111100\n11110011010\n00110101101\n11000011011\n11000000111\n00000000000\n00011111111\n00011001111\n";
