@@ -24,6 +24,8 @@ pub mod train;
 #[cfg(feature = "mpi")]
 pub mod run;
 
+pub mod visualization;
+
 pub mod utils;
 pub mod schedule;
 

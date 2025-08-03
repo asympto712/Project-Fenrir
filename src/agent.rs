@@ -228,8 +228,8 @@ pub struct Node<G: GameLogic> {
     game: G,
     actions: Vec<<G::B as BitBoard>::Movement>,
     // edges: Option<Vec<&Edges>>,
-    edges: Vec<Option<Edge<G>>>,
-    visit_count: f32,
+    pub edges: Vec<Option<Edge<G>>>,
+    pub visit_count: f32,
 }
 
 impl<G: GameLogic> Node<G>
@@ -465,6 +465,10 @@ where TaflBoard<G::B>: std::fmt::Display {
         &mut self.child
     }
 
+    pub fn get_child(&self) -> &Rc<Node<G>> {
+        &self.child
+    }
+
     fn from_node_action_id(node: &Node<G>, action_idx: usize, prior: f32) -> Result<Self> {
         let action = node.actions.get(action_idx)
             .ok_or(ErrReport::msg("action index out of bounds"))?;
@@ -510,17 +514,17 @@ where TaflBoard<G::B>: std::fmt::Display {
         })
     }
     
-    fn q(&self) -> f32 {
+    pub fn q(&self) -> f32 {
         self.q_value
     }
 
-    fn n(&self) -> f32 {
+    pub fn n(&self) -> f32 {
         self.visit_count
     }
 
     // get the prior probability of that edge 
     // which should be given by the inference process
-    fn prior(&self) -> f32 {
+    pub fn prior(&self) -> f32 {
         self.prior
     }
 }
@@ -528,7 +532,7 @@ where TaflBoard<G::B>: std::fmt::Display {
 
 #[derive(Debug)]
 pub struct MCTSTree<G: GameLogic> {
-    root: Rc<Node<G>>,
+    pub root: Rc<Node<G>>,
     turn_count: usize,
     n_sim: usize,
     c_puct: f32,
@@ -771,6 +775,7 @@ TaflBoard<G::B>: std::fmt::Display{
         let edges_to_update = path.into_iter()
             .fold(&mut self.root, |rc_node, action_idx| {
                 let node = Rc::get_mut(rc_node).unwrap();
+                node.visit_count += 1;
                 let player: Side = node.game.get_state().show_side();
                 let edge = node.get_edge_mut(action_idx).unwrap();
                 // dbg!();
