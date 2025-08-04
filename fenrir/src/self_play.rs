@@ -819,6 +819,8 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                         match request_receiver.try_recv() {
                             Ok(request) => {
 
+                                dbg!("request received");
+
                                 all_disconnected = false;
                                 let mut b = batch_clone[group_id].lock().unwrap();
                                 b.push_request(request);
@@ -850,6 +852,7 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                             }
                         }
                     }
+                    // dbg!(all_disconnected);
                     if all_disconnected { break; }
                 }
                 termination_sender.send(()).unwrap();
@@ -863,6 +866,7 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                 loop {
                     while let Some(job) = job_queue_clone2.lock().unwrap().pop_front() {
 
+                        dbg!("job received");
                         let (mini_batch, group_id, senders) = job;
 
                         if let Some(module_id) = {

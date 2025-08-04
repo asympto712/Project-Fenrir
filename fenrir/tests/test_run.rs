@@ -26,7 +26,7 @@ fn test_run_wo_mpi_sequential() {
     let comp_config: CompConfig = load_comp_config(path);
     assert!(!comp_config.fenrir_config.use_mpi);
 
-    let path = Path::new("./test_data").join("model_config1.toml");
+    let path = Path::new("./test_data").join("eleven_model_simple.toml");
     let model_config = ModelConfig::load_from_toml(path).unwrap();
 
     // Create a new model
@@ -53,6 +53,8 @@ fn test_run_wo_mpi_sequential() {
 
     let mut temp_file = tempfile().unwrap();
 
+    dbg!("config load, model setup complete");
+
     for i in 0..1 {
 
         let mut locked_shelf = LockedShelf::<P>::convert_from_shelf(shelf);
@@ -63,6 +65,7 @@ fn test_run_wo_mpi_sequential() {
 
         let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, comp_config.fenrir_config.mini_batch_size);
 
+        dbg!("self play phase");
         self_play_new::<P,D>(
             manager,
             request_senders[0].clone(),

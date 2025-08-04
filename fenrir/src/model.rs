@@ -147,11 +147,12 @@ fn conv_block(
 
 fn base_tower(
     vs: &nn::Path,
-    config: &ModelConfig
+    config: &ModelConfig,
+    in_features: i64,
 ) -> nn::SequentialT {
 
     let mut seq = nn::seq_t();
-    seq = seq.add(conv_block(&(vs / "block0"), config.in_features, config.conv_filters, config.kernel_size));
+    seq = seq.add(conv_block(&(vs / "block0"), in_features, config.conv_filters, config.kernel_size));
     for i in 1..=config.num_convblocks {
 
         seq = seq.add(res_block(&(vs / &format!("block{}", i)), config.conv_filters, config.kernel_size));
@@ -161,21 +162,23 @@ fn base_tower(
 
 fn fenrir_policy_head(
     vs: &nn::Path,
-    config: &ModelConfig
+    config: &ModelConfig,
+    in_features: i64
 ) -> nn::SequentialT {
 
     nn::seq_t()
-        .add(conv_block(&(vs / "conv layer"), config.conv_filters, config.conv_filters, config.kernel_size))
+        .add(conv_block(&(vs / "conv layer"), in_features, config.conv_filters, config.kernel_size))
         .add(conv_block(&(vs / "logit layer"), config.conv_filters, config.policy_out_features, 1))
 }
 
 fn fenrir_value_head(
     vs: &nn::Path,
-    config: &ModelConfig
+    config: &ModelConfig,
+    in_features: i64
 ) -> nn::SequentialT {
 
     nn::seq_t()
-        .add(nn::conv2d(vs / "conv layer", config.conv_filters, 1, 1, Default::default())) // (BS, 1, N, N)
+        .add(nn::conv2d(vs / "conv layer", in_features, 1, 1, Default::default())) // (BS, 1, N, N)
         .add_fn(|ts| ts.view([ts.size()[0], -1])) // (BS, N * N)
         .add(linear(vs / "linear", config.board_size * config.board_size, 256, Default::default()))
         .add_fn(|ts| ts.relu())
@@ -194,28 +197,28 @@ pub struct GeneralPVDualModel {
 impl PVModel for GeneralPVDualModel {
     fn new(vs: &nn::Path, config: &ModelConfig) -> Self {
         
-        let base = base_tower(&(vs / "base"), &config);
-        let p_head = fenrir_policy_head(&(vs / "p-head"), &config);
-        let v_head = fenrir_value_head(&(vs / "v-head"), &config);
+        let base = base_tower(&(vs / "base"), &config, config.in_features - 1);
+        let p_head = fenrir_policy_head(&(vs / "p-head"), &config, config.conv_filters + 1);
+        let v_head = fenrir_value_head(&(vs / "v-head"), &config, config.conv_filters);
         Self { base, p_head, v_head, config: config.clone(), device: vs.device()}
     }
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
         
-        let v = xs.split_sizes([-1,1], 1);
-        let minus_side = v[0].contiguous();
+        let v = xs.split_with_sizes([self.config.in_features - 1,1], 1);
+        let minus_side = v[0].contiguous(); // (BS, 17, 11, 11) for Eleven Board
         let based = minus_side.apply_t(&self.base, train);
         // (BS, Conv_filters, N, N)
         let base_output = Tensor::cat(&[&based, &v[1]], 1);
         let base_output = base_output.contiguous(); // Again, not sure if needed
         let logits = base_output.apply_t(&self.p_head, train);
-        let value = base_output.apply_t(&self.v_head, train);
+        let value = based.apply_t(&self.v_head, train);
 
         if !train {
             let likelihood = logits
-                .view([logits.size1().unwrap(), -1])
+                .view([logits.size()[0], -1])
                 .softmax(1, Kind::Float)
-                .view([logits.size1().unwrap(), self.config.policy_out_features, self.config.board_size, self.config.board_size]);
+                .view([logits.size()[0], self.config.policy_out_features, self.config.board_size, self.config.board_size]);
             (likelihood, value)
         } else {
             (logits, value)
@@ -240,24 +243,24 @@ pub struct GeneralPVSepModel {
 impl PVModel for GeneralPVSepModel {
     fn new(vs: &nn::Path, config: &ModelConfig) -> Self {
         
-        let p_base = base_tower(&( vs / "p-base" ), &config);
-        let v_base = base_tower(&( vs / "v-base" ), &config);
-        let p_head = fenrir_policy_head(&( vs / "p-head" ), &config);
-        let v_head = fenrir_value_head(&( vs / "v-head" ), &config);
+        let p_base = base_tower(&( vs / "p-base" ), &config, config.in_features);
+        let v_base = base_tower(&( vs / "v-base" ), &config, config.in_features - 1);
+        let p_head = fenrir_policy_head(&( vs / "p-head" ), &config, config.conv_filters);
+        let v_head = fenrir_value_head(&( vs / "v-head" ), &config, config.conv_filters);
         Self { p_base, v_base, p_head, v_head, config: config.clone(), device: vs.device()}
     }
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
 
-        let v = xs.split_sizes([-1, 1], 1);
+        let v = xs.split_sizes([self.config.in_features - 1, 1], 1); // split_sizes does not accept -1 as size estimator
         let minus_side = v[0].contiguous(); // Might not need this since conv2D automatically creates new contiguous tensor (needs testing)
         let logits = xs.apply_t(&self.p_base, train).apply_t(&self.p_head, train);
         let value = minus_side.apply_t(&self.v_base, train).apply_t(&self.v_head, train);
         if !train {
             let likelihood = logits
-                .view([logits.size1().unwrap(), -1])
+                .view([logits.size()[0], -1])
                 .softmax(1, Kind::Float)
-                .view([logits.size1().unwrap(), self.config.policy_out_features, self.config.board_size, self.config.board_size]);
+                .view([logits.size()[0], self.config.policy_out_features, self.config.board_size, self.config.board_size]);
             (likelihood, value)
         } else {
             (logits, value)

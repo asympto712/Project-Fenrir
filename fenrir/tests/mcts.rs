@@ -1,8 +1,7 @@
-use fenrir::agent::{Actor, Edge as MCTSEdge, MCTSConfig, MCTSTree, Node as MCTSNode, Oracle};
+use fenrir::agent::{Oracle, MCTSConfig, MCTSTree};
 use fenrir::utils::{ActionTensor, ModelInput, TBoard, TAction, VectorBasedMove, MoveRepresentation};
 use fenrir::visualization::*;
-use game::board::TaflBoard;
-use game::game::{GameLogic, Game, SimpleGame};
+use game::game::{GameLogic, Game};
 
 use rand::prelude::*;
 use std::cell::RefCell;
@@ -51,7 +50,7 @@ TAction<G::B>: ActionTensor {
 #[test]
 fn mcts_tree_draw() {
 
-    let mut mcts_config = MCTSConfig::default();
+    let mcts_config = MCTSConfig::default();
     let mut mcts_tree = MCTSTree::generate(Game::init_std(), mcts_config);
     let actor = RandomActor{
         rng: RefCell::new(thread_rng())
@@ -78,8 +77,8 @@ fn mcts_tree_draw() {
 
     draw_tree.draw("graphs/tmp/turn0.svg", XY::new(1000.0, 1000.0));
 
-    let (posterior, action_id) = mcts_tree.get_posterior_w_sampled_action_index().unwrap();
-    let (trimmed_game, action) = mcts_tree.trim_root(action_id).unwrap();
+    let (_posterior, action_id) = mcts_tree.get_posterior_w_sampled_action_index().unwrap();
+    let (trimmed_game, _action) = mcts_tree.trim_root(action_id).unwrap();
     mcts_tree.turn_count += 1;
     assert_eq!(trimmed_game, Game::default());
     mcts_tree.draw("graphs/tmp/turn1.svg", XY::new(200.0, 200.0));
