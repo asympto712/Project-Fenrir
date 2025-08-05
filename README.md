@@ -1,7 +1,7 @@
 # Project Fenrir &#x130E7;
 This project aims to train super-human level AI for [**Tafl**](https://en.wikipedia.org/wiki/Tafl_games), an ancient Nordic strategy boardgame family. It uses 100% pure Rust, because Rust is cool.
 
-# NOTE!
+# 👷 NOTE 🏗️
 This project is actively under development
 
 # Project overview
