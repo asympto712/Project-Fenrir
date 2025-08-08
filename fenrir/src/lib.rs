@@ -6,7 +6,7 @@ use std::{fs::File, io::Read};
 use crate::{
     agent::MCTSConfig,
     model::ModelConfig,
-    run::{FenrirConfig, FenrirConfigWrapper, ModelSetupConfig, ModelSetupConfigWrapper, ModuleLoadInfo, ModuleLoadInfoWrapper},
+    setup::{FenrirConfig, FenrirConfigWrapper, ModelSetupConfig, ModelSetupConfigWrapper, ModuleLoadInfo, ModuleLoadInfoWrapper},
     train::ModelSyncConfig
 };
 use serde::Deserialize;
@@ -21,10 +21,14 @@ pub mod agent;
 pub mod self_play;
 #[cfg(feature = "torch")]
 pub mod train;
-#[cfg(feature = "mpi")]
+
+pub mod setup;
+
 pub mod run;
 
 pub mod visualization;
+
+pub mod statistics;
 
 pub mod utils;
 pub mod schedule;
@@ -63,7 +67,6 @@ impl From<CompConfigWrapper> for CompConfig {
 }
 
 pub fn load_comp_config<P: AsRef<Path>>(filename: P) -> CompConfig {
-    let file: fs::File = File::open(&filename).unwrap();
     let data = fs::read_to_string(&filename).unwrap();
     let wrapper = toml::from_str::<CompConfigWrapper>(&data).unwrap();
     Into::<CompConfig>::into(wrapper)
@@ -73,7 +76,7 @@ pub fn load_comp_config<P: AsRef<Path>>(filename: P) -> CompConfig {
 fn toml_parse_works() {
     use std::fs::File;
     use toml;
-    let path = "./test_data/test_config1.toml";
+    let path = "./config/comp_config_test.toml";
     let file = File::open(path).unwrap();
     let data = std::fs::read_to_string(path).unwrap();
     let result = toml::from_str::<CompConfigWrapper>(&data);

@@ -253,6 +253,104 @@ impl<D: BoardData> Episode<D> {
     pub fn len(&self) -> usize {
         self.episode.len()
     }
+
+    // This will make the episode vector empty
+    pub fn save<W: Write>(&mut self, writer: &mut W) -> Result<()> {
+        if self.episode.len() == 0 {
+            return Err(eyre!("episode must have at least one length"));
+        }
+        if let EpisodeUnit::SPR(_) = self.episode[0] {
+            return Err(eyre!("episode must start with sep"));
+        }
+        let mut v: Vec<D> = vec![];
+
+        for eu in self.episode.drain(..) {
+            match eu {
+                EpisodeUnit::<D>::SPR(spr) => {
+                    v.push(spr);
+                },
+                EpisodeUnit::<D>::Sep => {}
+            }
+        }
+        write_one_episode::<W,D>(v, writer)?;
+        Ok(())
+    }
+
+    pub fn extend_from_reader<R: Read + Seek>(&mut self, mut reader: R, buf: &mut Vec<u8>) -> Result<()> {
+
+        use std::io::SeekFrom;
+        let mut pos = reader.seek(SeekFrom::End(0))?;
+        let mut episode_n_byte_buf: [u8;8] = [0;8];
+        let mut episode_count = 0;
+
+        while reader.stream_position().is_ok() {
+            if pos < 8 {
+                break;
+            }
+            pos -= 8;
+            reader.seek_relative(-8)?;
+            reader.read_exact(&mut episode_n_byte_buf)?;
+            let episode_n_byte: u64 = u64::from_le_bytes(episode_n_byte_buf);
+
+            pos -= episode_n_byte;
+            reader.seek_relative(-8 - episode_n_byte as i64)?;
+            // Maybe if we cap the total moves per game, we can allocate this on the stack
+            let mut data_buf = vec![0u8; episode_n_byte as usize];
+            reader.read_exact(buf)?;
+
+            let (mut v_spr, u) = bincode::decode_from_slice::<Vec<D>, Configuration<LittleEndian, Fixint>>(
+                &buf[..], 
+                REPLAY_BUFFER_ENCODE_CONFIG
+            )?;
+            buf.clear();
+            reader.seek_relative(-1 * u as i64)?;
+            self.episode.push(EpisodeUnit::Sep);
+            self.episode.extend(v_spr.into_iter().map(|spr| EpisodeUnit::SPR(spr)));
+
+            episode_count += 1;
+        }
+        Ok(())
+    }
+
+    pub fn load_from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+
+        use std::io::SeekFrom;
+        let mut output: Vec<EpisodeUnit<D>> = vec![];
+        let mut pos = reader.seek(SeekFrom::End(0))?;
+        let mut episode_n_byte_buf: [u8;8] = [0;8];
+        let mut episode_count = 0;
+
+        while reader.stream_position().is_ok() {
+            if pos < 8 {
+                break;
+            }
+            pos -= 8;
+            reader.seek_relative(-8)?;
+            reader.read_exact(&mut episode_n_byte_buf)?;
+            let episode_n_byte: u64 = u64::from_le_bytes(episode_n_byte_buf);
+
+            pos -= episode_n_byte;
+            reader.seek_relative(-8 - episode_n_byte as i64)?;
+            // Maybe if we cap the total moves per game, we can allocate this on the stack
+            let mut data_buf = vec![0u8; episode_n_byte as usize];
+            reader.read_exact(&mut data_buf)?;
+
+            let (mut v_spr, u) = bincode::decode_from_slice::<Vec<D>, Configuration<LittleEndian, Fixint>>(
+                data_buf.as_slice(), 
+                REPLAY_BUFFER_ENCODE_CONFIG
+            )?;
+            reader.seek_relative(-1 * u as i64)?;
+            output.extend(v_spr.into_iter().map(|spr| EpisodeUnit::SPR(spr)).rev());
+            output.push(EpisodeUnit::Sep);
+
+            episode_count += 1;
+        }
+
+        output.reverse();
+
+        let decoded = Episode::<D>{ episode: output};
+        Ok(decoded)
+    }
 }
 
 #[derive(Debug, Default, bincode::Encode, bincode::Decode)]
@@ -263,6 +361,11 @@ pub struct ReplayBuffer<D: BoardData + bincode::Encode> {
 // TODO: define custom default so that memory efficient
 
 impl<D: BoardData> ReplayBuffer<D> {
+
+    pub fn len(&self) -> usize {
+        self.replay_buffer.lock().unwrap().len()
+    }
+
     pub fn new(capacity: usize) -> Self {
         let replay_buffer = Vec::<EpisodeUnit<D>>::with_capacity(capacity);
         let replay_buffer = Mutex::new(replay_buffer);
@@ -368,7 +471,6 @@ impl<D: BoardData> ReplayBuffer<D> {
         }
         Ok(())
     }
-
 
     // load the latest n episodes from the specified file.
     // The capacity of the output is set to be usize::MAX

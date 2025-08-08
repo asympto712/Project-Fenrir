@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 use color_eyre::eyre::OptionExt;
+use crossbeam::channel::bounded;
 use rand::thread_rng;
 use rand::Rng;
 use rand::seq::index::sample_weighted;
@@ -19,6 +20,8 @@ use color_eyre::eyre::ErrReport;
 use rand::prelude::*;
 use rv::dist::SymmetricDirichlet;
 use rv::traits::Sampleable;
+#[cfg(feature = "bench")]
+use std::time::{Duration, Instant};
 
 // internal
 use crate::model::PVModel;
@@ -87,7 +90,9 @@ TAction<G::B>: ActionTensor,
 }
 
 pub struct NewActor {
-    sender: Arc<Sender<Request>>,
+    req_sender: Arc<Sender<Request>>,
+    eval_sender: Arc<Sender<Evaluation>>,
+    eval_receiver: Receiver<Evaluation>,
 }
 
 impl<G: GameLogic> Oracle<G> for NewActor
@@ -97,15 +102,25 @@ TAction<G::B>: ActionTensor
 {
     // returns the distribution of the valid actions and the value
     fn infer(&self, game: &G, actions: Option<Vec<&<G::B as BitBoard>::Movement>>) -> Result<(Tensor, f32)> {
-        let (s, r) = unbounded::<Evaluation>();
+
+        #[cfg(feature = "bench")]
+        let start = Instant::now();
+
         let mut rng = thread_rng();
         let k: u8 = rng.gen_range(0..4);
         let query: Query = <TBoard<G> as ModelInput<G>>::get_pnet_input(game, Rotation::Do(k), (Kind::Float, Device::Cpu)).get();
-        let request: Request = Request::new(query, Arc::new(s));
-        self.sender.send(request)
+        let request: Request = Request::new(query, Arc::clone(&self.eval_sender));
+        self.req_sender.send(request)
             .map_err(|_| ErrReport::msg("Could not send the inference request"))?;
 
-        let (pre_dist, pre_value) = r.recv()?;
+        let (pre_dist, pre_value) = self.eval_receiver.recv()?;
+
+        #[cfg(feature = "bench")]
+        {
+            let duration = start.elapsed();
+            // println!("{:?}", duration);
+        }
+
         // Not sure, but the received result should have the shape
         // [1,20,11,11] and [1,1]
         // Calling squeeze just in case
@@ -126,9 +141,7 @@ TAction<G::B>: ActionTensor
 
         let pre_dist = pre_dist.squeeze().rot90(-1 * k as i64, [-2,-1]);
         let dist = &pre_dist * mask.get().to_kind(Kind::Float);
-        dbg!();
-        // let sum: f64 = dist.sum(Kind::Float).double_value(&[0]);
-        // let dist = dist.divide_scalar(sum);
+
         let sum= dist.sum(Kind::Float);
         let dist = dist.divide(&sum);
         Ok((dist, value))
@@ -138,7 +151,12 @@ TAction<G::B>: ActionTensor
 
 impl NewActor {
     pub fn new(sender: Arc<Sender<Request>>) -> Self {
-        Self { sender }
+        let (eval_sender, eval_receiver) = bounded::<Evaluation>(1);
+        Self {
+            req_sender: sender,
+            eval_receiver,
+            eval_sender: Arc::new(eval_sender),
+        }
     }
 }
 
@@ -158,6 +176,9 @@ TAction<<G as GameLogic>::B>: ActionTensor
 
     // returns the distribution of the valid actions and the value
     fn infer(&self, game: &G, actions: Option<Vec<&<G::B as BitBoard>::Movement>>) -> Result<(Tensor, f32)> {
+        #[cfg(feature = "bench")]
+        let start = Instant::now();
+
         let (s, r) = unbounded::<Evaluation>();
         let mut rng = thread_rng();
         let k: u8 = rng.gen_range(0..4);
@@ -168,6 +189,12 @@ TAction<<G as GameLogic>::B>: ActionTensor
 
 
         let (pre_dist, pre_value) = r.recv()?;
+        #[cfg(feature = "bench")]
+        {
+            let duration = start.elapsed();
+            println!("inference took {:?}", duration);
+        }
+
         // Not sure, but the received result should have the shape
         // [1,20,11,11] and [1,1]
         // Calling squeeze just in case
@@ -230,7 +257,6 @@ pub fn get_vec_priors<B: BitBoard>(dist: &Tensor, ordered_actions: &Vec<B::Movem
 pub struct Node<G: GameLogic> {
     game: G,
     actions: Vec<<G::B as BitBoard>::Movement>,
-    // edges: Option<Vec<&Edges>>,
     pub edges: Vec<Option<Edge<G>>>,
     pub visit_count: f32,
 }
@@ -487,23 +513,26 @@ where TaflBoard<G::B>: std::fmt::Display {
             next_actions
         ) = node.game.do_move_and_update_whole(action, None, true)?;
 
-        // if cfg!(test) {
-        //     print!("{:?} ", reason);
-        //     print!("expansion from {} ", action);
-        //     println!("{}", new_game.get_board());
-        //     println!("{}", new_game.get_state());
-        //     for a in new_game.get_possible_actions() {
-        //         print!("{} ", a);
-        //     }
-        //     if let Some(ref actions) = next_actions {
-        //         println!("actions returned by do_move_and_update_whole");
-        //         for a in actions.iter() {
-        //             print!("{} ", a);
-        //         }
-        //     } else {
-        //         println!("do_move_and_update_whole returned no action");
-        //     }
-        // }
+        #[cfg(feature = "verbose")]
+        {
+            if reason.is_some() {
+                print!("terminal node encountered: {:?} ", reason);
+            }
+            println!("expansion from {} ", action);
+            println!("{}", new_game.get_board());
+            println!("{}", new_game.get_state());
+            // for a in new_game.get_possible_actions() {
+            //     print!("{} ", a);
+            // }
+            // if let Some(ref actions) = next_actions {
+            //     println!("actions returned by do_move_and_update_whole");
+            //     for a in actions.iter() {
+            //         print!("{} ", a);
+            //     }
+            // } else {
+            //     println!("do_move_and_update_whole returned no action");
+            // }
+        }
         
         let next_actions = next_actions
             .unwrap_or(vec![]);
@@ -558,7 +587,9 @@ TaflBoard<G::B>: std::fmt::Display {
     }
 }
 
-impl<G: GameLogic> MCTSTree<G> where TBoard<G>: ModelInput<G>,
+impl<G: GameLogic> MCTSTree<G>
+where
+TBoard<G>: ModelInput<G>,
 TAction<G::B>: ActionTensor,
 TaflBoard<G::B>: std::fmt::Display{
 
@@ -634,11 +665,12 @@ TaflBoard<G::B>: std::fmt::Display{
 
         loop {
 
-            // dbg!(depth_count);
-
             // First, check if current node is a leaf
             if cur_node.is_leaf() {
-                // dbg!("leaf node reached");
+                
+                #[cfg(feature = "verbose")]
+                print!("{}", depth);
+
                 return Some((Rc::get_mut(cur_node)?, path));
             }
 
@@ -649,20 +681,19 @@ TaflBoard<G::B>: std::fmt::Display{
                 cur_node.select_action_critically(self.c_puct)?
             };
 
-            // if cfg!(test) {
-            //     for (e, a) in cur_node.edges.iter().zip(cur_node.actions.iter()) {
-            //         if let Some(edge) = e {
-            //             print!("edge c.p.t. {}: acc_value is {}, prior is {}, visit count is {} ", a, edge.acc_value, edge.prior, edge.visit_count);
-            //         } else {
-            //             print!("no edge c.p.t {} ", a);
-            //         }
-            //     }
-            // }
-            
-            dbg!(best_idx);
-            if cfg!(test) {
-                println!("selected action: {}", cur_node.actions[best_idx]);
+            #[cfg(feature = "verbose")]
+            {
+                for (e, a) in cur_node.edges.iter().zip(cur_node.actions.iter()) {
+                    if let Some(edge) = e {
+                        println!("edge from {}: acc_value is {}, prior is {}, visit count is {} ", a, edge.acc_value, edge.prior, edge.visit_count);
+                    } else {
+                        println!("no edge from {} ", a);
+                    }
+                }
             }
+            
+            #[cfg(feature = "verbose")]
+            println!("Selected action: {}", cur_node.actions[best_idx]);
 
             // Check if the edge exists and if the child is a leaf
             // We need to do this check without holding onto the edge reference
@@ -682,11 +713,16 @@ TaflBoard<G::B>: std::fmt::Display{
             depth_count += 1;
 
             if child_is_leaf {
-                // dbg!();
-                // Now we can safely get mutable access since we're not holding any immutable references
+
+                // safely get mutable access since we're not holding any immutable references
                 let mut_edge = Rc::get_mut(cur_node)?.get_edge_mut(best_idx)?;
+
+                #[cfg(feature = "verbose")]
+                println!("{}", depth);
+
                 return Some((Rc::get_mut(mut_edge.get_child_mut())?, path));
             } else {
+
                 // Move to the next node
                 let mut_edge = Rc::get_mut(cur_node)?.get_edge_mut(best_idx)?;
                 cur_node = mut_edge.get_child_mut();
@@ -694,54 +730,6 @@ TaflBoard<G::B>: std::fmt::Display{
         }
 
         None
-
-        // while !cur_node.is_leaf() {
-
-        //     let best_action_idx = if depth_count == 0 {
-        //         cur_node.select_action_critically_w_noise(self.c_puct, self.alpha, self.epsilon)
-        //     } else {
-        //         cur_node.select_action_critically(self.c_puct)
-        //     };
-
-        //     match best_action_idx {
-        //         Some(idx) => {
-        //             if let Some(edge) = cur_node.get_edge(idx) {
-        //                 cur_node = edge.child.clone();
-        //                 path.push(idx);
-        //             } else { return None; }
-        //         }
-        //         None => {return None;}
-        //     }
-
-        //     depth_count += 1;
-        // }
-        // Some((cur_node, path))
-
-        // loop {
-
-        //     let best_action_idx = if depth_count == 0 {
-        //         cur_node.select_action_critically_w_noise(self.c_puct, self.alpha, self.epsilon)
-        //     } else {
-        //         cur_node.select_action_critically(self.c_puct)
-        //     };
-
-        //     match best_action_idx {
-        //         Some(idx) => {
-        //             if let Some(edge) = cur_node.get_edge(idx) {
-        //                 path.push(idx);
-        //                 let mut_edge = Rc::get_mut(cur_node).unwrap().get_edge_mut(idx).unwrap();
-        //                 if edge.child.is_leaf() {
-        //                     return Some((Rc::get_mut(mut_edge.get_child_mut())?, path));
-        //                 } else {
-        //                     cur_node = edge.get_child_mut();
-        //                 }
-        //             } else { return None; }
-        //         }
-        //         None => {return None;}
-        //     }
-
-        //     depth_count += 1;
-        // }
     }
 
     fn expand_from_leaf<O: Oracle<G>>(leaf: &mut Node<G>, actor: &O) -> Result<f32> {
@@ -755,20 +743,9 @@ TaflBoard<G::B>: std::fmt::Display{
             return Ok(value)
         }
 
-        // if cfg!(test) {
-        //     for a in leaf.actions.iter() {
-        //         print!("{} ", a);
-        //     }
-        // }
-        // debug_print_board(&leaf.game);
-
         let actions: Vec<&<G::B as BitBoard>::Movement> = leaf.actions.iter().collect();
         let (dist, value) = actor.infer(&leaf.game, Some(actions))?;
         let priors = get_vec_priors::<G::B>(&dist, &leaf.actions)?;
-
-        // if cfg!(test) {
-        //     println!("{:?}", priors);
-        // }
 
         leaf.expand(priors)?;
         Ok(value)
@@ -776,14 +753,12 @@ TaflBoard<G::B>: std::fmt::Display{
 
     fn backup(&mut self, value: f32, path: Vec<usize>) -> Result<()>{
 
-        // dbg!();
         let edges_to_update = path.into_iter()
             .fold(&mut self.root, |rc_node, action_idx| {
                 let node = Rc::get_mut(rc_node).unwrap();
                 node.visit_count += 1.0;
                 let player: Side = node.game.get_state().show_side();
                 let edge = node.get_edge_mut(action_idx).unwrap();
-                // dbg!();
                 edge.visit_count += 1.0;
                 edge.acc_value += match player{
                     Side::Att => value,
@@ -880,9 +855,7 @@ TaflBoard<G::B>: std::fmt::Display{
 
     pub fn trim_root(&mut self, action_id: usize) -> Result<(G, <G::B as BitBoard>::Movement)> {
 
-        // dbg!(Rc::strong_count(&self.root));
-        // dbg!(Rc::weak_count(&self.root));
-
+        // get the Rc clone of the next root node
         let edge_opt = self.root.edges.get(action_id)
             .ok_or_eyre("Action index out of bounds")?;
         let edge = edge_opt
@@ -890,54 +863,31 @@ TaflBoard<G::B>: std::fmt::Display{
             .ok_or_eyre("The edge chosen from the root node in the MCTS tree was not initialized")?;
         let next_root = edge.child.clone();
 
-        // dbg!(Rc::strong_count(&self.root));
-        // dbg!(Rc::weak_count(&self.root));
-
-        // now this should work, as self is the only one who holds reference to the root
+        // At this point there should only be one mutable reference to the current root, so we can call Rc::get_mut()
         let cur_root= Rc::get_mut(&mut self.root)
             .ok_or_eyre("try_unwrap operation failed at trim_root")?;
 
-        // if cfg!(test) {
-        //     println!("root board {}", cur_root.game.get_board());
-        //     println!("number of actions from root: {}", cur_root.actions.len());
-        // }
-
+        // Destructively obtain the chosen action and the current game state to return
         let chosen_action = cur_root.actions
             .drain(..)
             .nth(action_id)
             .ok_or_eyre("action index out of bounds")?;
         let cur_game = std::mem::replace::<G>(&mut cur_root.game, <G as GameLogic>::ghastly());
 
-        // dbg!(Rc::strong_count(&self.root));
-        // dbg!(Rc::weak_count(&self.root));
-
         // Now the only remaining reference to the old root (held by self) is dropped, so the old root will disappear
         self.root = next_root;
 
-        // dbg!(Rc::strong_count(&self.root));
-        // dbg!(Rc::weak_count(&self.root));
-
-        // Do these two still remain valid (still own the values)? I'm not sure
         Ok((cur_game, chosen_action))
     }
 
     pub fn search_expand_backup<O: Oracle<G>>(&mut self, actor: &O) -> Result<()> {
 
-        // let (mut rc_leaf, path) = self.traverse_and_as_ref_mut()
-        //     .ok_or_eyre("Traversing the MCTS tree didn't work")?;
-
-        // let leaf = Rc::get_mut(&mut rc_leaf)
-        //     .ok_or_eyre("Cannot get mutable reference to leaf node")?;
-
         let (leaf, path) = self.traverse_and_as_ref_mut()
             .ok_or_eyre("Traversing the MCTS tree didn't work")?;
 
-        // if cfg!(test) {
-        //     println!("{:?}", path);
-        // }
-
         let value = Self::expand_from_leaf::<O>(leaf, actor)?;
-        dbg!(value);
+        #[cfg(feature = "verbose")]
+        println!("{value}");
 
         self.backup(value, path)?;
 
@@ -952,20 +902,8 @@ TaflBoard<G::B>: std::fmt::Display{
             self.search_expand_backup::<O>(actor)?;
         }
 
-        // let (posterior, action_id) 
-        // = self.get_posterior_w_sampled_action_index_destructively()?;
-
         let (posterior, action_id) 
-        = self.get_posterior_w_sampled_action_index()?;
-
-        if cfg!(test) {
-            dbg!();
-            for (a, x) in posterior.iter() {
-                print!("{}, {}", a, x);
-                println!();
-            }
-        }
-        dbg!(action_id);
+        = self.get_posterior_w_sampled_action_index()?;  // Don't call destructive function here, as we still need action information from root.
 
         let (game, action) = self.trim_root(action_id)?;
         self.turn_count += 1;
@@ -996,10 +934,7 @@ pub enum Temperature {
     Zero
 }
 
-// pub fn mcts(game: &Game, vp_sender: &mut Arc<Sender<Tensor>>, vp_receiver: &mut Receiver<Tensor>) -> Tensor{
-//     todo!()
-// } 
-
+// To test if MCTS is working properly, I recommend trying tests/mcts.rs and see the tree visualization there.
 #[cfg(test)]
 mod tests {
     use super::*;

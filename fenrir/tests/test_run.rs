@@ -1,7 +1,7 @@
 use fenrir::load_comp_config;
 use fenrir::model::{GeneralPVDualModel, ModelConfig, PVModel};
 use fenrir::replay_buffer::{GameSPR, ReplayBuffer};
-use fenrir::run::{now_into_filename, setup, ModelSetupConfig, ModuleLoadInfo};
+use fenrir::setup::{now_into_filename, setup, ModelSetupConfig, ModuleLoadInfo};
 use fenrir::self_play::{ModuleShelf, LockedShelf, Shelf, InferenceManager, self_play_new};
 use fenrir::CompConfig;
 use fenrir::train::Trainer;
@@ -22,11 +22,11 @@ fn test_run_wo_mpi_sequential() {
 
     std::fs::create_dir_all(Path::new("./test_data").join("models")).unwrap();
 
-    let path = Path::new("./test_data").join("test_config1.toml");
+    let path = Path::new("./config").join("comp_config_test.toml");
     let comp_config: CompConfig = load_comp_config(path);
     assert!(!comp_config.fenrir_config.use_mpi);
 
-    let path = Path::new("./test_data").join("eleven_model_simple.toml");
+    let path = Path::new("./config").join("eleven_model_simple.toml");
     let model_config = ModelConfig::load_from_toml(path).unwrap();
 
     // Create a new model

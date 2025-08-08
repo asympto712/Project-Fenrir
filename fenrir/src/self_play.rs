@@ -38,13 +38,16 @@ use std::path::Path;
 use std::thread::{self, current, JoinHandle};
 use std::sync::{Arc, RwLock};
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::ffi::{OsString, OsStr};
 use std::path;
 use std::convert::AsRef;
 use std::borrow::Borrow;
 use std::io::{Read, Seek};
 use std::sync::Mutex as StdMutex;
+
+#[cfg(feature = "bench")]
+use crate::statistics::*;
 
 // needs experimenting
 const BATCHSIZE: i64 = 64;
@@ -334,9 +337,6 @@ impl<P: PVModel> Directer<P> {
 
         let target_size_per_device = batch.internal_length / num_devices as i64;
 
-        // book-keeping the slice locations so that later we can create mini-dispatchers
-        // let mut dispatcher_slicer: Vec<usize> = vec![];
-
         for (n, (len, _)) in batch.dispatcher.iter().enumerate() {
 
             current_size += len;
@@ -353,8 +353,6 @@ impl<P: PVModel> Directer<P> {
             split_sizes.push(current_size);
         }
 
-        // dispatcher_slicer.push(batch.dispatcher.len());
-        
         // make the batch state "Computing"
         batch.clear_everything_except_dispatcher();
         batch.status_computing();
@@ -366,14 +364,6 @@ impl<P: PVModel> Directer<P> {
             start = end;
         }
         dispatcher_ranges.push((start, batch.dispatcher.len()));
-
-        // creating mini-batchers, responsible of broadcasting the results from the sliced inputs back to the correct workers
-        // TODO! right now it doesn't work, have to find a better way
-        // let mut mini_dispatchers: Vec<&[(i64, Arc<Sender<Evaluation>>)]> = Vec::with_capacity(num_devices);
-        // mini_dispatchers.push(&batch.dispatcher[0..=dispatcher_slicer[0]]);
-        // for i in 0..num_devices - 1{
-        //     mini_dispatchers.push(&batch.dispatcher[dispatcher_slicer[i]+1..=dispatcher_slicer[i+1]]);
-        // }
 
         let tss = ts.split_with_sizes(split_sizes.as_slice(), 0);
 
@@ -423,19 +413,6 @@ impl<P: PVModel> Directer<P> {
                     .map_err(|_| ErrReport::msg("Error happened while sending the inference results"))?;
             }
         }
-
-        // Now, broadcast the evaluations back to the requesting workers
-        // for (n, &mini_dispatcher) in mini_dispatchers.into_iter().enumerate() {
-        //     let split_sizes: Vec<i64> = mini_dispatcher.iter().map(|(i, _)| *i).collect();
-        //     infer_results[n].0
-        //     .split_with_sizes(split_sizes, 0)
-        //     .into_iter()
-        //     .zip(infer_results[n].1.split_with_sizes(split_sizes, 0))
-        //     .zip(mini_dispatcher.into_iter())
-        //     .map(|(eval, (_, arc_sender))| {
-        //         arc_sender.send(eval);
-        //     })?;
-        // }
 
         batch.clear_dispatcher();
         batch.status_free();
@@ -553,15 +530,19 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 pub trait Shelf {
     fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize>;
     fn update_modules_from_stream<S: Read + Seek>(&mut self, group_id: usize, stream: &mut S) -> Result<()>;
+    fn write_to_stream<W: std::io::Write>(&self, group_id: usize, stream: &mut W) -> Result<()>;
     fn get_group_sizes(&self) -> Vec<usize>;
 }
 
-impl <S: Shelf + ?Sized> Shelf for &'_ mut S {
+impl<S: Shelf + ?Sized> Shelf for &'_ mut S {
     fn get_group_id<T: Borrow<OsStr>>(&self, name: T) -> Option<usize> {
         (**self).get_group_id(name)
     }
     fn update_modules_from_stream<R: Read + Seek>(&mut self, group_id: usize, stream: &mut R) -> Result<()> {
         (**self).update_modules_from_stream(group_id, stream)
+    }
+    fn write_to_stream<W: std::io::Write>(&self, group_id: usize, stream: &mut W) -> Result<()> {
+        (**self).write_to_stream(group_id, stream)
     }
     fn get_group_sizes(&self) -> Vec<usize> {
         (**self).get_group_sizes()
@@ -571,9 +552,9 @@ impl <S: Shelf + ?Sized> Shelf for &'_ mut S {
 // ModuleShelf stores the model replicas and its variable stores, grouped by the model they are derived from.
 pub struct ModuleShelf<P: PVModel + Send, B: Borrow<P>> {
     // This separates the model by group id
-    table: Vec<Vec<(B, VarStore)>>,
+    pub table: Vec<Vec<(B, VarStore)>>,
     // This is a look up function for model_name (file_name) <-> group id
-    name_lookup: Vec<OsString>,
+    pub name_lookup: Vec<OsString>,
     _marker: PhantomData<P>,
 }
 
@@ -610,6 +591,15 @@ impl<P: PVModel + Send, B: Borrow<P>> Shelf for ModuleShelf<P, B> {
         for (_, vs) in self.table[group_id].iter_mut() {
             vs.load_from_stream(&mut *stream).wrap_err("module update failed")?
         }
+        Ok(())
+    }
+
+    fn write_to_stream<W: std::io::Write>(&self, group_id: usize, stream: &mut W) -> Result<()> {
+        let replicas = self.table.get(group_id).ok_or_eyre("Could not get the replicas")?;
+        if replicas.is_empty() {
+            return Err(eyre!("module table was empty for the specified group"));
+        }
+        replicas[0].1.save_to_stream(stream)?;
         Ok(())
     }
 }
@@ -675,6 +665,16 @@ impl<P: PVModel + Send> Shelf for LockedShelf<P> {
         for (_, vs) in self.table[group_id].iter_mut() {
             vs.lock().unwrap().load_from_stream(&mut *stream).wrap_err("module update failed")?
         }
+        Ok(())
+    }
+
+    fn write_to_stream<W: std::io::Write>(&self, group_id: usize, stream: &mut W) -> Result<()> {
+        let replicas = self.table.get(group_id).ok_or_eyre("Could not get replicas")?;
+        if replicas.is_empty() {
+            return Err(eyre!("module table was empty for the specified group"));
+        }
+        let unlocked_module = replicas[0].1.lock().map_err(|_| eyre!("Could not acquire the lock when saving the model"))?;
+        unlocked_module.save_to_stream(stream)?;
         Ok(())
     }
     
@@ -819,7 +819,8 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                         match request_receiver.try_recv() {
                             Ok(request) => {
 
-                                dbg!("request received");
+                                #[cfg(feature = "verbose")]
+                                println!("request received at {:?}", thread::current().id());
 
                                 all_disconnected = false;
                                 let mut b = batch_clone[group_id].lock().unwrap();
@@ -852,7 +853,6 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                             }
                         }
                     }
-                    // dbg!(all_disconnected);
                     if all_disconnected { break; }
                 }
                 termination_sender.send(()).unwrap();
@@ -866,7 +866,9 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                 loop {
                     while let Some(job) = job_queue_clone2.lock().unwrap().pop_front() {
 
-                        dbg!("job received");
+                        #[cfg(feature = "verbose")]
+                        println!("job received at {:?}", thread::current().id());
+
                         let (mini_batch, group_id, senders) = job;
 
                         if let Some(module_id) = {
@@ -957,8 +959,32 @@ fn do_inference_job_sync<P: PVModel + Send>(
     Ok(())
 }
 
+#[cfg(not(feature = "bench"))]
+pub fn setup_mcts<G: GameLogic>(mcts_config: &MCTSConfig, request_sender: &Arc<Sender<Request>>)
+-> (MCTSTree<G>, NewActor)
+where
+TBoard<G>: ModelInput<G>,
+TAction<G::B>: ActionTensor,
+TaflBoard<G::B>: std::fmt::Display
+{
+        let game = <G as Default>::default();
+        let mut mcts_tree = MCTSTree::<G>::generate(game, mcts_config.clone());
+        let actor = NewActor::new(request_sender.clone());
+        (mcts_tree, actor)
+}
+
+#[cfg(feature = "bench")]
+pub fn setup_mcts<G: GameLogic>(stat_sender: &Arc<Sender<RunningStat>>, mcts_config: &MCTSConfig, request_sender: &Arc<Sender<Request>>)
+-> (MCTSTree<G>, NewActor, StatReporter) {
+        let game = <G as Default>::default();
+        let mut mcts_tree = MCTSTree::<G>::generate(game, mcts_config.clone());
+        let actor = NewActor::new(request_sender.clone());
+        let stat_reporter = StatReporter::new(stat_sender.clone());
+        (mcts_tree, actor, stat_reporter)
+}
 
 // play the game for the specified amount using the specified model, create the replay buffer
+#[cfg(not(feature = "bench"))]
 pub fn self_play_new<'a, P: PVModel + Send, D: BoardData>(
     manager: InferenceManager<'a, P, &'a mut LockedShelf<P>>,
     request_sender: Sender<Request>,
@@ -972,7 +998,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 {
 
     let request_sender = Arc::new(request_sender);
-    let model_id = 0;
+    let model_id = 0; // self-play only uses one model
 
     let ts = thread::scope::<'a>(|s| -> Result<()>{
 
@@ -982,24 +1008,15 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 
         (0..num_games).into_par_iter().for_each_init(
             || {
-                let (sender, receiver) = unbounded::<Evaluation>();
-                let sender = Arc::new(sender);
-                let game = <D::G as Default>::default();
-                let mut mcts_tree = MCTSTree::<D::G>::generate(game, mcts_config.clone());
-                let actor = NewActor::new(request_sender.clone());
-                (sender, receiver, mcts_tree, actor)
+                setup_mcts::<D::G>(mcts_config, &request_sender)
             }, 
         |(
-                vp_sender,
-                vp_receiver,
-                mcts_tree,
-                actor
-            ), worker_idx| {
+            mcts_tree,
+            actor
+            ), _worker_idx| {
 
-                dbg!(worker_idx);
-                if cfg!(test) {
-                    println!("current number of threads: {}",rayon::current_num_threads());
-                }
+                #[cfg(feature = "verbose")]
+                println!("current number of threads: {}",rayon::current_num_threads());
 
                 let mut episode: Episode<D>= Episode::<D>::new();
 
@@ -1008,13 +1025,11 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
                     let (game,_action, posterior) = mcts_tree.get_policy_and_update::<NewActor>(&actor).unwrap();
                     episode.append_wo_reward(&game, posterior);
 
-                    if cfg!(test) {
-                        print!("{_action}->");
-                    }
                 }
                 let winner = mcts_tree.get_winner();
 
-                dbg!(winner);
+                #[cfg(feature = "verbose")]
+                println!("{:?}", winner);
 
                 match winner {
                     Side::Att => episode.give_reward(1i64),
@@ -1031,4 +1046,117 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
     });
 
     ts
+}
+
+// play the game for the specified amount using the specified model, create the replay buffer
+#[cfg(feature = "bench")]
+pub fn self_play_bench<'a, P: PVModel + Send, D: BoardData>(
+    manager: InferenceManager<'a, P, &'a mut LockedShelf<P>>,
+    request_sender: Sender<Request>,
+    num_games: usize,
+    mcts_config: &MCTSConfig,
+    replay_buffer: &ReplayBuffer<D>,
+    bench_log_writer: &mut W,
+) -> Result<()>
+where TBoard<D::G>: ModelInput<D::G>,
+TAction<<D::G as GameLogic>::B>: ActionTensor,
+TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
+W: std::io::Write
+{
+
+    let request_sender = Arc::new(request_sender);
+    let model_id = 0;
+
+    let (stat_sender, stat_receiver) = unbounded::<RunningStat>();
+    let stat_sender = Arc::new(stat_sender);
+    let mut stat_collector = StatCollector::new(stat_receiver);
+
+    let ts = thread::scope::<'a>(|s| -> Result<()>{
+
+        let t = s.spawn( move || {
+            manager.consume_and_run()
+        });
+
+        let stat = s.spawn( move || -> Result<()> {
+            loop {
+                // Try to receive from the raw receiver to handle disconnection properly  
+                match stat_collector.try_recv() {
+                    Ok(()) => {},
+                    Err(TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(10));
+                    },
+                    Err(TryRecvError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+
+            match stat_collector.report() {
+                Ok((count, mean, variance)) => {
+                    if let Err(e) = write!(bench_log_writer, "MCTS search duration: mean {}ms, variance {}ms, N {}", mean, variance, count) {
+                        return Err(ErrReport::msg("{:?}", e))
+                    } else {}
+                },
+                Err(e) => return Err(ErrReport::msg("{:?}", e))
+            };
+            Ok(())
+        });
+
+        (0..num_games).into_par_iter().for_each_init(
+            || {
+                setup_mcts(&stat_sender, mcts_config, &request_sender)
+            }, 
+        |(
+                mcts_tree,
+                actor,
+                stat_reporter
+            ), worker_idx| {
+
+                #[cfg(feature = "verbose")]
+                println!("current number of threads: {}",rayon::current_num_threads());
+
+                let mut episode: Episode<D>= Episode::<D>::new();
+
+                while !mcts_tree.root_is_terminal() {
+
+                    let start = Instant::now();
+                    let (game,_action, posterior) = mcts_tree.get_policy_and_update::<NewActor>(&actor).unwrap();
+                    let time = start.elapsed().as_secs_f64() * 1000.0; // convert to milliseconds
+                    stat_reporter.update(time);
+                    episode.append_wo_reward(&game, posterior);
+
+                }
+                let winner = mcts_tree.get_winner();
+
+                #[cfg(feature = "verbose")]
+                println!("{:?}", winner);
+
+                match winner {
+                    Side::Att => episode.give_reward(1i64),
+                    Side::Def => episode.give_reward(-1i64),
+                };
+                replay_buffer.append_from_episode(&mut episode);
+
+                stat_reporter.report();
+        });
+
+        drop(request_sender); // just in case
+        drop(stat_sender); // Signal statistics thread to stop
+
+        t.join().map_err(|_| ErrReport::msg("Thread join failed"))??;
+        stat.join().map_err(|_| ErrReport::msg("Statistics thread join failed"))??;
+        Ok(())
+
+    });
+
+    ts
+}
+
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shelf_module_update_works() {
+        
+    }
 }

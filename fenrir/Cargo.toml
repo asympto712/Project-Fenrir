@@ -5,9 +5,10 @@ edition = "2024"
 
 [features]
 default = ["torch", "mpi"]
-no-torch = []
 torch = ["dep:tch", "dep:libc"]
 mpi = ["dep:mpi"]
+bench = ["torch", "mpi"]
+verbose = ["torch", "mpi"]
 
 [dependencies]
 bitboard = { path = "../bitboard"}
