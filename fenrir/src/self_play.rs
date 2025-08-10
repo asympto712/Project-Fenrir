@@ -53,6 +53,7 @@ use crate::statistics::*;
 const BATCHSIZE: i64 = 64;
 // maximum duration for the director to wait for request in millis
 const DIRECTOR_RCV_TIMEOUT: Duration = Duration::from_millis(1);
+const MAX_DURATION_BETWEEN_JOB_DISPATCH: Duration = Duration::from_millis(10);
 
 // Batching works as follows. Each worker sends a request (a Tensor and a Sender of the inference result) to the Directer instance.
 // Directer then fills the vector of requests, which is then sent to the designated Device when the send threshold is reached. 
@@ -809,6 +810,9 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
             let organizer = s.spawn(move || {
 
                 let req_rec_iter = self.request_receivers.into_iter();
+                // timer to measure the time from the last job dispatch. If no new job arrives for a certain amount of time, then dispatch the 
+                // current job without waiting for the batch to fill up.
+                let mut timers = (0..batch_clone.len()).map(|_x| Instant::now()).collect::<Vec<_>>();
 
                 loop{
 
@@ -819,7 +823,7 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                         match request_receiver.try_recv() {
                             Ok(request) => {
 
-                                #[cfg(feature = "verbose")]
+                                #[cfg(feature = "verbose_lvl2")]
                                 println!("request received at {:?}", thread::current().id());
 
                                 all_disconnected = false;
@@ -840,16 +844,62 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
 
                                     let mini_batch = Tensor::stack(queries.as_slice(), 0);
                                     job_queue_clone.lock().unwrap().push_back((mini_batch, group_id, senders));
-                                }
+                                    //job dispatched. reset the timer
+                                    timers[group_id] = Instant::now();
 
+                                } else if timers[group_id].elapsed() > MAX_DURATION_BETWEEN_JOB_DISPATCH && b.requests.len() > 0 {
+
+                                    let drain = b.requests.drain(..);
+                                    let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
+                                        (request.query, request.sender)
+                                    }).unzip();
+
+                                    let mini_batch = Tensor::stack(queries.as_slice(), 0);
+                                    job_queue_clone.lock().unwrap().push_back((mini_batch, group_id, senders));
+                                    //job dispatched. reset the timer
+                                    timers[group_id] = Instant::now();
+
+                                }
                             },
                             Err(TryRecvError::Empty) => {
+
                                 all_disconnected = false;
+
+                                if timers[group_id].elapsed() > MAX_DURATION_BETWEEN_JOB_DISPATCH {
+                                    let mut b = batch_clone[group_id].lock().unwrap();
+                                    if b.requests.len() > 0 {
+
+                                        let drain = b.requests.drain(..);
+                                        let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
+                                            (request.query, request.sender)
+                                        }).unzip();
+
+                                        let mini_batch = Tensor::stack(queries.as_slice(), 0);
+                                        job_queue_clone.lock().unwrap().push_back((mini_batch, group_id, senders));
+                                        //job dispatched. reset the timer
+                                        timers[group_id] = Instant::now();
+
+                                    }
+                                }
                             },
                             Err(TryRecvError::Disconnected) => {
                                 // Only in this case don't set all_disconnected = false.
                                 // If this happens for all of the receivers we will get true in the end
-                                ();
+
+                                let mut b = batch_clone[group_id].lock().unwrap();
+                                if b.requests.len() > 0 {
+
+                                    let drain = b.requests.drain(..);
+                                    let (queries, senders): (Vec<_>, Vec<_>)= drain.map(|request| {
+                                        (request.query, request.sender)
+                                    }).unzip();
+
+                                    let mini_batch = Tensor::stack(queries.as_slice(), 0);
+                                    job_queue_clone.lock().unwrap().push_back((mini_batch, group_id, senders));
+                                    //job dispatched. reset the timer
+                                    timers[group_id] = Instant::now();
+
+                                }
                             }
                         }
                     }
@@ -866,7 +916,7 @@ impl <'a, P: PVModel + Send> InferenceManager<'a, P, &'a mut LockedShelf<P>> {
                 loop {
                     while let Some(job) = job_queue_clone2.lock().unwrap().pop_front() {
 
-                        #[cfg(feature = "verbose")]
+                        #[cfg(feature = "verbose_lvl2")]
                         println!("job received at {:?}", thread::current().id());
 
                         let (mini_batch, group_id, senders) = job;
@@ -1013,9 +1063,9 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
         |(
             mcts_tree,
             actor
-            ), _worker_idx| {
+            ), game_id| {
 
-                #[cfg(feature = "verbose")]
+                #[cfg(feature = "verbose_lvl2")]
                 println!("current number of threads: {}",rayon::current_num_threads());
 
                 let mut episode: Episode<D>= Episode::<D>::new();
@@ -1028,8 +1078,8 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
                 }
                 let winner = mcts_tree.get_winner();
 
-                #[cfg(feature = "verbose")]
-                println!("{:?}", winner);
+                #[cfg(feature = "verbose_lvl1")]
+                println!("game {} finished. winner is {:?}", game_id, winner);
 
                 match winner {
                     Side::Att => episode.give_reward(1i64),
@@ -1038,6 +1088,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
                 replay_buffer.append_from_episode(&mut episode);
         });
 
+        dbg!(Arc::strong_count(&request_sender));
         drop(request_sender); // just in case
 
         t.join().map_err(|_| ErrReport::msg("Thread join failed"))??;
@@ -1110,9 +1161,9 @@ W: std::io::Write
                 mcts_tree,
                 actor,
                 stat_reporter
-            ), worker_idx| {
+            ), game_id| {
 
-                #[cfg(feature = "verbose")]
+                #[cfg(feature = "verbose_lvl2")]
                 println!("current number of threads: {}",rayon::current_num_threads());
 
                 let mut episode: Episode<D>= Episode::<D>::new();
@@ -1128,8 +1179,8 @@ W: std::io::Write
                 }
                 let winner = mcts_tree.get_winner();
 
-                #[cfg(feature = "verbose")]
-                println!("{:?}", winner);
+                #[cfg(feature = "verbose_lvl1")]
+                println!("game {} finished. Winner is {:?}", game_id, winner);
 
                 match winner {
                     Side::Att => episode.give_reward(1i64),
