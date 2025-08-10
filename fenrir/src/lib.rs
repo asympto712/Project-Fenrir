@@ -21,17 +21,14 @@ pub mod agent;
 pub mod self_play;
 #[cfg(feature = "torch")]
 pub mod train;
-
 pub mod setup;
-
-pub mod run;
-
+#[cfg(feature = "mpi")]
+pub mod node;
 pub mod visualization;
-
 pub mod statistics;
-
 pub mod utils;
 pub mod schedule;
+pub mod run;
 
 use std::fs;
 use toml;
@@ -72,8 +69,25 @@ pub fn load_comp_config<P: AsRef<Path>>(filename: P) -> CompConfig {
     Into::<CompConfig>::into(wrapper)
 }
 
+#[cfg(feature = "mpi")]
+use mpi::Rank;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MpiConfig {
+    root: Rank,
+    train: Rank,
+    test: Rank,
+    self_play: Vec<Rank>,
+}
+
+pub fn load_mpi_config<P: AsRef<Path>>(filename: P) -> MpiConfig {
+    let data = fs::read_to_string(&filename).unwrap();
+    let wrapper = toml::from_str::<MpiConfig>(&data).unwrap();
+    wrapper
+}
+
 #[test]
-fn toml_parse_works() {
+fn comp_toml_parse_works() {
     use std::fs::File;
     use toml;
     let path = "./config/comp_config_test.toml";
@@ -85,3 +99,27 @@ fn toml_parse_works() {
     let comp_config: CompConfig = wrapper.into();
 }
 
+#[test]
+fn comp_cnt_toml_parse_works() {
+    use std::fs::File;
+    use toml;
+    let path = "./config/comp_cnt_test.toml";
+    let file = File::open(path).unwrap();
+    let data = std::fs::read_to_string(path).unwrap();
+    let result = toml::from_str::<CompConfigWrapper>(&data);
+    assert!(result.is_ok());
+    let wrapper = result.unwrap();
+    let comp_config: CompConfig = wrapper.into();
+}
+
+#[test]
+fn mpi_toml_parse_works() {
+    use std::fs::File;
+    use toml;
+    let path = "./config/mpi_test.toml";
+    let file = File::open(path).unwrap();
+    let data = std::fs::read_to_string(path).unwrap();
+    let result = toml::from_str::<MpiConfig>(&data);
+    assert!(result.is_ok());
+    let wrapper = result.unwrap();
+}

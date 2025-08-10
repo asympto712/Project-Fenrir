@@ -1,7 +1,7 @@
-use fenrir::agent::{Oracle, MCTSConfig, MCTSTree};
+use fenrir::agent::{MCTSConfig, MCTSTree, Oracle};
 use fenrir::utils::{ActionTensor, ModelInput, TBoard, TAction, VectorBasedMove, MoveRepresentation};
-use fenrir::visualization::*;
-use game::game::{GameLogic, Game};
+use fenrir::{visualization::*};
+use game::game::{Game, GameLogic};
 
 use rand::prelude::*;
 use std::cell::RefCell;

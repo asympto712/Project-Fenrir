@@ -221,7 +221,7 @@ impl PVModel for GeneralPVDualModel {
                 .view([logits.size()[0], self.config.policy_out_features, self.config.board_size, self.config.board_size]);
             (likelihood, value)
         } else {
-            (logits, value)
+            (logits.view([logits.size()[0], -1]), value)
         }
     }
 
@@ -263,7 +263,7 @@ impl PVModel for GeneralPVSepModel {
                 .view([logits.size()[0], self.config.policy_out_features, self.config.board_size, self.config.board_size]);
             (likelihood, value)
         } else {
-            (logits, value)
+            (logits.view([logits.size()[0], -1]), value)
         }
     }
 

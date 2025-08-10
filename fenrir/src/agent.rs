@@ -513,25 +513,17 @@ where TaflBoard<G::B>: std::fmt::Display {
             next_actions
         ) = node.game.do_move_and_update_whole(action, None, true)?;
 
-        #[cfg(feature = "verbose")]
+        #[cfg(feature = "verbose_lvl2")]
         {
             if reason.is_some() {
-                print!("terminal node encountered: {:?} ", reason);
+                println!("terminal node encountered: {:?} ", reason);
             }
+        }
+        #[cfg(feature = "verbose_lvl3")]
+        {
             println!("expansion from {} ", action);
             println!("{}", new_game.get_board());
             println!("{}", new_game.get_state());
-            // for a in new_game.get_possible_actions() {
-            //     print!("{} ", a);
-            // }
-            // if let Some(ref actions) = next_actions {
-            //     println!("actions returned by do_move_and_update_whole");
-            //     for a in actions.iter() {
-            //         print!("{} ", a);
-            //     }
-            // } else {
-            //     println!("do_move_and_update_whole returned no action");
-            // }
         }
         
         let next_actions = next_actions
@@ -668,8 +660,8 @@ TaflBoard<G::B>: std::fmt::Display{
             // First, check if current node is a leaf
             if cur_node.is_leaf() {
                 
-                #[cfg(feature = "verbose")]
-                print!("{}", depth);
+                #[cfg(feature = "verbose_lvl2")]
+                print!("{}", depth_count);
 
                 return Some((Rc::get_mut(cur_node)?, path));
             }
@@ -681,7 +673,7 @@ TaflBoard<G::B>: std::fmt::Display{
                 cur_node.select_action_critically(self.c_puct)?
             };
 
-            #[cfg(feature = "verbose")]
+            #[cfg(feature = "verbose_lvl3")]
             {
                 for (e, a) in cur_node.edges.iter().zip(cur_node.actions.iter()) {
                     if let Some(edge) = e {
@@ -692,7 +684,7 @@ TaflBoard<G::B>: std::fmt::Display{
                 }
             }
             
-            #[cfg(feature = "verbose")]
+            #[cfg(feature = "verbose_lvl2")]
             println!("Selected action: {}", cur_node.actions[best_idx]);
 
             // Check if the edge exists and if the child is a leaf
@@ -717,8 +709,8 @@ TaflBoard<G::B>: std::fmt::Display{
                 // safely get mutable access since we're not holding any immutable references
                 let mut_edge = Rc::get_mut(cur_node)?.get_edge_mut(best_idx)?;
 
-                #[cfg(feature = "verbose")]
-                println!("{}", depth);
+                #[cfg(feature = "verbose_lvl2")]
+                println!("{}", depth_count);
 
                 return Some((Rc::get_mut(mut_edge.get_child_mut())?, path));
             } else {
@@ -886,7 +878,7 @@ TaflBoard<G::B>: std::fmt::Display{
             .ok_or_eyre("Traversing the MCTS tree didn't work")?;
 
         let value = Self::expand_from_leaf::<O>(leaf, actor)?;
-        #[cfg(feature = "verbose")]
+        #[cfg(feature = "verbose_lvl2")]
         println!("{value}");
 
         self.backup(value, path)?;

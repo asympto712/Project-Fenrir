@@ -271,12 +271,13 @@ fn get_bn_var_names<V: Borrow<VarStore>>(vss: &[V]) -> Option<Vec<String>> {
 
 pub struct NewTrainer<P: PVModel + Send> {
     pub shelf: ModuleShelf<P, P>,
+    pub step_count: usize,
+    pub loss_record: Vec<LossValue>,
     optimizers: Vec<Optimizer>,
     mini_batch_size: usize,
     trainable_var_names: Vec<String>,
     bn_stats_names: Vec<String>,
     sync_config: ModelSyncConfig,
-    pub loss_record: Vec<LossValue>,
 }
 
 impl<P: PVModel+ Send> NewTrainer<P> {
@@ -326,7 +327,17 @@ impl<P: PVModel+ Send> NewTrainer<P> {
         bn_stats_names.extend(get_bn_var_names(&vss).ok_or_eyre("Could not get batch norm var names")?);
 
         let loss_record: Vec<LossValue> = vec![];
-        Ok(Self { shelf, optimizers, mini_batch_size, trainable_var_names, bn_stats_names, sync_config, loss_record})
+        
+        Ok(Self {
+            shelf,
+            optimizers,
+            mini_batch_size,
+            trainable_var_names,
+            bn_stats_names,
+            sync_config,
+            loss_record,
+            step_count: 0
+        })
     }
 
     // Sample from the replay_buffer, calculate the forward pass on each replica and return the average loss value
@@ -368,6 +379,7 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             mse_loss += mse.double_value(&[0]);
             total_loss += loss.double_value(&[0]);
             
+            self.step_count += 1;
         }
 
         let denominator: f64 = self.replicas().len() as f64;
@@ -463,8 +475,9 @@ impl<P: PVModel+ Send> NewTrainer<P> {
                 unsafe {&mut *ptr}.get_mut(0).ok_or_eyre("Could not mutably get optimizer")?,
                 batch
             );
+            self.step_count += 1;
 
-            #[cfg(feature = "verbose")]
+            #[cfg(feature = "verbose_lvl1")]
             println!("{loss_value}");
 
             self.loss_record.push(loss_value);
@@ -497,6 +510,9 @@ impl<P: PVModel+ Send> NewTrainer<P> {
                 else { false }
             ; 
             self.step(replay_buffer.borrow(), sync_bn_stats, rng)?;
+
+            #[cfg(feature = "verbose_lvl1")]
+            println!("Train: {}/{}", i, n_steps);
         }
         Ok(())
     }
@@ -516,6 +532,12 @@ impl<P: PVModel+ Send> NewTrainer<P> {
     pub fn write_loss_record<W: Write>(&self, f: &mut W) {
         for loss in self.loss_record() {
             writeln!(f, "{:.4} {:.4} {:.4}", loss.cross_entropy, loss.mse, loss.total);
+        }
+    }
+
+    pub fn update_lr(&mut self, new_lr: f64) {
+        for o in self.optimizers.iter_mut() {
+            o.set_lr(new_lr);
         }
     }
 }
@@ -672,6 +694,10 @@ impl<'a, P: PVModel> Trainer<'a, P> {
                 else { false }
             ; 
             self.step(replay_buffer.borrow(), sync_bn_stats)?;
+
+            #[cfg(feature = "verbose_lvl1")]
+            println!("Train {}/{}", i, n_steps);
+
         }
         Ok(())
     }
@@ -689,6 +715,8 @@ fn train_from_batch<P: PVModel>(model: &P, optimizer: &mut Optimizer, batch: (Te
     policy = policy.to_device(device);
     reward = reward.to_device(device);
     let (evaluated_logits, evaluated_reward) = model.evaluate_t(&position, true);
+    dbg!(evaluated_logits.size());
+    dbg!(policy.size());
     let cross_entropy = evaluated_logits.cross_entropy_for_logits(&policy);
     let mse = evaluated_reward.mse_loss(&reward, tch::Reduction::Mean);
     let loss = &cross_entropy + &mse;
@@ -698,7 +726,7 @@ fn train_from_batch<P: PVModel>(model: &P, optimizer: &mut Optimizer, batch: (Te
     optimizer.step();
 
     let total = loss.to(Device::Cpu).double_value(&[0]);
-    let mse = loss.to(Device::Cpu).double_value(&[0]);
-    let cross_entropy = loss.to(Device::Cpu).double_value(&[0]);
+    let mse = mse.to(Device::Cpu).double_value(&[0]);
+    let cross_entropy = cross_entropy.to(Device::Cpu).double_value(&[0]);
     LossValue::loss_value(total, cross_entropy, mse)
 }

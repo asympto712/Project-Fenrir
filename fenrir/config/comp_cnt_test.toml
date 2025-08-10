@@ -1,11 +1,11 @@
-name = "mock-config"
+name = "cnt_fenrir_test"
 
 [fenrir_config]
-use_mpi = false
+use_mpi = true
 inference_bs = 4
 train_bs = 4
 n_training_step_per_cycle = 100
-n_self_play_games = 5
+n_self_play_games = 10
 n_games_per_tournament = 10
 model_update_threshold = 0.55
 replay_buffer_capacity = 100
@@ -25,13 +25,14 @@ temp_schedule_move_selection = "AlphaGoZero"
 [model_sync_config]
 
 [model_sync_config.grad]
-type = "Ave"
+type = "Sum"
 
 [setup_config]
-use_mpi = false
+use_mpi = true
 
 [[setup_config.module_load_infos]]
 path = "foo"
+rank = 0
     [setup_config.module_load_infos.device]
     type = "Cpu"
     
@@ -44,3 +45,32 @@ path = "foo"
     conv_filters = 3
     kernel_size = 3
 
+[[setup_config.module_load_infos]]
+path = "foo"
+rank = 1
+    [setup_config.module_load_infos.device]
+    type = "Cpu"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 16
+    num_convblocks = 1
+    in_features = 5
+    conv_filters = 3
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "foo"
+rank = 2
+    [setup_config.module_load_infos.device]
+    type = "Cpu"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 16
+    num_convblocks = 1
+    in_features = 5
+    conv_filters = 3
+    kernel_size = 3

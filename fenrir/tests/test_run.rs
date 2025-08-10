@@ -51,6 +51,8 @@ fn test_run_wo_mpi_sequential() {
     let mut shelf = ModuleShelf::module_shelf(table, name_lookup);
     let replay_buffer = ReplayBuffer::<D>::new(comp_config.fenrir_config.replay_buffer_capacity);
 
+    std::fs::remove_file(path).unwrap();
+
     let mut temp_file = tempfile().unwrap();
 
     dbg!("config load, model setup complete");
@@ -63,24 +65,29 @@ fn test_run_wo_mpi_sequential() {
             locked_shelf.update_modules_from_stream(0, &mut temp_file).unwrap();
         }
 
-        let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, comp_config.fenrir_config.mini_batch_size);
+        let (manager,mut request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, comp_config.fenrir_config.inference_bs);
 
-        dbg!("self play phase");
+        dbg!("self play phase\n");
+
+        let request_sender = request_senders.remove(0);
         self_play_new::<P,D>(
             manager,
-            request_senders[0].clone(),
+            request_sender,
             comp_config.fenrir_config.n_self_play_games,
             &comp_config.mcts_config,
             &replay_buffer
         ).unwrap();
 
         shelf = LockedShelf::<P>::convert_into_shelf(locked_shelf);
+
+        dbg!("train phase\n");
+
         let mut trainer = Trainer::<P>::new::<tch::nn::Sgd>(
             shelf.get_group_mut(0).expect("shelf is empty"),
             tch::nn::sgd(comp_config.fenrir_config.momentum, 0.0f64,comp_config.fenrir_config.weight_decay, false),
             (comp_config.fenrir_config.learning_rate_schedule)(0),
             comp_config.fenrir_config.weight_decay,
-            comp_config.fenrir_config.mini_batch_size,
+            comp_config.fenrir_config.train_bs,
             comp_config.model_sync_config
         ).unwrap();
 

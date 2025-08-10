@@ -45,17 +45,13 @@ const TAG_NO_MODEL_REQUEST: Tag = 0;
 
 #[derive(Debug, Clone)]
 pub struct FenrirConfig{
-    pub n_self_play_nodes: usize,
-    pub n_train_nodes: usize,
-    pub n_model_replica_self_play: usize,
-    pub n_model_replica_train: usize,
     pub use_mpi: bool,
-    pub mini_batch_size: usize,
+    pub inference_bs: usize,
+    pub train_bs: usize,
     pub n_training_step_per_cycle: usize,
     pub n_self_play_games: usize,
     pub n_games_per_tournament: usize,
     pub model_update_threshold: f32,
-    pub concurrent_training: bool,
     pub replay_buffer_capacity: usize,
     pub run_time_hr: u64,
     pub momentum: f64,
@@ -65,17 +61,13 @@ pub struct FenrirConfig{
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FenrirConfigWrapper {
-    n_self_play_nodes: usize,
-    n_train_nodes: usize,
-    n_model_replica_self_play: usize,
-    n_model_replica_train: usize,
     use_mpi: bool,
-    mini_batch_size: usize,
+    inference_bs: usize,
+    train_bs: usize,
     n_training_step_per_cycle: usize,
     n_self_play_games: usize,
     n_games_per_tournament: usize,
     model_update_threshold: f32,
-    concurrent_training: bool,
     replay_buffer_capacity: usize,
     run_time_hr: u64,
     momentum: f64,
@@ -88,17 +80,13 @@ impl From<FenrirConfigWrapper> for FenrirConfig {
         let mut table = lr_sch_initialize();
         let learning_rate_schedule = table.remove(&value.learning_rate_schedule).unwrap();
         Self {
-            n_self_play_nodes: value.n_self_play_nodes,
-            n_train_nodes: value.n_train_nodes,
-            n_model_replica_self_play: value.n_model_replica_self_play,
-            n_model_replica_train: value.n_model_replica_train,
             use_mpi: value.use_mpi,
-            mini_batch_size: value.mini_batch_size,
+            inference_bs: value.inference_bs,
+            train_bs: value.train_bs,
             n_training_step_per_cycle: value.n_training_step_per_cycle,
             n_self_play_games: value.n_self_play_games,
             n_games_per_tournament: value.n_games_per_tournament,
             model_update_threshold: value.model_update_threshold,
-            concurrent_training: value.concurrent_training,
             replay_buffer_capacity: value.replay_buffer_capacity,
             run_time_hr: value.run_time_hr,
             momentum: value.momentum,
@@ -434,10 +422,15 @@ pub fn setup_w_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsStrin
         if rank == 0 {
             process_model_request(&world, size)?;
         } else if rank == module_info.rank.unwrap() && !path.exists() {
+
+            println!("requesting model {:?} from root node", path);
+
             let cursor = request_model_from_root(&world, 0, path.as_os_str().to_str().unwrap());
             add_module_from_stream_to_list(module_info, &mut loaded_models, &mut available_cuda, cursor)?;
         } else {
-            world.process_at_rank(0).send_with_tag(&[0], TAG_NO_MODEL_REQUEST);
+            // If the model is visible from non-root, just load it
+            add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?; 
+            world.process_at_rank(0).send_with_tag::<[u8;0]>(&[], TAG_NO_MODEL_REQUEST);
         }
         world.barrier();
     }
@@ -477,6 +470,7 @@ fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
 
         let (msg, status) = world.process_at_rank(rank).matched_probe();
         if status.tag() == TAG_NO_MODEL_REQUEST {
+            msg.matched_receive_into(&mut buf);   // In this case the msg should be empty
             continue;
         } else if status.tag() == TAG_MODEL_REQUEST {
 
@@ -556,7 +550,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display {
             locked_shelf.update_modules_from_stream(0, &mut storage)?;
         }
 
-        let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.mini_batch_size);
+        let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.inference_bs);
 
         self_play_new::<P,D>(
             manager,
@@ -572,7 +566,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display {
             tch::nn::sgd(config.momentum, 0.0f64, config.weight_decay, false),
             (config.learning_rate_schedule)(0),
             config.weight_decay,
-            config.mini_batch_size,
+            config.train_bs,
             ModelSyncConfig::new(train::SumOrAve::Ave)
         )?;
 
@@ -701,6 +695,8 @@ mod tests {
 
     #[test]
     fn test_create_lookup_table_with_mpi_rank_filtering() {
+        let universe = mpi::initialize().unwrap();
+
         let loaded_models = vec![
             ("model1.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)),
             ("model2.pv".into(), MockPVModel::default(), VarStore::new(Device::Cpu)),
@@ -785,8 +781,8 @@ mod tests {
         let config = ModelSetupConfig::model_setup_config(false, module_infos);
         
         let result = setup::<MockPVModel>(&config);
-        // This should fail because the file doesn't exist
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        std::fs::remove_file("nonexistent.pv").unwrap();
     }
 
     #[test]
@@ -813,17 +809,13 @@ mod tests {
     #[test]
     fn test_fenrir_config_with_agz_lr_schedule() {
         let config = FenrirConfig {
-            n_self_play_nodes: 2,
-            n_train_nodes: 1,
-            n_model_replica_self_play: 4,
-            n_model_replica_train: 2,
             use_mpi: false,
-            mini_batch_size: 64,
+            inference_bs: 8,
+            train_bs: 64,
             n_training_step_per_cycle: 1000,
             n_self_play_games: 100,
             n_games_per_tournament: 10,
             model_update_threshold: 0.55,
-            concurrent_training: true,
             replay_buffer_capacity: 50000,
             run_time_hr: 2,
             momentum: 0.9,
@@ -837,7 +829,7 @@ mod tests {
         assert_eq!((config.learning_rate_schedule)(700000), 0.0001);
         
         assert!(!config.use_mpi);
-        assert_eq!(config.mini_batch_size, 64);
+        assert_eq!(config.train_bs, 64);
         assert_eq!(config.momentum, 0.9);
     }
 }

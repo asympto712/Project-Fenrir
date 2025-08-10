@@ -1,0 +1,4 @@
+root = 0
+train = 1
+test = 0
+self_play = [2]

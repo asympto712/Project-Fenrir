@@ -282,6 +282,7 @@ impl<D: BoardData> Episode<D> {
         let mut pos = reader.seek(SeekFrom::End(0))?;
         let mut episode_n_byte_buf: [u8;8] = [0;8];
         let mut episode_count = 0;
+        buf.clear();
 
         while reader.stream_position().is_ok() {
             if pos < 8 {
@@ -294,8 +295,7 @@ impl<D: BoardData> Episode<D> {
 
             pos -= episode_n_byte;
             reader.seek_relative(-8 - episode_n_byte as i64)?;
-            // Maybe if we cap the total moves per game, we can allocate this on the stack
-            let mut data_buf = vec![0u8; episode_n_byte as usize];
+
             reader.read_exact(buf)?;
 
             let (mut v_spr, u) = bincode::decode_from_slice::<Vec<D>, Configuration<LittleEndian, Fixint>>(
@@ -549,6 +549,7 @@ impl ReplayBuffer<GameSPR> {
                     let policy = <TAction::<BoardEleven> as ActionTensor>::from_index_policy(&spr.policy)
                         .inner()
                         .to_kind(options.0)
+                        .view([-1])
                         .to_device(options.1);
 
                     let reward = Tensor::from_slice(&[spr.reward as f32])
@@ -663,6 +664,7 @@ impl ReplayBuffer<SimpleGameSPR> {
                     let policy = <TAction::<BoardSeven> as ActionTensor>::from_index_policy(&spr.policy)
                         .inner()
                         .to_kind(options.0)
+                        .view([-1])
                         .to_device(options.1);
 
                     let reward = Tensor::from_slice(&[spr.reward as f32])
@@ -1065,6 +1067,32 @@ mod tests {
             let loaded = loaded_buffer.unwrap();
             let guard = loaded.replay_buffer.lock().unwrap();
             assert!(guard.len() > 0);
+        }
+
+        #[test]
+        fn gamespr_encode_size() {
+            let game = Game::init_std();
+            let posterior = game.get_possible_actions().into_iter().map(|x| (x, 1.0f32)).collect::<Vec<_>>();
+            let gamespr = GameSPR::reward_initialized(&game, posterior, 1);
+            let v = bincode::encode_to_vec(gamespr, REPLAY_BUFFER_ENCODE_CONFIG).unwrap();
+            println!("{}", v.len());
+        }
+
+        #[test]
+        fn simplegamespr_encode_size() {
+            let game = SimpleGame::init_std();
+            let posterior = game.get_possible_actions().into_iter().map(|x| (x, 1.0f32)).collect::<Vec<_>>();
+            let gamespr = SimpleGameSPR::reward_initialized(&game, posterior, 1);
+            let v = bincode::encode_to_vec(gamespr, REPLAY_BUFFER_ENCODE_CONFIG).unwrap();
+            println!("{}", v.len());
+        }
+
+        #[test]
+        fn bincode_test() {
+            let policy: Vec<(i64, f32)> = vec![(1, 1.0); 10];
+            let v = bincode::encode_to_vec(policy, REPLAY_BUFFER_ENCODE_CONFIG).unwrap();
+            println!("{}", v.len());
+            assert_eq!(v.len(), 10 * 12 + 8);
         }
     }
 

@@ -8,7 +8,9 @@ default = ["torch", "mpi"]
 torch = ["dep:tch", "dep:libc"]
 mpi = ["dep:mpi"]
 bench = ["torch", "mpi"]
-verbose = ["torch", "mpi"]
+verbose_lvl1 = ["torch", "mpi"]
+verbose_lvl2 = ["torch", "mpi", "verbose_lvl1"]
+verbose_lvl3 = ["torch", "mpi", "verbose_lvl2"]
 
 [dependencies]
 bitboard = { path = "../bitboard"}
