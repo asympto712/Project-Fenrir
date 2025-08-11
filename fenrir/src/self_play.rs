@@ -6,7 +6,7 @@ use bincode::Decode;
 use color_eyre::owo_colors::OwoColorize;
 use game::board::TaflBoard;
 //internal
-use game::game::{Game, GameLogic, GameState, Side};
+use game::game::{Game, GameLogic, GameState, Side, Victor};
 use bitboard::{BitBoard, PositionalEncoding, MoveOnBoard};
 use crate::{model, utils};
 use crate::replay_buffer::{self, BoardData, Episode, EpisodeUnit, ReplayBuffer, BoardPosForRB};
@@ -516,8 +516,9 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
             }
             let winner = mcts_tree.get_winner();
             match winner {
-                Side::Att => episode.give_reward(1i64),
-                Side::Def => episode.give_reward(-1i64),
+                Victor::Att => episode.give_reward(1i64),
+                Victor::Def => episode.give_reward(-1i64),
+                Victor::Draw => episode.give_reward(0i64),
             };
             replay_buffer.append_from_episode(&mut episode);
     });
@@ -1064,6 +1065,8 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
             mcts_tree,
             actor
             ), game_id| {
+                use game::game::Victor;
+
 
                 #[cfg(feature = "verbose_lvl2")]
                 println!("current number of threads: {}",rayon::current_num_threads());
@@ -1082,8 +1085,9 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
                 println!("game {} finished. winner is {:?}", game_id, winner);
 
                 match winner {
-                    Side::Att => episode.give_reward(1i64),
-                    Side::Def => episode.give_reward(-1i64),
+                    Victor::Att => episode.give_reward(1i64),
+                    Victor::Def => episode.give_reward(-1i64),
+                    Victor::Draw => episode.give_reward(0i64),
                 };
                 replay_buffer.append_from_episode(&mut episode);
         });

@@ -14,7 +14,7 @@ use crate::{CompConfig, MpiConfig};
 use bincode::Encode;
 use chrono::format::{DelayedFormat, StrftimeItems};
 use crossbeam::epoch::default_collector;
-use game::game::{Game, GameLogic, SimpleGame, Side};
+use game::game::{Game, GameLogic, Side, SimpleGame, Victor};
 use game::board::TaflBoard;
 use bitboard::{BitBoard, MoveOnBoard};
 
@@ -62,8 +62,8 @@ pub const SUB_RB_CAP: usize = 10000;
 pub const RB_MIN_LEN: usize = 1000; // minimum length of the replay buffer to start the training
 pub const N_STEP_PER_CYCLE: usize = 100; // number of training steps per cycle (until the next model update)
 pub const SYNC_BN_STATS_EVERY: usize = 10; // How often to synchronize the stats of Batch Norm layers during training
-pub const DATA_BUF_CAP: usize = 100000;
-pub const EP_BUF_CAP: usize = 1000;
+pub const DATA_BUF_CAP: usize = 40000;
+pub const EP_BUF_CAP: usize = 10000;
 pub const HE_BUF_CAP: usize = 100000; /* capacity of buffer to keep the one episode of data inside TrainNode. 
 It should be roughly (Maximum length of the game) * (Number of bytes it takes to encode one play data) */
 
@@ -171,7 +171,7 @@ impl<P: PVModel + Send, D: BoardData> Node<LockedShelf<P>> for SelfPlayNode<P, D
         let locked_shelf = LockedShelf::convert_from_shelf(shelf);
 
         // preallocate buffer
-        let buffer: Vec<u8> = Vec::with_capacity(capacity);
+        let buffer: Vec<u8> = Vec::with_capacity(2 * capacity);
         print_now(&format!("self node at rank {} has been initialized", Self::world().rank()));
         Self{
             shelf: locked_shelf,
@@ -274,13 +274,17 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                             let winner = tree.get_winner();
 
                             match winner {
-                                Side::Att => episode.give_reward(1i64),
-                                Side::Def => episode.give_reward(-1i64),
+                                Victor::Att => episode.give_reward(1i64),
+                                Victor::Def => episode.give_reward(-1i64),
+                                Victor::Draw => episode.give_reward(0i64),
                             };
 
                             episode.save(&mut buf);
                             // This requires MultiThread support from the MPI, so make sure to initialize MPI with Threading::Multiple
                             SimpleCommunicator::world().process_at_rank(rank_trainer).send_with_tag(&buf, TAG_REPLAY_SEND);
+
+                            #[cfg(feature = "verbose_lvl1")]
+                            print_now("an episode was sent from self play node");
 
                             buf.clear();
 
@@ -308,8 +312,9 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
 
                                     print_now(&format!("self play node at rank {} received halt message", Self::world().rank()));
                                     run = false;
-                                    let mut unlocked_buffer = buffer.lock().unwrap();
-                                    let mut buf = DynBufferMut::new(&mut unlocked_buffer);
+                                    // HALT messages send empty array [u8;0], receive into empty array
+                                    let mut empty_data: [u8; 0] = [];
+                                    let mut buf = DynBufferMut::new(&mut empty_data);
                                     msg.matched_receive_into(&mut buf);
                                     break;
                                 }
@@ -378,7 +383,7 @@ impl<P: PVModel + Send, D: BoardData + Encode> Node<ModuleShelf<P, P>> for Train
         let shelf = ModuleShelf::module_shelf(table, name_lookup);
 
         // preallocate buffer
-        let buffer: Vec<u8> = Vec::with_capacity(capacity);
+        let buffer: Vec<u8> = Vec::with_capacity(2 * capacity);
 
         let trainer: NewTrainer<P> = NewTrainer::new(
             shelf,
@@ -421,7 +426,7 @@ ReplayBuffer<D>: Sampler{
         use CommFlag::*;
 
         // buffer to receive the incoming (encoded) replay data
-        let mut data_buffer: Vec<u8> = Vec::with_capacity(DATA_BUF_CAP);
+        let mut data_buffer: Vec<u8> = vec![0; DATA_BUF_CAP];
 
         // secondary replay buffer that keeps the incoming replay data while the main buffer is busy
         let episode_buffer = Episode::<D>{
@@ -449,9 +454,16 @@ ReplayBuffer<D>: Sampler{
                             match status.tag() {
                                 TAG_REPLAY_SEND => {
 
+                                    #[cfg(feature = "verbose_lvl1")]
+                                    {
+                                        let byte = <u8 as Equivalence>::equivalent_datatype();
+                                        println!("byte count in one episode: {}", status.count(byte));
+                                    }
+
                                     let mut unlocked_ep_buf = episode_buffer.lock().unwrap();
-                                    msg.matched_receive_into(&mut data_buffer);
-                                    let cursor = Cursor::new(&data_buffer[..]);
+                                    let s = msg.matched_receive_into(&mut data_buffer);
+                                    let count = status.count(<u8 as Equivalence>::equivalent_datatype());
+                                    let cursor = Cursor::new(&data_buffer[..count as usize]);
                                     unlocked_ep_buf.extend_from_reader(cursor, &mut helper_buffer);
 
                                     // If the episode buffer has ample amount of samples to give...
@@ -460,12 +472,12 @@ ReplayBuffer<D>: Sampler{
                                     }
                                     drop(unlocked_ep_buf);
 
-                                    data_buffer.clear();
                                     helper_buffer.clear();
                                 },
                                 TAG_MODEL_REQUEST => {
 
-                                    msg.matched_receive_into(&mut data_buffer);  //the message should be empty
+                                    let mut dyn_buffer = DynBufferMut::new(&mut data_buffer);
+                                    msg.matched_receive_into(&mut dyn_buffer);  //the message should be empty
 
                                     print_now("train node has received the model request tag");
 
@@ -473,7 +485,10 @@ ReplayBuffer<D>: Sampler{
                                 },
                                 TAG_HALT => {
 
-                                    msg.matched_receive_into(&mut data_buffer);
+                                    // HALT messages send empty array [u8;0], receive into empty array
+                                    let mut empty_data: [u8; 0] = [];
+                                    let mut buf = DynBufferMut::new(&mut empty_data);
+                                    msg.matched_receive_into(&mut buf);
 
                                     print_now("train node has received the halt tag");
 
@@ -694,8 +709,9 @@ D: Send + Sync
                                 print_now("test node has received the halt tag");
 
                                 tx.send(CommFlag::Terminate);
-                                let mut buf = rec_buf_clone.lock().unwrap();
-                                let mut buffer_mut = DynBufferMut::new::<u8>(&mut buf);
+                                // HALT messages send empty array [u8;0], receive into empty array
+                                let mut empty_data: [u8; 0] = [];
+                                let mut buffer_mut = DynBufferMut::new(&mut empty_data);
                                 msg.matched_receive_into(&mut buffer_mut);
                                 break;
                             },
@@ -786,9 +802,9 @@ D: Send + Sync
                                 let (mut tree, champion, challenger) = setup_duel::<D::G>(&mcts_config, &champ_rs_cloned, &chal_rs_cloned);
 
                                 let players = if i % 2 == 0 {
-                                    [champion, challenger]
+                                    [champion, challenger] // Att: champion, Def: challenger
                                 } else {
-                                    [challenger, champion]
+                                    [challenger, champion] // Att: challenger, Def: champion
                                 };
                                 let mut cycle = players.iter().cycle();
 
@@ -798,11 +814,14 @@ D: Send + Sync
 
                                 let winner = tree.get_winner();
                                 let cond = match winner {
-                                    Side::Att => {
+                                    Victor::Att => {
                                         if (i % 2 == 0) {false} else {true}
                                     },
-                                    Side::Def => {
+                                    Victor::Def => {
                                         if (i % 2 == 0) {true} else {false}
+                                    }
+                                    Victor::Draw => {
+                                        false
                                     }
                                 };
                                 return cond

@@ -28,7 +28,7 @@ use mpi::{point_to_point::*, Tag};
 use mpi::topology::SimpleCommunicator;
 use mpi::traits::Communicator;
 use mpi::MpiError;
-use mpi::datatype::Equivalence;
+use mpi::datatype::{DynBufferMut, Equivalence};
 
 use color_eyre::eyre::Result;
 use rand::prelude::*;
@@ -39,7 +39,7 @@ use tch::vision::image::load;
 use tch::Device;
 use chrono::{Utc, Local};
 
-const BUFFER_LEN: usize = 1024;
+const BUFFER_LEN: usize = 10000;
 const TAG_MODEL_REQUEST: Tag = 1;
 const TAG_NO_MODEL_REQUEST: Tag = 0;
 
@@ -448,13 +448,14 @@ fn request_model_from_root(world: &SimpleCommunicator, root: i32, path: &str) ->
     let mut buffer = vec![0u8; BUFFER_LEN];
     loop {
 
-        let status = world.any_process().receive_into(&mut buffer);
+        let status = world.process_at_rank(root).receive_into(&mut buffer);
         let just_a_byte = u8::equivalent_datatype();
         let count = status.count(just_a_byte) as usize;
         if count == 0 { break; }
         else {
             data.extend_from_slice(&buffer[..count]);
         }
+        buffer.clear();
 
     }
     let cursor = Cursor::new(data);
@@ -463,18 +464,20 @@ fn request_model_from_root(world: &SimpleCommunicator, root: i32, path: &str) ->
 
 fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
 
-    let mut buf: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(BUFFER_LEN);
     for rank in 1..size {
 
         buf.clear();
 
         let (msg, status) = world.process_at_rank(rank).matched_probe();
         if status.tag() == TAG_NO_MODEL_REQUEST {
-            msg.matched_receive_into(&mut buf);   // In this case the msg should be empty
+            let mut dyn_buf = DynBufferMut::new(&mut buf);
+            msg.matched_receive_into(&mut dyn_buf);   // In this case the msg should be empty
             continue;
         } else if status.tag() == TAG_MODEL_REQUEST {
 
-            msg.matched_receive_into(&mut buf);
+            let mut dyn_buf = DynBufferMut::new(&mut buf);
+            msg.matched_receive_into(&mut dyn_buf);
             let filename = std::str::from_utf8(&buf)?;
             let path = Path::new(&filename);
             if !path.exists() {

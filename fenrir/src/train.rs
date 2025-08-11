@@ -362,7 +362,7 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             policy = policy.to_device(device);
             reward = reward.to_device(device);
             let (evaluated_logits, evaluated_reward) = replica.evaluate_t(&position, true);
-            let cross_entropy = evaluated_logits.cross_entropy_for_logits(&policy);
+            let cross_entropy = evaluated_logits.cross_entropy_loss::<Tensor>(&policy, None, tch::Reduction::Mean, -100, 0.0);
             let mse = evaluated_reward.mse_loss(&reward, tch::Reduction::Mean);
             let loss = &cross_entropy + &mse;
             
@@ -375,9 +375,9 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             let mse = mse.to(Device::Cpu);
 
             //  add to the total losses
-            cross_entropy_loss += cross_entropy.double_value(&[0]);
-            mse_loss += mse.double_value(&[0]);
-            total_loss += loss.double_value(&[0]);
+            cross_entropy_loss += cross_entropy.double_value(&[]);
+            mse_loss += mse.double_value(&[]);
+            total_loss += loss.double_value(&[]);
             
             self.step_count += 1;
         }
@@ -611,7 +611,7 @@ impl<'a, P: PVModel> Trainer<'a, P> {
             policy = policy.to_device(device);
             reward = reward.to_device(device);
             let (evaluated_logits, evaluated_reward) = replica.evaluate_t(&position, true);
-            let cross_entropy = evaluated_logits.cross_entropy_for_logits(&policy);
+            let cross_entropy = evaluated_logits.cross_entropy_loss::<Tensor>(&policy, None, tch::Reduction::Mean, -100, 0.0);
             let mse = evaluated_reward.mse_loss(&reward, tch::Reduction::Mean);
             let loss = &cross_entropy + &mse;
             
@@ -624,9 +624,9 @@ impl<'a, P: PVModel> Trainer<'a, P> {
             let mse = mse.to(Device::Cpu);
 
             //  add to the total losses
-            cross_entropy_loss += cross_entropy.double_value(&[0]);
-            mse_loss += mse.double_value(&[0]);
-            total_loss += loss.double_value(&[0]);
+            cross_entropy_loss += cross_entropy.double_value(&[]);
+            mse_loss += mse.double_value(&[]);
+            total_loss += loss.double_value(&[]);
             
         }
 
@@ -715,9 +715,9 @@ fn train_from_batch<P: PVModel>(model: &P, optimizer: &mut Optimizer, batch: (Te
     policy = policy.to_device(device);
     reward = reward.to_device(device);
     let (evaluated_logits, evaluated_reward) = model.evaluate_t(&position, true);
-    dbg!(evaluated_logits.size());
-    dbg!(policy.size());
-    let cross_entropy = evaluated_logits.cross_entropy_for_logits(&policy);
+    // dbg!(evaluated_logits.size());
+    // dbg!(policy.size());
+    let cross_entropy = evaluated_logits.cross_entropy_loss::<Tensor>(&policy, None, tch::Reduction::Mean, -100, 0.0);
     let mse = evaluated_reward.mse_loss(&reward, tch::Reduction::Mean);
     let loss = &cross_entropy + &mse;
 
@@ -725,8 +725,8 @@ fn train_from_batch<P: PVModel>(model: &P, optimizer: &mut Optimizer, batch: (Te
     loss.backward();
     optimizer.step();
 
-    let total = loss.to(Device::Cpu).double_value(&[0]);
-    let mse = mse.to(Device::Cpu).double_value(&[0]);
-    let cross_entropy = cross_entropy.to(Device::Cpu).double_value(&[0]);
+    let total = loss.to(Device::Cpu).double_value(&[]);
+    let mse = mse.to(Device::Cpu).double_value(&[]);
+    let cross_entropy = cross_entropy.to(Device::Cpu).double_value(&[]);
     LossValue::loss_value(total, cross_entropy, mse)
 }

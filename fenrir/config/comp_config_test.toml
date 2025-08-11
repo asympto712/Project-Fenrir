@@ -5,7 +5,7 @@ use_mpi = false
 inference_bs = 4
 train_bs = 4
 n_training_step_per_cycle = 100
-n_self_play_games = 5
+n_self_play_games = 4
 n_games_per_tournament = 10
 model_update_threshold = 0.55
 replay_buffer_capacity = 100
@@ -16,7 +16,7 @@ weight_decay = 0.001
 
 [mcts_config]
 c_puct = 0.3
-n_sim = 10
+n_sim = 4
 dirichlet_alpha = 0.03
 dirichlet_epsilon = 0.25
 temp_schedule_target_policy = "AlphaGoZero"

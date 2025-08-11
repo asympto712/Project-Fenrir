@@ -1,6 +1,7 @@
 use fenrir::load_comp_config;
 use fenrir::model::{GeneralPVDualModel, ModelConfig, PVModel};
-use fenrir::replay_buffer::{GameSPR, ReplayBuffer};
+#[allow(unused_imports)]
+use fenrir::replay_buffer::{GameSPR, ReplayBuffer, SimpleGameSPR};
 use fenrir::setup::{now_into_filename, setup, ModelSetupConfig, ModuleLoadInfo};
 use fenrir::self_play::{ModuleShelf, LockedShelf, Shelf, InferenceManager, self_play_new};
 use fenrir::CompConfig;
@@ -18,7 +19,7 @@ use tempfile::tempfile;
 fn test_run_wo_mpi_sequential() {
 
     type P = GeneralPVDualModel;
-    type D = GameSPR;
+    type D = SimpleGameSPR;
 
     std::fs::create_dir_all(Path::new("./test_data").join("models")).unwrap();
 
@@ -26,7 +27,7 @@ fn test_run_wo_mpi_sequential() {
     let comp_config: CompConfig = load_comp_config(path);
     assert!(!comp_config.fenrir_config.use_mpi);
 
-    let path = Path::new("./config").join("eleven_model_simple.toml");
+    let path = Path::new("./config").join("seven_model_simple.toml");
     let model_config = ModelConfig::load_from_toml(path).unwrap();
 
     // Create a new model

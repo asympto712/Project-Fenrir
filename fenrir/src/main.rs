@@ -1,5 +1,5 @@
+#![allow(unused_imports)]
 use std::path::{PathBuf, Path};
-use std::fs;
 
 use fenrir::{CompConfig, MpiConfig};
 use fenrir::run;

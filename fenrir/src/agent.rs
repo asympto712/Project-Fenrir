@@ -4,6 +4,7 @@
 
 use color_eyre::eyre::OptionExt;
 use crossbeam::channel::bounded;
+use game::game::Victor;
 use rand::thread_rng;
 use rand::Rng;
 use rand::seq::index::sample_weighted;
@@ -526,6 +527,8 @@ where TaflBoard<G::B>: std::fmt::Display {
             println!("{}", new_game.get_state());
         }
         
+        // dbg!(next_actions);
+
         let next_actions = next_actions
             .unwrap_or(vec![]);
 
@@ -613,7 +616,7 @@ TaflBoard<G::B>: std::fmt::Display{
         !self.root.game.get_state().is_ongoing()
     }
 
-    pub fn get_winner(&self) -> Side {
+    pub fn get_winner(&self) -> Victor {
         self.root.game.get_state().get_victor()
     }
 
@@ -661,7 +664,12 @@ TaflBoard<G::B>: std::fmt::Display{
             if cur_node.is_leaf() {
                 
                 #[cfg(feature = "verbose_lvl2")]
-                print!("{}", depth_count);
+                {
+                    println!("leaf detected");
+                    println!("depth {}", depth_count);
+                    println!("{}", cur_node.game.get_board());
+
+                }
 
                 return Some((Rc::get_mut(cur_node)?, path));
             }
@@ -710,7 +718,7 @@ TaflBoard<G::B>: std::fmt::Display{
                 let mut_edge = Rc::get_mut(cur_node)?.get_edge_mut(best_idx)?;
 
                 #[cfg(feature = "verbose_lvl2")]
-                println!("{}", depth_count);
+                println!("depth {}", depth_count);
 
                 return Some((Rc::get_mut(mut_edge.get_child_mut())?, path));
             } else {
@@ -729,8 +737,9 @@ TaflBoard<G::B>: std::fmt::Display{
         // When the leaf node is a terminal state, we just return the reward
         if !leaf.game.get_state().is_ongoing() {
             let value = match leaf.game.get_state().get_victor() {
-                Side::Att => 1.0,
-                Side::Def => -1.0,
+                Victor::Att => 1.0,
+                Victor::Def => -1.0,
+                Victor::Draw => 0.0
             };
             return Ok(value)
         }
@@ -738,6 +747,8 @@ TaflBoard<G::B>: std::fmt::Display{
         let actions: Vec<&<G::B as BitBoard>::Movement> = leaf.actions.iter().collect();
         let (dist, value) = actor.infer(&leaf.game, Some(actions))?;
         let priors = get_vec_priors::<G::B>(&dist, &leaf.actions)?;
+
+        // dbg!(priors.len());
 
         leaf.expand(priors)?;
         Ok(value)
@@ -778,6 +789,15 @@ TaflBoard<G::B>: std::fmt::Display{
         let temp_move_selection = (self.temp_schedule_move_selection)(self.turn_count);
         let dist = self.root
             .generate_dist_from_visit_counts(temp_posterior)?;
+
+        #[cfg(feature = "verbose_lvl2")]
+        {
+            for (m, x) in dist.iter() {
+                print!("{} {}|" , m, x);
+            }
+            println!();
+
+        }
 
         match temp_move_selection {
 
@@ -879,7 +899,7 @@ TaflBoard<G::B>: std::fmt::Display{
 
         let value = Self::expand_from_leaf::<O>(leaf, actor)?;
         #[cfg(feature = "verbose_lvl2")]
-        println!("{value}");
+        println!("value {value}");
 
         self.backup(value, path)?;
 
@@ -898,6 +918,12 @@ TaflBoard<G::B>: std::fmt::Display{
         = self.get_posterior_w_sampled_action_index()?;  // Don't call destructive function here, as we still need action information from root.
 
         let (game, action) = self.trim_root(action_id)?;
+
+        // dbg!();
+
+        #[cfg(feature = "verbose_lvl2")]
+        println!("{}", action);
+
         self.turn_count += 1;
 
         Ok((game, action, posterior))
@@ -997,6 +1023,40 @@ mod tests {
             let (game, action, posterior) = result.unwrap();
             println!("{}", game.board);
             println!("{action}");
+        }
+    }
+
+    #[test]
+    fn trim_root_works_simple_game() {
+        let mut tree = MCTSTree::<SimpleGame>::default();
+
+        {
+            let root = Rc::get_mut(&mut tree.root).unwrap();
+            root.expand_selectively(0, 0.0).unwrap();
+        }
+
+        let original_game = tree.root.game.clone();
+        let original_action = tree.root.actions[0].clone();
+
+        assert_eq!(Rc::strong_count(&tree.root), 1);
+
+        println!("{:?}", tree);
+        let (game, action) = tree.trim_root(0).unwrap();
+
+        assert_eq!(game, original_game);
+        assert_eq!(action, original_action);
+        println!("{:?}", tree);
+    }
+
+    #[test]
+    fn mcts_works_simple_game() {
+        let mut tree = MCTSTree::<SimpleGame>::default();
+        let actor = DummyActor{};
+        while !tree.root_is_terminal() {
+            let result = tree.get_policy_and_update::<DummyActor>(&actor);
+            let (game, action, posterior) = result.unwrap();
+            // println!("{}", game.board);
+            // println!("{action}");
         }
     }
 }
