@@ -10,14 +10,36 @@ use bitflags::{bitflags};
 use arraydeque::{ArrayDeque, Wrapping};
 use bincode;
 
+const SIMPLE_GAME_TURN_LIM: u8 = 100;
+
 #[derive(Debug, Copy, Clone)]
-pub enum Side { Att, Def }
+pub enum Side {
+    Att,
+    Def,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Victor {
+    Att,
+    Def,
+    Draw
+}
 
 impl Display for Side {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self{
             Side::Att => write!(f, "Attacker"),
             Side::Def => write!(f, "Defender"),
+        }
+    }
+}
+
+impl Display for Victor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self{
+            Victor::Att => write!(f, "Attacker"),
+            Victor::Def => write!(f, "Defender"),
+            Victor::Draw => write!(f, "draw"),
         }
     }
 }
@@ -44,6 +66,7 @@ pub enum ReasonForTermination {
     ViolatedRepetition(Side),
     NoMoveLeft(Side),
     NoLegalMoveLeft(Side),
+    MaxTurnReached,
 }
 
 impl Display for ReasonForTermination {
@@ -56,6 +79,7 @@ impl Display for ReasonForTermination {
             Self::ViolatedRepetition(side) => write!(f, "{side} violated the repetition rule"),
             Self::NoMoveLeft(side) => write!(f, "{side} has no move left"),
             Self::NoLegalMoveLeft(side) => write!(f, "{side} has no legal move left"),
+            Self::MaxTurnReached => write!(f, "maximum turn count was reached"),
         }
     }
 }
@@ -74,6 +98,7 @@ bitflags! {
         const TURN_ATT =  1 << 0;
         const TERMINATED = 1 << 1;
         const ATTACKER_VICTORY = 1 << 2;
+        const Draw = 1 << 3;
     }
 }
 
@@ -121,18 +146,22 @@ impl GameState {
     pub fn incre_turn_count(&self) -> Self {
         Self((self.0 + 1) << 8)
     }
-    pub fn get_victor(&self) -> Side {
+    pub fn get_victor(&self) -> Victor {
         debug_assert!(!self.is_ongoing());
-        if self.contains(Self::ATTACKER_VICTORY) {
-            Side::Att
+        if self.contains(Self::Draw) {
+            Victor::Draw
+        }
+        else if self.contains(Self::ATTACKER_VICTORY) {
+            Victor::Att
         } else {
-            Side::Def
+            Victor::Def
         }
     }
-    pub fn set_victor(&mut self, side: Side) {
-        match side {
-            Side::Att => self.insert(Self::ATTACKER_VICTORY),
-            Side::Def => self.remove(Self::ATTACKER_VICTORY),
+    pub fn set_victor(&mut self, victor: Victor) {
+        match victor {
+            Victor::Att => self.insert(Self::ATTACKER_VICTORY),
+            Victor::Def => self.remove(Self::ATTACKER_VICTORY),
+            Victor::Draw => self.insert(Self::Draw),
         }
     }
 }
@@ -273,11 +302,11 @@ pub trait GameLogic: Sized + Default + Clone + std::fmt::Debug{
                 self.get_state_mut().change_side_mut();
                 if king_capt.is_nonzero(){
                     self.get_state_mut().game_over_mut();
-                    self.get_state_mut().set_victor(Side::Att);
+                    self.get_state_mut().set_victor(Victor::Att);
                 }
                 if self.get_board().def_is_encircled() {
                     self.get_state_mut().game_over_mut();
-                    self.get_state_mut().set_victor(Side::Att);
+                    self.get_state_mut().set_victor(Victor::Att);
                 }
                 self.get_state_mut().incre_turn_count_mut();
 
@@ -302,12 +331,12 @@ pub trait GameLogic: Sized + Default + Clone + std::fmt::Debug{
                 if !self.get_board().bit_att.is_nonzero()
                 {
                     self.get_state_mut().game_over();
-                    self.get_state_mut().set_victor(Side::Def);
+                    self.get_state_mut().set_victor(Victor::Def);
                 }
                 if (self.get_board().bit_king & <Self::B as BitBoard>::CORNERS).is_nonzero()
                 {
                     self.get_state_mut().game_over();
-                    self.get_state_mut().set_victor(Side::Def);
+                    self.get_state_mut().set_victor(Victor::Def);
                 } 
 
                 self.get_state_mut().incre_turn_count_mut();
@@ -705,11 +734,11 @@ impl GameLogic for Game{
                 self.state.change_side_mut();
                 if king_capt.is_nonzero(){
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                 }
                 if self.board.def_is_encircled() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                 }
                 self.state.incre_turn_count_mut();
 
@@ -759,12 +788,12 @@ impl GameLogic for Game{
                 if !self.board.bit_att.is_nonzero()
                 {
                     self.state.game_over();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                 }
                 if (self.board.bit_king & BoardEleven::CORNERS).is_nonzero()
                 {
                     self.state.game_over();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                 } 
 
                 self.state.incre_turn_count_mut();
@@ -858,12 +887,12 @@ impl GameLogic for Game{
             Side::Att => {
                 if !self.board.bit_king.is_nonzero() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                     opt = Some(KingCaptured);
                 }
                 if self.board.def_is_encircled() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                     opt = Some(DefEncircled);
                 }
                 let mut def_possible_moves = self.board.generate_actions_for_defsoldiers();
@@ -871,7 +900,7 @@ impl GameLogic for Game{
 
                 if def_possible_moves.is_empty() && king_possible_moves.is_empty(){
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                     opt = Some(NoMoveLeft(Side::Def));
 
                 } else if get_rep_counter_for_oldest(self.repetition_counter) == 2 {
@@ -884,7 +913,7 @@ impl GameLogic for Game{
                     );
                     if no_legal_move_for_defsol && no_legal_move_for_king {
                         self.state.game_over_mut();
-                        self.state.set_victor(Side::Att);
+                        self.state.set_victor(Victor::Att);
                         opt = Some(NoLegalMoveLeft(Side::Def));
                     }
                 }
@@ -899,13 +928,13 @@ impl GameLogic for Game{
             Side::Def => {
                 if !self.board.bit_att.is_nonzero() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                     opt = Some(NoAttSoldier);
                 }
                 let att_possible_moves = self.board.generate_actions_for_attsoldiers();
                 if att_possible_moves.is_empty() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                     opt = Some(NoMoveLeft(Side::Att));
                 } else if get_rep_counter_for_oldest(self.repetition_counter) == 2 {
                     let no_legal_move_for_att = att_possible_moves.iter().all(|action|
@@ -913,13 +942,13 @@ impl GameLogic for Game{
                     );
                     if no_legal_move_for_att {
                         self.state.game_over_mut();
-                        self.state.set_victor(Side::Def);
+                        self.state.set_victor(Victor::Def);
                         opt = Some(NoLegalMoveLeft(Side::Att));
                     }
                 }
                 if (self.board.bit_king & BoardEleven::CORNERS).is_nonzero() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                     opt = Some(KingEscaped)
                 }
                 if pass_next_moves {
@@ -941,12 +970,12 @@ impl GameLogic for Game{
             match side {
                 Side::Att => {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                     Some(ViolatedRepetition(Side::Att))
                 },
                 Side::Def => {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                     Some(ViolatedRepetition(Side::Def))
                 }
             }
@@ -1251,14 +1280,17 @@ impl GameLogic for SimpleGame {
                 new_board.bit_def ^= def_capt;
                 new_board.bit_king ^= king_capt;
                 let mut new_state = self.state;
+
                 new_state.change_side_mut();
-                if king_capt.is_nonzero(){
-                    new_state.game_over_mut();
-                }
-                if new_board.def_is_encircled() {
-                    new_state.game_over_mut();
-                }
                 new_state.incre_turn_count_mut();
+
+                if king_capt.is_nonzero() || new_board.def_is_encircled() {
+                    new_state.game_over_mut();
+                    new_state.set_victor(Victor::Att);
+                } else if new_state.get_turn_count() > SIMPLE_GAME_TURN_LIM {
+                    new_state.game_over_mut();
+                    new_state.set_victor(Victor::Draw);
+                }
 
                 Self { board: new_board, state: new_state }
                 
@@ -1272,25 +1304,28 @@ impl GameLogic for SimpleGame {
                     PieceType::King => self.board.king_force_move(action),
                     PieceType::AttSoldier => panic!("???"),
                 };
+
                 let att_capt = self.board.att_capture(action);
                 new_board.bit_att ^= att_capt;
                 let mut new_state = self.state;
-                new_state.change_side_mut();
-                if !new_board.bit_att.is_nonzero()
-                {
-                    new_state.game_over();
-                }
-                if (new_board.bit_king & BoardSeven::CORNERS).is_nonzero()
-                {
-                    new_state.game_over();
-                } 
 
+                new_state.change_side_mut();
                 new_state.incre_turn_count_mut();
+
+                if !new_board.bit_att.is_nonzero() || (new_board.bit_king & BoardSeven::CORNERS).is_nonzero()
+                {
+                    new_state.game_over_mut();
+                    new_state.set_victor(Victor::Def);
+                } else if new_state.get_turn_count() > SIMPLE_GAME_TURN_LIM {
+                    new_state.game_over_mut();
+                    new_state.set_victor(Victor::Draw);
+                }
 
                 Self {board: new_board, state: new_state }
             },
         }
     }
+
     fn update_victory(&mut self, side: Side, pass_next_moves: bool) -> (Option<ReasonForTermination>, Option<Vec<<Self::B as BitBoard>::Movement>>) {
         use ReasonForTermination::*;
 
@@ -1299,12 +1334,12 @@ impl GameLogic for SimpleGame {
             Side::Att => {
                 if !self.board.bit_king.is_nonzero() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                     opt = Some(KingCaptured);
                 }
                 if self.board.def_is_encircled() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                     opt = Some(DefEncircled);
                 }
                 let mut def_possible_moves = self.board.generate_actions_for_defsoldiers();
@@ -1312,9 +1347,17 @@ impl GameLogic for SimpleGame {
 
                 if def_possible_moves.is_empty() && king_possible_moves.is_empty() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Att);
+                    self.state.set_victor(Victor::Att);
                     opt = Some(NoMoveLeft(Side::Def));
                 } 
+
+                // If the maximum turn count is reached and attacker couldn't finish the game, we have draw
+                if opt.is_none() && self.state.get_turn_count() >= SIMPLE_GAME_TURN_LIM {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Victor::Draw);
+                    opt = Some(MaxTurnReached);
+                }
+
                 if pass_next_moves {
                     def_possible_moves.append(&mut king_possible_moves);
                     (opt, Some(def_possible_moves))
@@ -1325,20 +1368,28 @@ impl GameLogic for SimpleGame {
             Side::Def => {
                 if !self.board.bit_att.is_nonzero() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                     opt = Some(NoAttSoldier);
                 }
                 let att_possible_moves = self.board.generate_actions_for_attsoldiers();
                 if att_possible_moves.is_empty() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                     opt = Some(NoMoveLeft(Side::Att));
                 }
                 if (self.board.bit_king & BoardSeven::CORNERS).is_nonzero() {
                     self.state.game_over_mut();
-                    self.state.set_victor(Side::Def);
+                    self.state.set_victor(Victor::Def);
                     opt = Some(KingEscaped)
                 }
+
+                // if the maximum turn count is reached and defender couldn't finish the game, we have draw
+                if opt.is_none() && self.state.get_turn_count() >= SIMPLE_GAME_TURN_LIM {
+                    self.state.game_over_mut();
+                    self.state.set_victor(Victor::Draw);
+                    opt = Some(MaxTurnReached);
+                }
+
                 if pass_next_moves {
                     (opt, Some(att_possible_moves))
                 } else {
@@ -1393,21 +1444,18 @@ impl GameLogic for SimpleGame {
             state: self.state,
         };
         
-        // Check for game termination
-        let postfix 
-        = if let Some(r) = new_game.update_if_lost(side) 
-        { 
-            (Some(r), None) 
-        } else if let (Some(rr), v) = new_game.update_victory(side, pass_next_moves) 
-        {
-            (Some(rr), v)
-        } else {
-            (None, None)
-        };
-
         new_game.forward_turn();
 
-        Ok((new_game, postfix.0, postfix.1))
+        if let Some(reason) = new_game.update_if_lost(side) {
+            return Ok((new_game, Some(reason), None));
+        } else {
+            let (r, v) = new_game.update_victory(side, pass_next_moves);
+            if r.is_none() {
+                return Ok((new_game, None, v));
+            } else {
+                return Ok((new_game, Some(r.unwrap()), v));
+            }
+        }
     }
 }
 

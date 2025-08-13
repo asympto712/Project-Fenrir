@@ -336,7 +336,7 @@ fn draw(
             *internal_counter += 1;
             if *internal_counter > pad as u8 - 1{
                 writeln!(f)?;
-            } else if *internal_counter >= pad as u8 - 2 {
+            } else if *internal_counter >= 10 {
                 write!(f, "\n{internal_counter} ")?;
             } else {
                 write!(f, "\n{internal_counter}  ")?;
