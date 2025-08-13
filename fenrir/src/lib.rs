@@ -29,6 +29,7 @@ pub mod statistics;
 pub mod utils;
 pub mod schedule;
 pub mod run;
+pub mod duel;
 
 use std::fs;
 use toml;

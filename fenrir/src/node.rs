@@ -1,4 +1,5 @@
 use crate::agent::{MCTSConfig, MCTSTree, Oracle, NewActor};
+use crate::duel::duel;
 use crate::model::{self, ModelConfig};
 use crate::model::PVModel;
 use crate::replay_buffer::{Episode, BoardData, GameSPR, ReplayBuffer, SimpleGameSPR, Sampler};
@@ -24,13 +25,14 @@ use mpi::environment::Universe;
 use mpi::Rank;
 use mpi::{point_to_point::*, Tag};
 use mpi::topology::SimpleCommunicator;
-use mpi::traits::Communicator;
+use mpi::traits::{Communicator, CommunicatorCollectives, Group};
 use mpi::MpiError;
 use mpi::datatype::{DynBufferMut, Equivalence};
 
 use color_eyre::eyre::{eyre, OptionExt, Result};
 use rand::prelude::*;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::BroadcastContext;
 use rv::traits::Mode;
 use tch::nn::ModuleT;
 use tch::nn::VarStore;
@@ -38,18 +40,21 @@ use tch::vision::image::load;
 use tch::{data, Device, Kind};
 use chrono::{Utc, Local};
 
+use std::default;
 use std::ffi::OsString;
 use std::fs::File;
 use std::iter::FlatMap;
 use std::marker::PhantomData;
+use std::ops::AddAssign;
 use std::os::raw::c_int;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{bounded, unbounded};
+use crossbeam::channel::{bounded, unbounded, SendError, TryRecvError, TrySendError};
 use crossbeam::channel::{Sender, Receiver};
 
 pub const TAG_HALT: Tag = 100;
@@ -58,16 +63,21 @@ pub const TAG_MODEL_UPDATE: Tag = 102;
 pub const TAG_REPLAY_SEND: Tag = 103;
 
 // TainNode-related constants
-pub const SUB_RB_CAP: usize = 10000;
-pub const RB_MIN_LEN: usize = 1000; // minimum length of the replay buffer to start the training
-pub const N_STEP_PER_CYCLE: usize = 100; // number of training steps per cycle (until the next model update)
+pub const RB_MIN_LEN: usize = 2000; // minimum length of the replay buffer to start the training
+/* when you change the replay buffer length in the config, make sure to reconsider this value too! 
+For example, if the replay buffer length is 1000 and this value is 2000, the training never starts!!  */
+
 pub const SYNC_BN_STATS_EVERY: usize = 10; // How often to synchronize the stats of Batch Norm layers during training
-pub const DATA_BUF_CAP: usize = 40000;
-pub const EP_BUF_CAP: usize = 10000;
-pub const HE_BUF_CAP: usize = 100000; /* capacity of buffer to keep the one episode of data inside TrainNode. 
+pub const DATA_BUF_CAP: usize = 60000;
+pub const EP_BUF_CAP: usize = 2000;
+pub const HE_BUF_CAP: usize = 60000; /* capacity of buffer to keep the one episode of data inside TrainNode. 
 It should be roughly (Maximum length of the game) * (Number of bytes it takes to encode one play data) */
 
-pub const N_DUEL: usize = 50; // How many times do the champion and the challenger play to calculate the win% ?
+
+/* memo: About the termination process. When the test node detects timeout and send Halt Tag to other nodes, 
+nodes might still be in the middle of a computing process or, even worse, sending operations. If one node terminates while other nodes are trying or 
+is about to try to send some data to it, that sending operation will not finish. In order to prevent that, we need some kind of synchronization between nodes
+to ensure that all processes can finish. */
 
 // communication flags to use internally inside each Node
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,7 +181,7 @@ impl<P: PVModel + Send, D: BoardData> Node<LockedShelf<P>> for SelfPlayNode<P, D
         let locked_shelf = LockedShelf::convert_from_shelf(shelf);
 
         // preallocate buffer
-        let buffer: Vec<u8> = Vec::with_capacity(2 * capacity);
+        let buffer: Vec<u8> = vec![0; 2 * capacity];
         print_now(&format!("self node at rank {} has been initialized", Self::world().rank()));
         Self{
             shelf: locked_shelf,
@@ -188,9 +198,10 @@ TBoard<D::G>: ModelInput<D::G>,
 TAction<<D::G as GameLogic>::B>: ActionTensor,
 TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
 {
-    fn update_model_safely(&mut self, buf: Arc<Mutex<Vec<u8>>>) -> Result<()> {
-        let mut unlocked = buf.lock().map_err(|_| eyre!("Could not acquire lock"))?;
-        let mut cursor = Cursor::new(unlocked.as_mut_slice());
+    fn update_model_safely(&mut self, count: usize) -> Result<()> {
+
+        // let mut unlocked = buf.lock().map_err(|_| eyre!("Could not acquire lock"))?;
+        let mut cursor = Cursor::new(&mut self.buffer[..count]);
         let group = self.shelf.get_group_mut(1).ok_or_eyre("Could not get the group")?;
         for (_, mutex_vs) in group.iter_mut() {
             cursor.set_position(0);
@@ -203,30 +214,34 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
     pub fn run(&mut self, mpi_config: &MpiConfig) {
 
         let mut run: bool = true;
-        let mut update_flag = false;
 
-        let buffer = std::mem::take(&mut self.buffer);
-        let buffer = Arc::new(Mutex::new(buffer));
+        let mut game_count: u64 = 0;
 
-        let mut msg_opt: Option<Message> = None;
+        // let buffer = std::mem::take(&mut self.buffer);
+        // let buffer = Arc::new(Mutex::new(buffer));
+
+        let mut msg_opt: Option<(Message, usize)> = None; // msg and its size (in bytes) to pass to the model update process
 
         print_now(&format!("self play node at rank {} has started running!", Self::world().rank()));
 
         while run {
 
             std::thread::scope(|s| {
-                let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut self.shelf, self.config.fenrir_config.inference_bs);
+
+                let arc_game_count = Arc::new(AtomicU64::new(game_count));
+
+                let (manager, mut request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut self.shelf, self.config.fenrir_config.inference_bs);
                 assert_eq!(request_senders.len(), 1);
-                let mut iter = request_senders.into_iter().take(1);
+                let request_sender = request_senders.remove(0);
                 // It is imperative that this gets dropped in order for the manager thread to stop
-                let request_sender = Arc::new(iter.next().unwrap());
+                let request_sender = Arc::new(request_sender);
 
                 // Get the (recommended) number of threads
                 let thread_count = std::thread::available_parallelism().unwrap().get();
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_count).build().unwrap();
 
                 // Channel for halting messages for threads in the pool
-                let (tx, rx) = bounded::<bool>(1);
+                let (tx, rx) = bounded::<u8>(1);
                 let rx = Arc::new(rx);
 
                 // manager is responsible for accepting and managing inference requests from any worker thread.
@@ -242,11 +257,12 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                     let request_sender_cloned = Arc::clone(&request_sender);
                     let rank_trainer = mpi_config.train.clone();
                     let mcts_config = self.config.mcts_config.clone();
+                    let arc_game_count_clone = Arc::clone(&arc_game_count);
 
                     move |_| {
 
-                        let rx_cloned = rx_cloned.clone();
-                        let request_sender_cloned = request_sender_cloned.clone();
+                        let rx_cloned = Arc::clone(&rx_cloned);
+                        let request_sender_cloned = Arc::clone(&request_sender_cloned);
 
                         // keep using the same buffer for send operation
                         let mut buf: Vec<u8> = Vec::new();
@@ -261,7 +277,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                             let (
                                 mut tree,
                                 mut actor
-                            ) = setup_mcts::<D::G>(&mcts_config, &request_sender_cloned);
+                            ) = setup_mcts::<D::G>(&mcts_config, request_sender_cloned.clone());
 
                             let mut episode: Episode<D>= Episode::<D>::new();
 
@@ -279,20 +295,52 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                                 Victor::Draw => episode.give_reward(0i64),
                             };
 
-                            episode.save(&mut buf);
-                            // This requires MultiThread support from the MPI, so make sure to initialize MPI with Threading::Multiple
-                            SimpleCommunicator::world().process_at_rank(rank_trainer).send_with_tag(&buf, TAG_REPLAY_SEND);
+                            let _ = arc_game_count_clone.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
 
-                            #[cfg(feature = "verbose_lvl1")]
+                            episode.save(&mut buf);
+
+                            // try catching termination signal here again because send operation is blocking,
+                            // and I suspect it blocks even if the target is already terminated.
+                            if let Ok(_) = rx_cloned.try_recv() {
+                                drop(request_sender_cloned); // (strong count of request_sender) -= 1
+                                break;
+                            }
+
+                            mpi::request::scope(|scope| {
+                                let req = Self::world().process_at_rank(rank_trainer).immediate_send_with_tag(scope, &buf, TAG_REPLAY_SEND);
+                                match req.test() {
+                                    Ok(_) => (),
+                                    Err(rreq) => {
+                                        std::thread::sleep(Duration::from_secs(10));
+                                        if let Err(rrreq) = rreq.test() {
+                                            print_now("Could not send episode from self play node, cancelling send operation..");
+                                            rrreq.cancel();
+                                            rrreq.wait();
+                                            print_now("Cancellation complete");
+                                        }
+                                    }
+                                }
+                            });
+                            // // This requires MultiThread support from the MPI, so make sure to initialize MPI with Threading::Multiple
+                            // SimpleCommunicator::world().process_at_rank(rank_trainer).send_with_tag(&buf, TAG_REPLAY_SEND);
+
+                            #[cfg(feature = "verbose_lvl2")]
                             print_now("an episode was sent from self play node");
 
                             buf.clear();
 
                         }
+
+
+                        #[cfg(feature = "verbose_lvl1")]
+                        println!("self play thread finished");
+
                     }   
+
                 });
 
-                drop(rx);
+                let total_games = Arc::into_inner(arc_game_count).unwrap().load(std::sync::atomic::Ordering::Relaxed);
+                game_count = total_games;
                 
                 loop {
                     let opt = Self::world().any_process().immediate_matched_probe();
@@ -304,18 +352,20 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                             match status.tag() {
                                 TAG_MODEL_UPDATE => {
                                     print_now(&format!("rank {} received model update message from rank {}", Self::world().rank(), status.source_rank()));
-                                    update_flag = true;
-                                    msg_opt = Some(msg);
+                                    let size = status.count(<u8 as Equivalence>::equivalent_datatype()) as usize;
+                                    msg_opt = Some((msg, size));
                                     break;
                                 },
-                                TAG_HALT => {
+                                TAG_HALT => { 
+
+                                /*Received halt tag from test node. that means there is no more incoming comm to this rank,
+                                only there might be (upcoming) sending operation FROM this node (to the train node)*/
 
                                     print_now(&format!("self play node at rank {} received halt message", Self::world().rank()));
                                     run = false;
                                     // HALT messages send empty array [u8;0], receive into empty array
-                                    let mut empty_data: [u8; 0] = [];
-                                    let mut buf = DynBufferMut::new(&mut empty_data);
-                                    msg.matched_receive_into(&mut buf);
+                                    let mut empty_data: [u8; 4] = [0; 4];
+                                    msg.matched_receive_into(&mut empty_data);
                                     break;
                                 }
                                 _ => { panic!("unexpected tag")}
@@ -324,32 +374,72 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                     };
                 }
 
+                // dbg!(Arc::strong_count(&request_sender));
                 drop(request_sender);
                 // If the main thread reaches here, that means it received a communication,
                 // so we must finish the current self-play to prepare for the model update
+                let count = Arc::strong_count(&rx);
+                drop(rx);
+                // dbg!(count);
                 loop {
-                    if let Err(_) = tx.send(true) {
+                    if let Err(e) = tx.send(1) {
+                        // dbg!(e);
                         break;
                     }
                 }
+
                 // After the loop completes, all the request sender clones should be dropped..
                 manager_handler.join().unwrap();
+                #[cfg(feature = "verbose_lvl1")]
+                print_now("inference manager was shut down correctly");
+
+                print_now(&format!("At rank {}, total of {} games were played so far", Self::world().rank(), game_count));
             });
 
-            if update_flag {
-                let tmp = Arc::clone(&buffer);
-                let mut unlocked_buffer = tmp.lock().unwrap();
-                unlocked_buffer.clear();
-                let mut buf = DynBufferMut::new(&mut unlocked_buffer);
-                let msg = std::mem::take(&mut msg_opt);
-                let _ = msg.unwrap().matched_receive_into(&mut buf);
-                drop(unlocked_buffer);
-                self.update_model_safely(tmp);
+
+            if let Some((msg, size)) = msg_opt {
+                // let tmp = Arc::clone(&buffer);
+                // let mut unlocked_buffer = tmp.lock().unwrap();
+                // unlocked_buffer.clear();
+                // let mut buf = DynBufferMut::new(&mut unlocked_buffer);
+                // let msg = std::mem::take(&mut msg_opt);
+
+                if size > self.buffer.len() {
+                    print_now(
+                        &format!("msg size{} exceeding that of buffer{} detected at rank {}, adjusting the buffer length..",
+                        size,
+                        self.buffer().len(),
+                        Self::world().rank()
+                    ));
+                    self.buffer.resize(size, 0);
+                }
+
+                let status = msg.matched_receive_into(&mut self.buffer);
+                let count = status.count(<u8 as Equivalence>::equivalent_datatype()) as usize;
+                // drop(unlocked_buffer);
+                self.update_model_safely(count);
 
                 print_now("model update completed");
+                msg_opt = None;
             }
-            update_flag = false;
+
         }
+
+        /* synchronize barrier only amongst self-play nodes */
+        let world = Self::world();
+        let group = world.group();
+        let self_play_group = group.include(&mpi_config.self_play);
+        let sub_comm = world.split_by_subgroup(&self_play_group).unwrap();
+        sub_comm.barrier();
+        
+        /* self node has finished its run, so now it can safely send halt tag to train node. 
+        But only one of the self play nodes should send this message */
+        if Self::world().rank() == mpi_config.self_play[0] {
+            Self::world().process_at_rank(mpi_config.train).send_with_tag::<[u8;0]>(&[], TAG_HALT);
+        }
+
+        print_now(&format!("At rank {}, total of {} games were played", Self::world().rank(), game_count));
+        print_now(&format!("Self play node at rank {} has finished all of its run process", Self::world().rank()));
     }
 }
 
@@ -383,7 +473,7 @@ impl<P: PVModel + Send, D: BoardData + Encode> Node<ModuleShelf<P, P>> for Train
         let shelf = ModuleShelf::module_shelf(table, name_lookup);
 
         // preallocate buffer
-        let buffer: Vec<u8> = Vec::with_capacity(2 * capacity);
+        let buffer: Vec<u8> = vec![0; 2 * capacity];
 
         let trainer: NewTrainer<P> = NewTrainer::new(
             shelf,
@@ -421,7 +511,7 @@ impl<P: PVModel + Send, D: BoardData + Encode> Node<ModuleShelf<P, P>> for Train
 impl<P: PVModel + Send, D: BoardData + Encode> TrainNode<P, D>
 where 
 ReplayBuffer<D>: Sampler{
-    pub fn run(&mut self, mpi_config: &MpiConfig) {
+    pub fn run<A: AsRef<Path> + Send + Sync>(&mut self, mpi_config: &MpiConfig, data_store_dir: A) {
 
         use CommFlag::*;
 
@@ -434,7 +524,7 @@ ReplayBuffer<D>: Sampler{
         };
         let mut episode_buffer: Mutex<Episode<D>> = Mutex::new(episode_buffer);
         // helper buffer to decode byte data into episode_buffer
-        let mut helper_buffer: Vec<u8> = Vec::with_capacity(HE_BUF_CAP);
+        let mut helper_buffer: Vec<u8> = vec![0; HE_BUF_CAP];
 
         print_now(&format!("train node at rank {} has started running!", Self::world().rank()));
 
@@ -443,8 +533,10 @@ ReplayBuffer<D>: Sampler{
         std::thread::scope(|s| {
 
             // thread to listens for communication
-            s.spawn(|| {
+            let comm_handle = s.spawn(|| {
+
                 loop {
+
                     let opt = Self::world().any_process().immediate_matched_probe();
                     match opt {
                         None => {
@@ -454,17 +546,31 @@ ReplayBuffer<D>: Sampler{
                             match status.tag() {
                                 TAG_REPLAY_SEND => {
 
-                                    #[cfg(feature = "verbose_lvl1")]
+                                    #[cfg(feature = "verbose_lvl2")]
                                     {
                                         let byte = <u8 as Equivalence>::equivalent_datatype();
                                         println!("byte count in one episode: {}", status.count(byte));
                                     }
 
                                     let mut unlocked_ep_buf = episode_buffer.lock().unwrap();
-                                    let s = msg.matched_receive_into(&mut data_buffer);
-                                    let count = status.count(<u8 as Equivalence>::equivalent_datatype());
-                                    let cursor = Cursor::new(&data_buffer[..count as usize]);
+                                    let size = status.count(<u8 as Equivalence>::equivalent_datatype()) as usize;
+                                    if size > data_buffer.len() {
+
+                                        print_now(
+                                            &format!("episode size{} exceeding that of buffer{} detected at rank {}, adjusting the buffer length..",
+                                            size,
+                                            data_buffer.len(),
+                                            Self::world().rank()
+                                        ));
+                                        data_buffer.resize(size, 0);
+
+                                    }
+                                    msg.matched_receive_into(&mut data_buffer);
+                                    let cursor = Cursor::new(&data_buffer[..size]);
                                     unlocked_ep_buf.extend_from_reader(cursor, &mut helper_buffer);
+
+                                    #[cfg(feature = "verbose_lvl2")]
+                                    print_now(&format!("episode buffer length {}/{}", unlocked_ep_buf.len(), EP_BUF_CAP));
 
                                     // If the episode buffer has ample amount of samples to give...
                                     if unlocked_ep_buf.len() > EP_BUF_CAP / 2{
@@ -474,7 +580,7 @@ ReplayBuffer<D>: Sampler{
 
                                     helper_buffer.clear();
                                 },
-                                TAG_MODEL_REQUEST => {
+                                TAG_MODEL_REQUEST => {  // In practice this should not happen
 
                                     let mut dyn_buffer = DynBufferMut::new(&mut data_buffer);
                                     msg.matched_receive_into(&mut dyn_buffer);  //the message should be empty
@@ -483,85 +589,136 @@ ReplayBuffer<D>: Sampler{
 
                                     tx.send(CommFlag::ModelSend(status.source_rank())).unwrap();
                                 },
-                                TAG_HALT => {
+                                TAG_HALT => { /* Received halt tag from self nodes, that means there is no more comm coming from self play nodes.
+                                    Meaning it is safe to terminate once it finishes whatever it is doing right now. */
 
                                     // HALT messages send empty array [u8;0], receive into empty array
-                                    let mut empty_data: [u8; 0] = [];
-                                    let mut buf = DynBufferMut::new(&mut empty_data);
-                                    msg.matched_receive_into(&mut buf);
+                                    let mut empty_data: [u8; 4] = [0; 4];
+                                    msg.matched_receive_into(&mut empty_data);
 
                                     print_now("train node has received the halt tag");
 
                                     tx.send(CommFlag::Terminate).unwrap();
+                                    break;
                                 },
                                 _ => { panic!("Unexpected tag");}
                             }
                         }
                     }
                 }
+                // dbg!();
             });
 
-            s.spawn( || {
 
-                let path = Path::new("./data/loss_record.dat");
+            let train_handle = s.spawn( || {
+
+                std::fs::create_dir_all(&data_store_dir);
+                let mut path: PathBuf = data_store_dir.as_ref().to_path_buf();
+                path = path.join(format!("{}-loss-data", self.config.name));
+                let _ = path.set_extension("dat");
                 let mut file = File::create(path).unwrap();
+                let mut step_count: usize = 0;
 
-                loop {
+                let n_step_per_cycle = self.config.fenrir_config.n_training_step_per_cycle;
+                let test_rank = mpi_config.test;
+
+                let mut run = true;
+                let mut model_send: Option<Rank> = None;
+
+                while run {
 
                     let mut rng = rand::thread_rng();
 
-                    let mut flag_opt: Option<CommFlag> = None;
-                    let mut step_count: usize = 0;
                     if self.replay_buffer.len() < RB_MIN_LEN {  // cannot start training yet
+                        #[cfg(feature = "verbose_lvl1")]
+                        print_now(&format!("cannot start training yet.. Replay Buffer needs to reach {} ({})", RB_MIN_LEN, self.replay_buffer.len()));
+
                         std::thread::sleep(Duration::from_secs(10));
+
                     } else {
 
+                        #[cfg(feature = "verbose_lvl1")]
                         print_now(&format!("training: current step {}", self.trainer.step_count));
+
                         let new_lr = (&self.config.fenrir_config.learning_rate_schedule)(self.trainer.step_count);
                         self.trainer.update_lr(new_lr);
 
-                        for _ in 0..N_STEP_PER_CYCLE {
-                            if step_count >= N_STEP_PER_CYCLE{
-                                flag_opt = Some(ModelSend(mpi_config.test));
+                        for _ in 0..n_step_per_cycle {
+                            if step_count >= n_step_per_cycle {
+
+                                model_send = Some(test_rank);
+                                step_count = 0;  // reset step count
                                 break;
                             }
-                            if let Ok(flag) = rx.try_recv() {
-                                flag_opt = Some(flag);
-                                break;
-                            }
+
                             let sync_bn_stats =
                                 if step_count % SYNC_BN_STATS_EVERY == 0 { true} else {false};
                             self.trainer.step(&self.replay_buffer, sync_bn_stats, &mut rng).unwrap();
                             step_count += 1;
                         }
-                        self.trainer.write_loss_record(&mut file);
+                        self.trainer.flush_loss_record(&mut file);
                     }
 
-                    if let Some(flag) = flag_opt {
-                        match flag {
-                            Terminate => {
-                                self.trainer.write_loss_record(&mut file);
-                                break;
-                            },
-                            RbUpdate => {
-                                let mut unlocked_ep_buf = episode_buffer.lock().unwrap();
-                                self.replay_buffer.append_from_episode(&mut unlocked_ep_buf);
-                                drop(unlocked_ep_buf);
+                    if let Some(target) = model_send {
+                        // dbg!();
+                        self.send_model(target);
+                        print_now(&format!("train node sent model to rank {}", target));
+                        model_send = None;
+                    }
 
-                                print_now(&format!("updated replay_buffer. Current size: {}/{}", self.replay_buffer.len(), self.replay_buffer.capacity));
-                            },
-                            ModelSend(target) =>  {
-                                self.send_model(target);
-                                print_now(&format!("train node sent model to rank {}", target));
+                    loop {
+                        match rx.try_recv() {
+                            Ok(flag) => {
+                                match flag {
+                                    Terminate => {
+                                        // dbg!();
+                                        self.trainer.write_loss_record(&mut file);
+                                        run = false;
+                                    },
+                                    RbUpdate => {
+
+                                        // dbg!();
+                                        let mut unlocked_ep_buf = episode_buffer.lock().unwrap();
+                                        self.replay_buffer.append_from_episode(&mut unlocked_ep_buf);
+                                        drop(unlocked_ep_buf);
+
+                                        #[cfg(feature = "verbose_lvl1")]
+                                        print_now(&format!("updated replay_buffer. Current size: {}/{}", self.replay_buffer.len(), self.replay_buffer.capacity));
+
+                                    },
+                                    ModelSend(target) =>  {
+                                        // dbg!();
+                                        self.send_model(target);
+                                        print_now(&format!("train node sent model to rank {}", target));
+                                    }
+                                    _ => {
+                                        panic!("unexpected flag");
+                                    }
+                                }
                             }
-                            _ => {
-                                panic!("unexpected flag");
+                            Err(e) => match e {
+                                TryRecvError::Disconnected => {
+                                    // dbg!();
+                                    run = false;
+                                    break;
+                                }
+                                TryRecvError::Empty => {
+                                    // dbg!();
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             });
-        })
+
+            comm_handle.join().unwrap();
+            // dbg!();
+            train_handle.join().unwrap();
+            // dbg!();
+            print_now("train node has been terminated correctly");
+            Self::world().process_at_rank(mpi_config.test).send_with_tag::<[u8;0]>(&[], TAG_HALT);
+        });
 
     }
 }
@@ -603,15 +760,26 @@ impl<P: PVModel + Send, D: BoardData> Node<LockedShelf<P>> for TestNode<P, D> {
                 }
             }
             // ideally at this point available_cuda has the equal number of elements as table[0]
-            dbg!(available_cuda.len());
+            // dbg!(available_cuda.len());
             let mut tmp: Vec<(P, VarStore)> = Vec::new();
-            for d in available_cuda {
-                let vs = VarStore::new(d);
+
+            // In this case store the new model on Cpu
+            if available_cuda.is_empty() {
+                let vs = VarStore::new(Device::Cpu);
                 let module: P  = P::new(&vs.root(), &config.setup_config.module_load_infos[0].config);
                 tmp.push((module, vs));
+            } else {
+
+                for d in available_cuda {
+                    let vs = VarStore::new(d);
+                    let module: P  = P::new(&vs.root(), &config.setup_config.module_load_infos[0].config);
+                    tmp.push((module, vs));
+                }
             }
             table.push(tmp);
             name_lookup.push(OsString::from("challenger"));
+
+            // dbg!(&name_lookup);
         }
 
         let (numel, capacity) = numel_for_model(&table[0][0].1);
@@ -619,7 +787,7 @@ impl<P: PVModel + Send, D: BoardData> Node<LockedShelf<P>> for TestNode<P, D> {
         let locked_shelf = LockedShelf::convert_from_shelf(shelf);
 
         // preallocate buffer
-        let buffer: Vec<u8> = Vec::with_capacity(capacity);
+        let buffer: Vec<u8> = vec![0; 2 * capacity];
 
         println!("test node has been initialized!");
 
@@ -656,12 +824,14 @@ D: BoardData,
 TBoard<D::G>: ModelInput<D::G>,
 TAction<<D::G as GameLogic>::B>: ActionTensor,
 TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
-D: Send + Sync
+D: Send + Sync,
+<<D::G as GameLogic>::B as BitBoard>::Movement: PartialEq,
 {
 
-    fn update_model_safely(&mut self, buf: Arc<Mutex<Vec<u8>>>) -> Result<()> {
+    fn update_model_safely(&mut self, buf: Arc<Mutex<(Vec<u8>, usize)>>) -> Result<()> {
         let mut unlocked = buf.lock().map_err(|_| eyre!("Could not acquire lock"))?;
-        let mut cursor = Cursor::new(unlocked.as_mut_slice());
+        let size = unlocked.1;
+        let mut cursor = Cursor::new(&mut unlocked.0[..size]);
         let group = self.shelf.get_group_mut(1).ok_or_eyre("Could not get the group")?;
         for (_, mutex_vs) in group.iter_mut() {
             cursor.set_position(0);
@@ -671,31 +841,45 @@ D: Send + Sync
         Ok(())
     }
 
-    pub fn run(&mut self, mpi_config: &MpiConfig) {
+    pub fn run<A: AsRef<Path> + Send>(&mut self, mpi_config: &MpiConfig, evaluation_mcts_config: &MCTSConfig, model_store_dir: A) {
 
         let mut update: bool = false;
         let start = Instant::now();
-        let time_limit = Duration::from_secs(3600 * self.config.fenrir_config.run_time_hr);
+        let time_limit = Duration::from_secs_f32(3600.0 * self.config.fenrir_config.run_time_hr);
 
         // Use the same buffer for sending the champion model data
         let send_buf: Vec<u8> = Vec::with_capacity(self.buffer.capacity());
         let buffer = std::mem::replace(&mut self.buffer, vec![]);
-        let rec_buf = Arc::new(Mutex::new(buffer));
+        let module_size: usize = 0;
+        let cha_buf = Arc::new(Mutex::new((buffer, module_size)));
 
         let (tx, rx) = unbounded::<CommFlag>(); 
+        let (finish_tx, finish_rx) = bounded(0);
+        let mpi_config_clone = mpi_config.clone();
 
         print_now(&format!("test node at rank {} has started running!", Self::world().rank()));
 
-        let rec_buf_clone = rec_buf.clone();
+        let cha_buf_clone = cha_buf.clone();
         let run_time = self.config.fenrir_config.run_time_hr;
         let handler = std::thread::spawn(move || {
             loop {
+
                 let duration = start.elapsed();
                 if duration > time_limit {
-                    for i in 0..Self::world().size() {
-                        Self::world().process_at_rank(i).send_with_tag::<[u8;0]>(&[], TAG_HALT);
+
+                    // From the second time onward, rx will have been dropped, so this send will block unless if we handle disconnected error explicitly.
+                    if let Ok(_) = tx.send(CommFlag::Terminate){
+
+                        finish_rx.recv().unwrap(); /* This blocks until the duel ended, and there is no longer a possibility of communication happening 
+                        from test node to self-play node */
+
+                        for i in mpi_config_clone.self_play.iter() {
+                            Self::world().process_at_rank(*i).send_with_tag::<[u8;0]>(&[], TAG_HALT);
+                        }
+                        // dbg!();
+
                     }
-                    tx.send(CommFlag::Terminate);
+
                 } 
                 let opt = Self::world().any_process().immediate_matched_probe();
                 match opt {
@@ -704,29 +888,56 @@ D: Send + Sync
                     },
                     Some((msg, status)) => {
                         match status.tag() {
+                            
+                            // message with the halt tag is the very last message this node will ever receive.
+                            // So it is safe to break out of loop here, as there will be no more messages coming
                             TAG_HALT => {
 
                                 print_now("test node has received the halt tag");
 
-                                tx.send(CommFlag::Terminate);
                                 // HALT messages send empty array [u8;0], receive into empty array
-                                let mut empty_data: [u8; 0] = [];
-                                let mut buffer_mut = DynBufferMut::new(&mut empty_data);
-                                msg.matched_receive_into(&mut buffer_mut);
+                                let mut empty_data: [u8; 4] = [0;4];
+                                msg.matched_receive_into(&mut empty_data);
                                 break;
                             },
                             TAG_MODEL_UPDATE => {
 
                                 print_now("test node has received the model update tag");
 
-                                tx.send(CommFlag::Play);
-                                let mut buf = rec_buf_clone.lock().unwrap();
-                                buf.clear(); /* It is possible that
+                                match tx.try_send(CommFlag::Play){
+                                    Ok(_) => (),
+                                    Err(e) => match e {
+                                        // In this case the termination message was received by the main thread so 
+                                        // this new model will not be tested. We still have to receive the message though.
+                                        TrySendError::Disconnected(_) => {
+                                            print_now("Halting process has started. This new model will not be tested");
+                                        }
+                                        // this is an unbounded channel so this should not happen
+                                        TrySendError::Full(_) => {
+                                            // dbg!();
+                                        }
+                                    }
+                                }
+                                let mut buf = cha_buf_clone.lock().unwrap();
+                                /* It is possible that
                                 TrainNode sends new challengers too often for the TestNode to keep up.
                                 In that case, it only takes the most recent challenger. 
                                 */
-                                let mut buffer_mut = DynBufferMut::new::<u8>(&mut buf);
+                                let size = status.count(<u8 as Equivalence>::equivalent_datatype()) as usize;
+                                if size > buf.0.len() {
+
+                                    print_now(
+                                        &format!("message size{} exceeding that of buffer{} detected at rank {}, adjusting the buffer length..",
+                                        size,
+                                        buf.0.len(),
+                                        Self::world().rank()
+                                    ));
+                                    buf.0.resize(size, 0);
+
+                                }
+                                let mut buffer_mut = DynBufferMut::new::<u8>(&mut buf.0);
                                 msg.matched_receive_into(&mut buffer_mut);
+                                buf.1 = size;
                                 drop(buf);
                             },
                             _ => {panic!("unexpected tag")}
@@ -749,9 +960,10 @@ D: Send + Sync
                 }
             }
             if let Some(CommFlag::Terminate) = pending_messages.last() {
-                let mut path = PathBuf::from("./models");
+                let mut path: PathBuf = model_store_dir.as_ref().to_path_buf();
                 std::fs::create_dir_all(&path);
-                path.join(format!("{}", self.config.name)).set_extension("pv");
+                path = path.join(format!("{}", self.config.name));
+                let _ = path.set_extension("pv");
                 let mut file = File::create(&path).unwrap();
                 self.shelf.write_to_stream(0, &mut file);
 
@@ -764,7 +976,7 @@ D: Send + Sync
 
                 std::thread::scope(|s| {
 
-                    self.update_model_safely(rec_buf.clone()); // Update the challenger from the buffer first
+                    self.update_model_safely(cha_buf.clone()); // Update the challenger from the buffer first
 
                     print_now("test node has accepted a new challenger!");
 
@@ -772,73 +984,27 @@ D: Send + Sync
                         = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut self.shelf, self.config.fenrir_config.inference_bs);
 
                     assert_eq!(request_senders.len(), 2);
+                    
+                    let challenger_rs = request_senders.remove(1);
+                    let champion_rs = request_senders.remove(0);
 
-                    let mut iter = request_senders.into_iter().take(2);
-                    let (champion_rs, challenger_rs) = (Arc::new(iter.next().unwrap()), Arc::new(iter.next().unwrap()));
 
-                    let thread_count = std::thread::available_parallelism().unwrap().get();
-                    let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_count).build().unwrap();
+                    let (win_rate, draw_count) = duel::<P, D>(
+                        manager,
+                        champion_rs,
+                        challenger_rs,
+                        self.config.fenrir_config.n_games_per_tournament,
+                        evaluation_mcts_config
+                    ).unwrap();
 
-                    let (tx, rx) = bounded::<bool>(1);
-                    let rx = Arc::new(rx);
 
-                    let manager_handler = s.spawn(move || {
-                        manager.consume_and_run().unwrap();
-                    });
-
-                    let win_rate = pool.install({
-                        let rx_cloned = Arc::clone(&rx);
-                        let champ_rs_cloned = Arc::clone(&champion_rs);
-                        let chal_rs_cloned = Arc::clone(&challenger_rs);
-                        let mcts_config = self.config.mcts_config.clone();
-                        
-                        move || -> f32 {
-
-                            let champ_rs_cloned = champ_rs_cloned.clone();
-                            let chal_rs_cloned = chal_rs_cloned.clone();
-
-                            let win_count = (0..N_DUEL).into_par_iter().filter(|i| {
-
-                                let (mut tree, champion, challenger) = setup_duel::<D::G>(&mcts_config, &champ_rs_cloned, &chal_rs_cloned);
-
-                                let players = if i % 2 == 0 {
-                                    [champion, challenger] // Att: champion, Def: challenger
-                                } else {
-                                    [challenger, champion] // Att: challenger, Def: champion
-                                };
-                                let mut cycle = players.iter().cycle();
-
-                                while !tree.root_is_terminal() {
-                                    let (game, _action, posterior) = tree.get_policy_and_update::<NewActor>(cycle.next().unwrap()).unwrap();
-                                }
-
-                                let winner = tree.get_winner();
-                                let cond = match winner {
-                                    Victor::Att => {
-                                        if (i % 2 == 0) {false} else {true}
-                                    },
-                                    Victor::Def => {
-                                        if (i % 2 == 0) {true} else {false}
-                                    }
-                                    Victor::Draw => {
-                                        false
-                                    }
-                                };
-                                return cond
-                            }).collect::<Vec<_>>().len();
-
-                            (win_count / N_DUEL) as f32
-                        }
-                    });
+                    // dbg!();
 
                     print_now(&format!("new model test has been completed. win rate against the current best was {}", win_rate));
 
                     if win_rate > self.config.fenrir_config.model_update_threshold {
                         update = true;
                     }
-
-                    drop(champion_rs);
-                    drop(challenger_rs);
 
                 });
 
@@ -848,15 +1014,21 @@ D: Send + Sync
                     }
 
                     print_now(&format!("test node has sent model to self play nodes"));
+                    update = false;
                 }   
             } 
         }
+
+        drop(rx);
+        finish_tx.send(()).unwrap();
+
         handler.join().unwrap();
+        print_now("test node has been terminated correctly");
     }
 
 }
 
-pub fn setup_duel<G: GameLogic>(mcts_config: &MCTSConfig, champion_rs: &Arc<Sender<Request>>, challenger_rs: &Arc<Sender<Request>>)
+pub fn setup_duel<G: GameLogic>(mcts_config: &MCTSConfig, champion_rs: Arc<Sender<Request>>, challenger_rs: Arc<Sender<Request>>)
 -> (MCTSTree<G>, NewActor, NewActor)
 where
 TBoard<G>: ModelInput<G>,
@@ -865,8 +1037,8 @@ TaflBoard<G::B>: std::fmt::Display
 {
     let game = <G as Default>::default();
     let mut mcts_tree = MCTSTree::<G>::generate(game, mcts_config.clone());
-    let champion = NewActor::new(champion_rs.clone());
-    let challenger = NewActor::new(challenger_rs.clone());
+    let champion = NewActor::new(champion_rs);
+    let challenger = NewActor::new(challenger_rs);
     (mcts_tree, champion, challenger)
 
 }

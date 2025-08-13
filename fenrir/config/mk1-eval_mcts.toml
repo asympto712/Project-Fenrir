@@ -1,0 +1,6 @@
+c_puct = 0.3
+n_sim = 800
+dirichlet_alpha = 0.03
+dirichlet_epsilon = 0.25
+temp_schedule_target_policy = "AlphaGoZero"
+temp_schedule_move_selection = "evaluation"

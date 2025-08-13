@@ -281,8 +281,6 @@ impl<D: BoardData> Episode<D> {
         use std::io::SeekFrom;
         let mut pos = reader.seek(SeekFrom::End(0))?;
         let mut episode_n_byte_buf: [u8;8] = [0;8];
-        let mut episode_count = 0;
-        buf.clear();
 
         while reader.stream_position().is_ok() {
             if pos < 8 {
@@ -291,23 +289,27 @@ impl<D: BoardData> Episode<D> {
             pos -= 8;
             reader.seek_relative(-8)?;
             reader.read_exact(&mut episode_n_byte_buf)?;
-            let episode_n_byte: u64 = u64::from_le_bytes(episode_n_byte_buf);
+            let episode_n_byte= u64::from_le_bytes(episode_n_byte_buf) as usize;
 
-            pos -= episode_n_byte;
+            pos -= episode_n_byte as u64;
             reader.seek_relative(-8 - episode_n_byte as i64)?;
 
-            reader.read_exact(buf)?;
+            if episode_n_byte > buf.len() {
+                buf.resize(episode_n_byte, 0);
+            }
+
+            reader.read_exact(&mut buf[..episode_n_byte])?;
 
             let (mut v_spr, u) = bincode::decode_from_slice::<Vec<D>, Configuration<LittleEndian, Fixint>>(
-                &buf[..], 
+                &buf[..episode_n_byte], 
                 REPLAY_BUFFER_ENCODE_CONFIG
             )?;
-            buf.clear();
+
+            assert_eq!(u, episode_n_byte);
             reader.seek_relative(-1 * u as i64)?;
             self.episode.push(EpisodeUnit::Sep);
             self.episode.extend(v_spr.into_iter().map(|spr| EpisodeUnit::SPR(spr)));
 
-            episode_count += 1;
         }
         Ok(())
     }

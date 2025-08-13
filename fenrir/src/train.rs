@@ -477,7 +477,7 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             );
             self.step_count += 1;
 
-            #[cfg(feature = "verbose_lvl1")]
+            #[cfg(feature = "verbose_lvl2")]
             println!("{loss_value}");
 
             self.loss_record.push(loss_value);
@@ -531,6 +531,13 @@ impl<P: PVModel+ Send> NewTrainer<P> {
 
     pub fn write_loss_record<W: Write>(&self, f: &mut W) {
         for loss in self.loss_record() {
+            writeln!(f, "{:.4} {:.4} {:.4}", loss.cross_entropy, loss.mse, loss.total);
+        }
+    }
+
+    pub fn flush_loss_record<W: Write>(&mut self, f: &mut W) {
+        let drain = self.loss_record.drain(..);
+        for loss in drain {
             writeln!(f, "{:.4} {:.4} {:.4}", loss.cross_entropy, loss.mse, loss.total);
         }
     }

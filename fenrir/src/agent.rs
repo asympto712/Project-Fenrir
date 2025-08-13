@@ -82,6 +82,12 @@ impl Default for MCTSConfig {
     }
 }
 
+use std::path::Path;
+pub fn load_mcts_config<P: AsRef<Path>>(path: P) -> MCTSConfig {
+    let s = std::fs::read_to_string(path).unwrap();
+    toml::from_str::<MCTSConfig>(&s).unwrap()
+}
+
 pub trait Oracle<G: GameLogic> 
 where 
 TBoard<G>: ModelInput<G>,
@@ -256,8 +262,8 @@ pub fn get_vec_priors<B: BitBoard>(dist: &Tensor, ordered_actions: &Vec<B::Movem
 
 #[derive(Debug)]
 pub struct Node<G: GameLogic> {
-    game: G,
-    actions: Vec<<G::B as BitBoard>::Movement>,
+    pub game: G,
+    pub actions: Vec<<G::B as BitBoard>::Movement>,
     pub edges: Vec<Option<Edge<G>>>,
     pub visit_count: f32,
 }
@@ -620,6 +626,11 @@ TaflBoard<G::B>: std::fmt::Display{
         self.root.game.get_state().get_victor()
     }
 
+    /// Get the current game state
+    pub fn get_current_game(&self) -> &G {
+        &self.root.game
+    }
+
     // traverse the tree from root and find the leaf node, and returns the edge that leads to the (potentially) new node
     fn traverse(&self) -> Option<(&Node<G>, Vec<usize>)> {
         let mut cur_node = &*self.root;
@@ -890,6 +901,32 @@ TaflBoard<G::B>: std::fmt::Display{
         self.root = next_root;
 
         Ok((cur_game, chosen_action))
+    }
+
+    /// Apply an external action to advance the tree (for opponent moves)
+    /// This finds the action in the current node's actions and advances to that child
+    /// If the action hasn't been explored, it creates a new node
+    pub fn apply_external_action(&mut self, action: &<G::B as BitBoard>::Movement) -> Result<()> 
+    where 
+        <G::B as BitBoard>::Movement: PartialEq 
+    {
+        // Find the action index in the current root's actions
+        let action_id = self.root.actions.iter()
+            .position(|a| a == action)
+            .ok_or_eyre("External action not found in current node's legal actions")?;
+
+        // Check if this edge has been explored
+        if self.root.edges[action_id].is_none() {
+            // Create the edge with a dummy prior (since we're not using MCTS to choose this)
+            let root_mut = Rc::get_mut(&mut self.root)
+                .ok_or_eyre("Cannot get mutable reference to root when applying external action")?;
+            root_mut.expand_selectively(action_id, 0.0)?;
+        }
+
+        // Now advance to the child node
+        self.trim_root(action_id)?;
+        
+        Ok(())
     }
 
     pub fn search_expand_backup<O: Oracle<G>>(&mut self, actor: &O) -> Result<()> {

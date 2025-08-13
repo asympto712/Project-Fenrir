@@ -1,3 +1,4 @@
+use crate::agent::MCTSConfig;
 use crate::model::PVModel;
 use crate::node::{Node, SelfPlayNode, TrainNode, TestNode};
 use crate::replay_buffer::{BoardData, ReplayBuffer, Sampler};
@@ -7,6 +8,7 @@ use crate::{CompConfig, MpiConfig};
 use bincode::Encode;
 use game::board::TaflBoard;
 use game::game::GameLogic;
+use bitboard::BitBoard;
 #[cfg(feature = "mpi")]
 use mpi::environment::Universe;
 #[cfg(feature = "mpi")]
@@ -17,12 +19,21 @@ use mpi::traits::Communicator;
 use mpi::MpiError;
 use mpi::datatype::{DynBufferMut, Equivalence};
 
-pub fn run_cnt<P: PVModel + Send, D: BoardData + Encode> (config: CompConfig, mpi_config: MpiConfig)
+use std::path::Path;
+
+pub fn run_cnt<P: PVModel + Send, D: BoardData + Encode>(
+    config: CompConfig,
+    mpi_config: MpiConfig,
+    evaluation_mcts_config: MCTSConfig,
+    model_store_dir: &str,
+    data_store_dir: &str,
+)
 where 
 TBoard<D::G>: ModelInput<D::G>,
 TAction<<D::G as GameLogic>::B>: ActionTensor,
 TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
 D: Send + Sync,
+<<D::G as GameLogic>::B as BitBoard>::Movement: PartialEq,
 ReplayBuffer<D>: Sampler
 {
     let (universe, threading) = mpi::initialize_with_threading(mpi::Threading::Multiple).unwrap();
@@ -32,11 +43,11 @@ ReplayBuffer<D>: Sampler
     if rank == mpi_config.test {
         println!("Hello from rank {}", rank);
         let mut node = TestNode::<P, D>::init(config);
-        node.run(&mpi_config);
+        node.run(&mpi_config, &evaluation_mcts_config, model_store_dir);
     } else if rank == mpi_config.train {
         println!("Hello from rank {}", rank);
         let mut node = TrainNode::<P, D>::init(config);
-        node.run(&mpi_config);
+        node.run(&mpi_config, data_store_dir);
     } else if mpi_config.self_play.contains(&rank) {
         println!("Hello from rank {}", rank);
         let mut node = SelfPlayNode::<P, D>::init(config);

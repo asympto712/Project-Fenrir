@@ -45,7 +45,12 @@ pub fn temp_sch_ms_initialize() -> TemperatureScheduleForMoveSelection {
         }
     }
 
+    const fn evaluation(n_steps: usize) -> Temperature{
+        Temperature::Zero
+    }
+
     hm.insert("AlphaGoZero".to_string(), agz);
+    hm.insert("evaluation".to_string(), evaluation);
 
     hm
 }

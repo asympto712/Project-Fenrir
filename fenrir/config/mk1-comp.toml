@@ -1,0 +1,242 @@
+name = "mk-1"
+
+[fenrir_config]
+use_mpi = true
+inference_bs = 8
+train_bs = 64
+n_training_step_per_cycle = 1000
+n_self_play_games = 25000
+n_games_per_tournament = 100
+model_update_threshold = 0.55
+replay_buffer_capacity = 500000
+run_time_hr = 5
+momentum = 0.9
+learning_rate_schedule = "AlphaGoZero"
+weight_decay = 0.0001
+
+[mcts_config]
+c_puct = 0.3
+n_sim = 800
+dirichlet_alpha = 0.03
+dirichlet_epsilon = 0.25
+temp_schedule_target_policy = "AlphaGoZero"
+temp_schedule_move_selection = "AlphaGoZero"
+
+[model_sync_config]
+
+[model_sync_config.grad]
+type = "Sum"
+
+[setup_config]
+use_mpi = true
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 0
+    [setup_config.module_load_infos.device]
+    type = "Cuda(0)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 0
+    [setup_config.module_load_infos.device]
+    type = "Cuda(1)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 1
+    [setup_config.module_load_infos.device]
+    type = "Cuda(0)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 1
+    [setup_config.module_load_infos.device]
+    type = "Cuda(1)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 1
+    [setup_config.module_load_infos.device]
+    type = "Cuda(2)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 1
+    [setup_config.module_load_infos.device]
+    type = "Cuda(3)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 2
+    [setup_config.module_load_infos.device]
+    type = "Cuda(0)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 2
+    [setup_config.module_load_infos.device]
+    type = "Cuda(1)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 2
+    [setup_config.module_load_infos.device]
+    type = "Cuda(2)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 2
+    [setup_config.module_load_infos.device]
+    type = "Cuda(3)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 3
+    [setup_config.module_load_infos.device]
+    type = "Cuda(0)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 3
+    [setup_config.module_load_infos.device]
+    type = "Cuda(1)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 3
+    [setup_config.module_load_infos.device]
+    type = "Cuda(2)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3
+
+[[setup_config.module_load_infos]]
+path = "mk1-init"
+rank = 3
+    [setup_config.module_load_infos.device]
+    type = "Cuda(3)"
+    
+    [setup_config.module_load_infos.config]
+    policy_out_features = 12
+    board_size = 7
+    value_hidden_layer_unit_count = 256
+    num_convblocks = 10
+    in_features = 5
+    conv_filters = 256
+    kernel_size = 3

@@ -205,6 +205,12 @@ impl PVModel for GeneralPVDualModel {
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
         
+        let xs = match xs.size().len() {
+            3 => &xs.unsqueeze(0),
+            4 => xs,
+            _ => panic!("PVModel only accepts 3-dim or 4-dim tensor"),
+        };
+
         let v = xs.split_with_sizes([self.config.in_features - 1,1], 1);
         let minus_side = v[0].contiguous(); // (BS, 17, 11, 11) for Eleven Board
         let based = minus_side.apply_t(&self.base, train);
@@ -251,6 +257,12 @@ impl PVModel for GeneralPVSepModel {
     }
     // Assumes that the input has the shape (BS, Features, N, N), with the last feature being the playing side
     fn evaluate_t(&self, xs: &Tensor, train: bool) -> Evaluation {
+
+        let xs = match xs.size().len() {
+            3 => &xs.unsqueeze(0),
+            4 => xs,
+            _ => panic!("PVModel only accepts 3-dim or 4-dim tensor"),
+        };
 
         let v = xs.split_sizes([self.config.in_features - 1, 1], 1); // split_sizes does not accept -1 as size estimator
         let minus_side = v[0].contiguous(); // Might not need this since conv2D automatically creates new contiguous tensor (needs testing)

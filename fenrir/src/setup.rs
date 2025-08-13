@@ -53,7 +53,7 @@ pub struct FenrirConfig{
     pub n_games_per_tournament: usize,
     pub model_update_threshold: f32,
     pub replay_buffer_capacity: usize,
-    pub run_time_hr: u64,
+    pub run_time_hr: f32,
     pub momentum: f64,
     pub weight_decay: f64,
     pub learning_rate_schedule: fn(usize) -> f64,
@@ -69,7 +69,7 @@ pub struct FenrirConfigWrapper {
     n_games_per_tournament: usize,
     model_update_threshold: f32,
     replay_buffer_capacity: usize,
-    run_time_hr: u64,
+    run_time_hr: f32,
     momentum: f64,
     weight_decay: f64,
     learning_rate_schedule: String,
@@ -402,7 +402,9 @@ pub fn setup_w_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsStrin
     let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
 
     if rank == 0 {
+
         for module_info in config.module_load_infos.iter() {
+
             if module_info.rank.is_some_and(|i| i == 0) {
                 add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?;
             } else if !Path::new(&module_info.path).exists() {
@@ -417,22 +419,27 @@ pub fn setup_w_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsStrin
 
     for module_info in config.module_load_infos.iter() {
 
+        world.barrier();
+
         let path = Path::new(&module_info.path);
 
         if rank == 0 {
             process_model_request(&world, size)?;
-        } else if rank == module_info.rank.unwrap() && !path.exists() {
+            continue;
+        }
 
-            println!("requesting model {:?} from root node", path);
-
-            let cursor = request_model_from_root(&world, 0, path.as_os_str().to_str().unwrap());
-            add_module_from_stream_to_list(module_info, &mut loaded_models, &mut available_cuda, cursor)?;
+        // If this module is to be loaded by this rank, or all the ranks
+        if module_info.rank.is_some_and(|x| x==rank) || module_info.rank.is_none() {
+            if path.exists() {
+                world.process_at_rank(0).send_with_tag::<[u8;0]>(&[], TAG_NO_MODEL_REQUEST);
+                add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?;
+            } else {
+                println!("requesting model {:?} from root node", path);
+                let cursor = request_model_from_root(&world, 0, path.as_os_str().to_str().unwrap());
+            }
         } else {
-            // If the model is visible from non-root, just load it
-            add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?; 
             world.process_at_rank(0).send_with_tag::<[u8;0]>(&[], TAG_NO_MODEL_REQUEST);
         }
-        world.barrier();
     }
 
     Ok(loaded_models)
@@ -449,13 +456,11 @@ fn request_model_from_root(world: &SimpleCommunicator, root: i32, path: &str) ->
     loop {
 
         let status = world.process_at_rank(root).receive_into(&mut buffer);
-        let just_a_byte = u8::equivalent_datatype();
-        let count = status.count(just_a_byte) as usize;
+        let count = status.count(u8::equivalent_datatype()) as usize;
         if count == 0 { break; }
         else {
             data.extend_from_slice(&buffer[..count]);
         }
-        buffer.clear();
 
     }
     let cursor = Cursor::new(data);
@@ -464,21 +469,22 @@ fn request_model_from_root(world: &SimpleCommunicator, root: i32, path: &str) ->
 
 fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
 
-    let mut buf: Vec<u8> = Vec::with_capacity(BUFFER_LEN);
+    let mut buf: [u8;BUFFER_LEN] = [0;BUFFER_LEN];
+
     for rank in 1..size {
 
-        buf.clear();
-
         let (msg, status) = world.process_at_rank(rank).matched_probe();
+
         if status.tag() == TAG_NO_MODEL_REQUEST {
-            let mut dyn_buf = DynBufferMut::new(&mut buf);
-            msg.matched_receive_into(&mut dyn_buf);   // In this case the msg should be empty
+
+            msg.matched_receive_into(&mut buf);   // In this case the msg should be empty
             continue;
+            
         } else if status.tag() == TAG_MODEL_REQUEST {
 
-            let mut dyn_buf = DynBufferMut::new(&mut buf);
-            msg.matched_receive_into(&mut dyn_buf);
-            let filename = std::str::from_utf8(&buf)?;
+            let status = msg.matched_receive_into(&mut buf);
+            let count = status.count(<u8 as Equivalence>::equivalent_datatype());
+            let filename = std::str::from_utf8(&buf[..count as usize])?;
             let path = Path::new(&filename);
             if !path.exists() {
                 return Err(eyre!("The requested file {} does not exist in the root rank", filename));
@@ -486,16 +492,15 @@ fn process_model_request(world: &SimpleCommunicator, size: i32) -> Result<()> {
             let mut file = File::open(path)?;
             let target = world.process_at_rank(rank);
 
-            let mut buffer = [0u8; BUFFER_LEN];
             loop {
-                let count = file.read(&mut buffer)?;
+                let count = file.read(&mut buf)?;
                 if count == 0 {
                     // Send the EOF signal
                     target.send(&[] as &[u8]);
                     break;
                 } 
                 else {
-                    target.send(&buffer[..count]);
+                    target.send(&buf[..count]);
                 }
             }
         }
@@ -820,7 +825,7 @@ mod tests {
             n_games_per_tournament: 10,
             model_update_threshold: 0.55,
             replay_buffer_capacity: 50000,
-            run_time_hr: 2,
+            run_time_hr: 2.0,
             momentum: 0.9,
             learning_rate_schedule: agz_lr_schedule,
             weight_decay: 0.0001,
@@ -835,4 +840,5 @@ mod tests {
         assert_eq!(config.train_bs, 64);
         assert_eq!(config.momentum, 0.9);
     }
+
 }

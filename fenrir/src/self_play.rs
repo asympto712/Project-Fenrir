@@ -1011,7 +1011,7 @@ fn do_inference_job_sync<P: PVModel + Send>(
 }
 
 #[cfg(not(feature = "bench"))]
-pub fn setup_mcts<G: GameLogic>(mcts_config: &MCTSConfig, request_sender: &Arc<Sender<Request>>)
+pub fn setup_mcts<G: GameLogic>(mcts_config: &MCTSConfig, request_sender: Arc<Sender<Request>>)
 -> (MCTSTree<G>, NewActor)
 where
 TBoard<G>: ModelInput<G>,
@@ -1020,7 +1020,7 @@ TaflBoard<G::B>: std::fmt::Display
 {
         let game = <G as Default>::default();
         let mut mcts_tree = MCTSTree::<G>::generate(game, mcts_config.clone());
-        let actor = NewActor::new(request_sender.clone());
+        let actor = NewActor::new(request_sender);
         (mcts_tree, actor)
 }
 
@@ -1059,7 +1059,8 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 
         (0..num_games).into_par_iter().for_each_init(
             || {
-                setup_mcts::<D::G>(mcts_config, &request_sender)
+                let rs_clone = Arc::clone(&request_sender);
+                setup_mcts::<D::G>(mcts_config, rs_clone)
             }, 
         |(
             mcts_tree,

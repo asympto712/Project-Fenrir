@@ -36,3 +36,8 @@ svg = "0.18"
 tempfile = "3.0"
 
 [lib]
+
+[[bin]]
+name = "mpi-test"
+path = "./tests/mpi-test.rs"
+test = true
