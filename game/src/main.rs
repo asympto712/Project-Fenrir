@@ -178,6 +178,95 @@ trait Draw {
     fn draw(&mut self, frame: &mut Frame);
 }
 
+impl Draw for App<SimpleGame> {
+    
+    fn draw(&mut self, frame: &mut Frame) {
+
+        use Constraint::{Length, Min, Percentage, Fill, Max};
+        let area = frame.area();
+        let mut buf = frame.buffer_mut();
+
+        let horizontal = Layout::horizontal(
+            [Min(0), Length(50), Min(0)]
+        );
+        let vertical = Layout::vertical(
+            [Length(4), Length(40), Length(4)]
+        );
+        let [input_area, board_area, misc_area] = vertical.areas(area);
+        let [_, input_area, _] = horizontal.areas(input_area);
+        let [_, board_area, _] = horizontal.areas(board_area);
+        let [_, misc_area, _] = horizontal.areas(misc_area);
+
+        let cur_board = self.game.get_board();
+        draw_main_board(board_area, buf, cur_board).map_err(|e| {
+            let msg = Line::from(format!("{e}"));
+            msg.left_aligned().render(board_area, buf);
+        });
+
+        // Render game state
+        self.draw_game_state_block(misc_area, buf);
+
+        // Render input
+        self.draw_input_block(input_area, buf);
+        if self.flags.contains(AppFlags::ALLOWS_INPUT) {
+            frame.set_cursor_position(Position::new(
+                input_area.x + self.character_index as u16 + 1,
+                input_area.y + 1,
+            ));
+        }
+
+        // Render popup (Error message)
+        if self.flags.contains(AppFlags::POPUP)
+        {
+            let x = frame.area().x;
+            let y = frame.area().y;
+            let width = frame.area().width;
+            let height = frame.area().height;
+            let popup_rect = Rect{
+                x: x + width / 3,
+                y: y + height / 3,
+                width: width / 2,
+                height: height / 2
+            };
+
+            frame.render_widget(Clear, popup_rect);
+            let instruction = Line::from(
+                "Press <p> to close this message"
+            );
+            let msg = if let Some(er) = &self.error_report
+            {
+                Text::from(format!("{er}"))
+            } else {
+                Text::default()
+            };
+            Paragraph::new(msg)
+                .left_aligned()
+                .block(Block::bordered().border_type(BorderType::Double)
+                .title_bottom(instruction))
+                .render(popup_rect, frame.buffer_mut());
+        }
+
+        // Render game end message
+        if self.flags.contains(AppFlags::TERMINATED)
+        {
+            let popup_area = get_popup_area(frame.area());
+            frame.render_widget(Clear, popup_area);
+            let instruction = vec![
+                Span::raw("Press <g> to start new game. "),
+                Span::raw("Press <q> to quit")
+            ];
+            let msg = Text::from(self.game_end_message.to_string());
+            Paragraph::new(msg)
+                .left_aligned()
+                .block(Block::bordered().border_type(BorderType::Double).border_style(Style::default().blue())
+                .title_bottom(Line::from(instruction)))
+                .render(popup_area, frame.buffer_mut());
+        }
+        
+    }
+
+}
+
 impl Draw for App<Game> {
     
     fn draw(&mut self, frame: &mut Frame){

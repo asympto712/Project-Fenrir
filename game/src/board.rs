@@ -255,7 +255,9 @@ impl<B: BitBoard> TaflBoard<B> {
         (cpt_candid_e & cpt_candid_w) | (cpt_candid_n & cpt_candid_s)
         
     }
-    // returns the king pieces that are captured by the movement from the attacker pieces.
+
+    // returns the king pieces that are captured by the movement from the attacker pieces,
+    // following the strong king capture rule by https://aagenielsen.dk/tafl_rules.php.
     // To actually update the board, simply take the XOR of the output with self.bit_king 
     // NOTE!: Call this function on the board BEFORE the action is applied to
     pub fn king_capture(&self, action: &B::Movement) -> B{
@@ -271,6 +273,22 @@ impl<B: BitBoard> TaflBoard<B> {
         let cpt_candid_n = (restricted_king.shift_n() & mask).shift_s();
         cpt_candid_e & cpt_candid_w & cpt_candid_n & cpt_candid_s
         
+    }
+
+    // returns the king pieces that are captured by the movement from the attacker pieces,
+    // following the weak king capture rule by https://aagenielsen.dk/tafl_rules.php.
+    // To actually update the board, simply take the XOR of the output with self.bit_king 
+    // NOTE!: Call this function on the board BEFORE the action is applied to
+    pub fn weak_king_capture(&self, action: &B::Movement) -> B {
+        let dst_neighbor = B::neighbor_of(&action.dst());
+        let restricted_king = self.bit_king & dst_neighbor;
+        let mut mask = self.bit_att | self.hostile;
+        mask.flip_target_bit_mut(&action.dst());
+        let cpt_candid_e = (restricted_king.shift_e() & mask).shift_w();
+        let cpt_candid_w = (restricted_king.shift_w() & mask).shift_e();
+        let cpt_candid_s = (restricted_king.shift_s() & mask).shift_n();
+        let cpt_candid_n = (restricted_king.shift_n() & mask).shift_s();
+        (cpt_candid_e & cpt_candid_w) | (cpt_candid_n & cpt_candid_s)
     }
 
 }

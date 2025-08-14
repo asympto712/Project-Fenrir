@@ -1270,6 +1270,10 @@ impl GameLogic for SimpleGame {
         }
     }
 
+    fn yield_captured_def(&self, action: &<Self::B as BitBoard>::Movement) -> (Self::B, Self::B) {
+        (self.board.def_capture(action), self.board.weak_king_capture(action))
+    }
+
     fn do_action_unchecked(&self, action: &<Self::B as BitBoard>::Movement, piece_type: Option<PieceType>) -> Self {
         let side = self.state.show_side();
 
