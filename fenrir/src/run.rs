@@ -51,7 +51,7 @@ ReplayBuffer<D>: Sampler
     } else if mpi_config.self_play.contains(&rank) {
         println!("Hello from rank {}", rank);
         let mut node = SelfPlayNode::<P, D>::init(config);
-        node.run(&mpi_config);
+        node.run(&mpi_config, data_store_dir);
     }
 
 }

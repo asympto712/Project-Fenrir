@@ -14,18 +14,20 @@ use crate::{CompConfig, MpiConfig};
 
 use bincode::Encode;
 use chrono::format::{DelayedFormat, StrftimeItems};
+use crossbeam::atomic::AtomicConsume;
 use crossbeam::epoch::default_collector;
 use game::game::{Game, GameLogic, Side, SimpleGame, Victor};
 use game::board::TaflBoard;
 use bitboard::{BitBoard, MoveOnBoard};
 
+use mpi::collective::SystemOperation;
 #[cfg(feature = "mpi")]
 use mpi::environment::Universe;
 #[cfg(feature = "mpi")]
 use mpi::Rank;
 use mpi::{point_to_point::*, Tag};
 use mpi::topology::SimpleCommunicator;
-use mpi::traits::{Communicator, CommunicatorCollectives, Group};
+use mpi::traits::{Communicator, CommunicatorCollectives, Group, Root};
 use mpi::MpiError;
 use mpi::datatype::{DynBufferMut, Equivalence};
 
@@ -51,10 +53,11 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{bounded, unbounded, SendError, TryRecvError, TrySendError};
+use crossbeam::channel::{bounded, unbounded, RecvTimeoutError, SendError, TryRecvError, TrySendError};
 use crossbeam::channel::{Sender, Receiver};
 
 pub const TAG_HALT: Tag = 100;
@@ -211,24 +214,148 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
         Ok(())
     }
 
-    pub fn run(&mut self, mpi_config: &MpiConfig) {
+    pub fn run<A: AsRef<Path> + Send + Sync>(&mut self, mpi_config: &MpiConfig, win_rate_dir: A) {
 
         let mut run: bool = true;
 
-        let mut game_count: u64 = 0;
+        let att_win_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let def_win_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let draw_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let game_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        
+        let world = Self::world();
+        let group = world.group();
+        let self_play_group = group.include(&mpi_config.self_play);
+        let sub_comm = world.split_by_subgroup(&self_play_group).unwrap();
+
+        print_now(&format!("Hello from rank {} in self-play communicator", sub_comm.rank()));
+
+        let mut f = if sub_comm.rank() == 0 {
+
+            std::fs::create_dir_all(&win_rate_dir);
+            let mut path = win_rate_dir.as_ref().to_path_buf().join(format!("{}-win-rates", self.config.name));
+            let _ = path.set_extension("dat");
+            let mut file = File::create(path).unwrap();
+            Some(file)
+        } else {
+            None
+        };
+
+        if let Some(ref mut f) = f {
+            writeln!(f, "att def draw total");
+        }
 
         // let buffer = std::mem::take(&mut self.buffer);
         // let buffer = Arc::new(Mutex::new(buffer));
 
         let mut msg_opt: Option<(Message, usize)> = None; // msg and its size (in bytes) to pass to the model update process
 
+        let (mtx, mrx) = bounded::<u8>(1);
+
+
         print_now(&format!("self play node at rank {} has started running!", Self::world().rank()));
+
+
+
+        let measure = std::thread::spawn({
+            let att_win_count_clone = Arc::clone(&att_win_count);
+            let def_win_count_clone = Arc::clone(&def_win_count);
+            let draw_count_clone = Arc::clone(&draw_count);
+            let mut tmp_att_win_count: u64 = 0;
+            let mut tmp_def_win_count: u64 = 0;
+            let mut tmp_draw_count: u64 = 0;
+            let self_play_ranks = mpi_config.self_play.clone();
+
+
+            let mut all_ready = true; // boolean to determine if the reduce operation can take place.
+            // The transition from true to false is irreversible - once even one node bails out, and this becomes false,
+            // no more reduce operation will happen.
+
+            move || {
+
+                let world = Self::world();
+                let group = world.group();
+                let self_play_group = group.include(&self_play_ranks);
+                let sub_comm = world.split_by_subgroup(&self_play_group).unwrap();
+
+                loop {
+                    match mrx.recv_timeout(Duration::from_secs(20)) {
+                        Ok(_) => {
+
+                            // A bail-out mechanism so that the nodes can signal their participation in the reduce operation.
+                            // Note that once it signals false, the reduce operation will no longer take place and only the root node will track the statistics
+                            if all_ready {
+                                let ready: bool = false;
+                                sub_comm.all_reduce_into(&ready, &mut all_ready, SystemOperation::logical_and());
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            match e {
+                                RecvTimeoutError::Disconnected => {
+                                    if all_ready {
+                                        let ready: bool = false;
+                                        sub_comm.all_reduce_into(&ready, &mut all_ready, SystemOperation::logical_and());
+                                    }
+                                    break;
+                                }
+                                RecvTimeoutError::Timeout => {
+                                    tmp_att_win_count += att_win_count_clone.swap(0, Ordering::Relaxed);
+                                    tmp_def_win_count += def_win_count_clone.swap(0, Ordering::Relaxed);
+                                    tmp_draw_count += draw_count_clone.swap(0, Ordering::Relaxed);
+                                    let sum = tmp_att_win_count + tmp_def_win_count + tmp_draw_count;
+
+                                    // Final check before proceeding to reduce operation
+                                    if all_ready {
+                                        let ready: bool = false;
+                                        sub_comm.all_reduce_into(&ready, &mut all_ready, SystemOperation::logical_and());
+                                    }
+
+                                    if all_ready {
+
+                                        if sub_comm.rank() == 0 {
+                                            sub_comm.process_at_rank(0)
+                                                .reduce_into_root(&tmp_att_win_count.clone(), &mut tmp_att_win_count, SystemOperation::sum());
+                                            sub_comm.process_at_rank(0)
+                                                .reduce_into_root(&tmp_def_win_count.clone(), &mut tmp_def_win_count, SystemOperation::sum());
+                                            sub_comm.process_at_rank(0)
+                                                .reduce_into_root(&tmp_draw_count.clone(), &mut tmp_draw_count, SystemOperation::sum());
+
+                                            if let Some(ref mut file) = f && (tmp_att_win_count + tmp_def_win_count + tmp_draw_count) > 100 {
+                                                writeln!(file, "{} {} {}", tmp_att_win_count, tmp_def_win_count, tmp_draw_count);
+                                            }
+
+                                        } else {
+                                            sub_comm.process_at_rank(0)
+                                                .reduce_into(&tmp_att_win_count.clone(), SystemOperation::sum());
+                                            sub_comm.process_at_rank(0)
+                                                .reduce_into(&tmp_def_win_count.clone(), SystemOperation::sum());
+                                            sub_comm.process_at_rank(0)
+                                                .reduce_into(&tmp_draw_count.clone(), SystemOperation::sum());
+                                        }
+
+                                    } else if sub_comm.rank() == 0 && (tmp_att_win_count + tmp_def_win_count + tmp_draw_count) > 100 {
+
+                                        if let Some(ref mut file) = f {
+                                            writeln!(file, "{} {} {}", tmp_att_win_count, tmp_def_win_count, tmp_draw_count);
+                                        }
+
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         while run {
 
             std::thread::scope(|s| {
 
-                let arc_game_count = Arc::new(AtomicU64::new(game_count));
+                // Channel for halting messages for threads in the pool
+                let (tx, rx) = bounded::<u8>(1);
+                let rx = Arc::new(rx);
 
                 let (manager, mut request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut self.shelf, self.config.fenrir_config.inference_bs);
                 assert_eq!(request_senders.len(), 1);
@@ -240,9 +367,6 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                 let thread_count = std::thread::available_parallelism().unwrap().get();
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_count).build().unwrap();
 
-                // Channel for halting messages for threads in the pool
-                let (tx, rx) = bounded::<u8>(1);
-                let rx = Arc::new(rx);
 
                 // manager is responsible for accepting and managing inference requests from any worker thread.
                 let manager_handler = s.spawn(move || {
@@ -257,7 +381,10 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                     let request_sender_cloned = Arc::clone(&request_sender);
                     let rank_trainer = mpi_config.train.clone();
                     let mcts_config = self.config.mcts_config.clone();
-                    let arc_game_count_clone = Arc::clone(&arc_game_count);
+                    let att_win_count_clone = Arc::clone(&att_win_count);
+                    let def_win_count_clone = Arc::clone(&def_win_count);
+                    let draw_count_clone = Arc::clone(&draw_count);
+                    let game_count_clone = Arc::clone(&game_count);
 
                     move |_| {
 
@@ -289,13 +416,22 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                             }
                             let winner = tree.get_winner();
 
-                            match winner {
-                                Victor::Att => episode.give_reward(1i64),
-                                Victor::Def => episode.give_reward(-1i64),
-                                Victor::Draw => episode.give_reward(0i64),
-                            };
+                            game_count_clone.fetch_add(1, Ordering::Relaxed);
 
-                            let _ = arc_game_count_clone.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                            match winner {
+                                Victor::Att => {
+                                    episode.give_reward(1i64);
+                                    att_win_count_clone.fetch_add(1, Ordering::Relaxed);
+                                },
+                                Victor::Def => {
+                                    episode.give_reward(-1i64);
+                                    def_win_count_clone.fetch_add(1, Ordering::Relaxed);
+                                },
+                                Victor::Draw => {
+                                    episode.give_reward(0i64);
+                                    draw_count_clone.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
 
                             episode.save(&mut buf);
 
@@ -339,9 +475,6 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
 
                 });
 
-                let total_games = Arc::into_inner(arc_game_count).unwrap().load(std::sync::atomic::Ordering::Relaxed);
-                game_count = total_games;
-                
                 loop {
                     let opt = Self::world().any_process().immediate_matched_probe();
                     match opt {
@@ -393,7 +526,9 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
                 #[cfg(feature = "verbose_lvl1")]
                 print_now("inference manager was shut down correctly");
 
-                print_now(&format!("At rank {}, total of {} games were played so far", Self::world().rank(), game_count));
+                
+
+                print_now(&format!("At rank {}, total of {} games were played so far", Self::world().rank(), game_count.load(Ordering::Relaxed)));
             });
 
 
@@ -425,20 +560,23 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
 
         }
 
+        // let world = Self::world();
+        // let group = world.group();
+        // let self_play_group = group.include(&mpi_config.self_play);
+        // let sub_comm = world.split_by_subgroup(&self_play_group).unwrap();
+        mtx.send(1).unwrap();
+        measure.join().unwrap();
+
         /* synchronize barrier only amongst self-play nodes */
-        let world = Self::world();
-        let group = world.group();
-        let self_play_group = group.include(&mpi_config.self_play);
-        let sub_comm = world.split_by_subgroup(&self_play_group).unwrap();
         sub_comm.barrier();
         
         /* self node has finished its run, so now it can safely send halt tag to train node. 
         But only one of the self play nodes should send this message */
-        if Self::world().rank() == mpi_config.self_play[0] {
+        if sub_comm.rank() == 0 {
             Self::world().process_at_rank(mpi_config.train).send_with_tag::<[u8;0]>(&[], TAG_HALT);
         }
 
-        print_now(&format!("At rank {}, total of {} games were played", Self::world().rank(), game_count));
+        print_now(&format!("At rank {}, total of {} games were played", Self::world().rank(), game_count.load(Ordering::Relaxed)));
         print_now(&format!("Self play node at rank {} has finished all of its run process", Self::world().rank()));
     }
 }
