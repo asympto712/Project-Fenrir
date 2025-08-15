@@ -30,21 +30,24 @@ use rayon::{iter::{IntoParallelIterator, ParallelIterator}};
 use tokio::task::JoinSet;
 use mpi::datatype::MutView;
 
+// std
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-// std
 use std::path::Path;
 use std::thread::{self, current, JoinHandle};
 use std::sync::{Arc, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use std::ffi::{OsString, OsStr};
+use std::fs::File;
 use std::path;
 use std::convert::AsRef;
 use std::borrow::Borrow;
 use std::io::{Read, Seek};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering;
+use std::io::Write;
 
 #[cfg(feature = "bench")]
 use crate::statistics::*;
@@ -1036,20 +1039,31 @@ pub fn setup_mcts<G: GameLogic>(stat_sender: &Arc<Sender<RunningStat>>, mcts_con
 
 // play the game for the specified amount using the specified model, create the replay buffer
 #[cfg(not(feature = "bench"))]
-pub fn self_play_new<'a, P: PVModel + Send, D: BoardData>(
+pub fn self_play_new<'a, P: PVModel + Send, D: BoardData, A: AsRef<Path>>(
     manager: InferenceManager<'a, P, &'a mut LockedShelf<P>>,
     request_sender: Sender<Request>,
     num_games: usize,
     mcts_config: &MCTSConfig,
     replay_buffer: &ReplayBuffer<D>,
+    record_path: Option<A>,
 ) -> Result<()>
 where TBoard<D::G>: ModelInput<D::G>,
 TAction<<D::G as GameLogic>::B>: ActionTensor,
 TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 {
+    use std::sync::atomic::AtomicU64;
+
 
     let request_sender = Arc::new(request_sender);
     let model_id = 0; // self-play only uses one model
+    let mut file: Option<File> = if let Some(a) = record_path {
+        let f = std::fs::File::create(a.as_ref())?;
+        Some(f)
+    } else { None };
+
+    let att_win_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let def_win_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let draw_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     let ts = thread::scope::<'a>(|s| -> Result<()>{
 
@@ -1060,11 +1074,16 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
         (0..num_games).into_par_iter().for_each_init(
             || {
                 let rs_clone = Arc::clone(&request_sender);
-                setup_mcts::<D::G>(mcts_config, rs_clone)
+                let awc_clone = Arc::clone(&att_win_count);
+                let dwc_clone = Arc::clone(&def_win_count);
+                let dc_clone = Arc::clone(&draw_count);
+                (setup_mcts::<D::G>(mcts_config, rs_clone), awc_clone, dwc_clone, dc_clone)
             }, 
         |(
-            mcts_tree,
-            actor
+                (mcts_tree,actor),
+                awc_clone,
+                dwc_clone,
+                dc_clone
             ), game_id| {
                 use game::game::Victor;
 
@@ -1086,9 +1105,18 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
                 println!("game {} finished. winner is {:?}", game_id, winner);
 
                 match winner {
-                    Victor::Att => episode.give_reward(1i64),
-                    Victor::Def => episode.give_reward(-1i64),
-                    Victor::Draw => episode.give_reward(0i64),
+                    Victor::Att => {
+                        awc_clone.fetch_add(1, Ordering::Relaxed);
+                        episode.give_reward(1i64);
+                    }
+                    Victor::Def => {
+                        dwc_clone.fetch_add(1, Ordering::Relaxed);
+                        episode.give_reward(-1i64);
+                    }
+                    Victor::Draw => {
+                        dc_clone.fetch_add(1, Ordering::Relaxed);
+                        episode.give_reward(0i64);
+                    }
                 };
                 replay_buffer.append_from_episode(&mut episode);
         });
@@ -1100,6 +1128,10 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
         Ok(())
 
     });
+
+    if let Some(mut f) = file {
+        writeln!(f, "{} {} {}", att_win_count.load(Ordering::Relaxed), def_win_count.load(Ordering::Relaxed), draw_count.load(Ordering::Relaxed));
+    }
 
     ts
 }

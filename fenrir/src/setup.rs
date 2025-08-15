@@ -560,12 +560,13 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display {
 
         let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.inference_bs);
 
-        self_play_new::<P,D>(
+        self_play_new::<P,D, &str>(
             manager,
             request_senders[0].clone(),
             config.n_self_play_games,
             &mcts_config,
-            &replay_buffer
+            &replay_buffer,
+            None
         )?;
 
         shelf = LockedShelf::<P>::convert_into_shelf(locked_shelf);

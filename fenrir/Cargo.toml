@@ -41,3 +41,7 @@ tempfile = "3.0"
 name = "mpi-test"
 path = "./tests/mpi-test.rs"
 test = true
+
+[[bin]]
+name = "seq_fenrir"
+path = "./src/sequential_run.rs"

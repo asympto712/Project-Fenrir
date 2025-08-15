@@ -92,7 +92,7 @@ enum CommFlag {
  }
 
 // returns (number of elements, how many bytes it takes in total) for a model with the given config
-fn numel_for_model(vs: &VarStore) -> (usize, usize) {
+pub fn numel_for_model(vs: &VarStore) -> (usize, usize) {
     let mut numel: usize = 0;
     for (_name, variable) in vs.variables().iter() {
         numel += variable.numel();
@@ -584,7 +584,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
 // MEMO: Call initialize_with_threading(Threading::Multiple) at the start of the main()
 
 pub struct TrainNode<P: PVModel + Send, D: BoardData + Encode> {
-    trainer: NewTrainer<P>,
+    trainer: NewTrainer<P, ModuleShelf<P, P>>,
     replay_buffer: ReplayBuffer<D>,
     buffer: Vec<u8>,
     config: CompConfig,
@@ -613,7 +613,7 @@ impl<P: PVModel + Send, D: BoardData + Encode> Node<ModuleShelf<P, P>> for Train
         // preallocate buffer
         let buffer: Vec<u8> = vec![0; 2 * capacity];
 
-        let trainer: NewTrainer<P> = NewTrainer::new(
+        let trainer: NewTrainer<P, ModuleShelf<P, P>> = NewTrainer::new(
             shelf,
             tch::nn::sgd(config.fenrir_config.momentum, 0.0f64, config.fenrir_config.weight_decay, false),
             (config.fenrir_config.learning_rate_schedule)(0),
@@ -1187,7 +1187,7 @@ fn write_now(msg: &str, w: &mut impl Write) {
     write!(w, "{}   {}", format, msg).unwrap()
 }
 
-fn print_now(msg: &str) {
+pub fn print_now(msg: &str) {
     let datetime = chrono::Local::now();
     let format = datetime.format("%m/%d %H:%M:%S");
     println!("{}   {}", format, msg)

@@ -5,6 +5,7 @@ use std::borrow::{Borrow, BorrowMut};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
+use std::marker::PhantomData;
 
 use crate::model::*;
 use crate::model::PVModel;
@@ -269,8 +270,12 @@ fn get_bn_var_names<V: Borrow<VarStore>>(vss: &[V]) -> Option<Vec<String>> {
 
 }
 
-pub struct NewTrainer<P: PVModel + Send> {
-    pub shelf: ModuleShelf<P, P>,
+pub struct NewTrainer<P, M>
+where
+P: PVModel + Send,
+M: BorrowMut<ModuleShelf<P, P>>
+{
+    pub shelf: M,
     pub step_count: usize,
     pub loss_record: Vec<LossValue>,
     optimizers: Vec<Optimizer>,
@@ -278,20 +283,21 @@ pub struct NewTrainer<P: PVModel + Send> {
     trainable_var_names: Vec<String>,
     bn_stats_names: Vec<String>,
     sync_config: ModelSyncConfig,
+    _marker: PhantomData<P>
 }
 
-impl<P: PVModel+ Send> NewTrainer<P> {
+impl<P: PVModel+ Send, M: BorrowMut<ModuleShelf<P,P>>> NewTrainer<P, M> {
 
     pub fn replicas(&self) -> &[(P, VarStore)] {
-        &self.shelf.get_group(0).unwrap()[..]
+        &self.shelf.borrow().get_group(0).unwrap()[..]
     }
 
-    pub fn replicas_mut(&mut self) -> &[(P, VarStore)] {
-        &mut self.shelf.get_group_mut(0).unwrap()[..]
+    pub fn replicas_mut(&mut self) -> &mut [(P, VarStore)] {
+        &mut self.shelf.borrow_mut().get_group_mut(0).unwrap()[..]
     }
 
     pub fn new<O: OptimizerConfig + Clone>(
-        shelf: ModuleShelf<P, P>,
+        shelf: M,
         config: O,
         lr: f64,
         weight_decay: f64,
@@ -299,14 +305,14 @@ impl<P: PVModel+ Send> NewTrainer<P> {
         sync_config: ModelSyncConfig
     ) -> Result<Self>{
 
-        if shelf.table.len() != 1 {
-            return Err(eyre!("Trainer creation expected one model group in the shelf but got {}", shelf.table.len()));
+        if shelf.borrow().table.len() != 1 {
+            return Err(eyre!("Trainer creation expected one model group in the shelf but got {}", shelf.borrow().table.len()));
         }
-        if shelf.table[0].len() == 0 {
+        if shelf.borrow().table[0].len() == 0 {
             return Err(eyre!("modules has to have at least one element"));
         }
 
-        let optimizers= shelf.table[0].iter().map(|(module, vs)| {
+        let optimizers= shelf.borrow().table[0].iter().map(|(module, vs)| {
 
             if let Ok(mut optim) = config.clone().build(vs, lr) {
                 optim.set_weight_decay_group(NO_WEIGHT_DECAY_GROUP, weight_decay);
@@ -316,7 +322,7 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             }
         }).collect::<Result<Vec<_>>>()?;
 
-        let vss = shelf.table[0].iter().map(|(_, vs)| {
+        let vss = shelf.borrow().table[0].iter().map(|(_, vs)| {
             vs
         }).collect::<Vec<_>>();
         // Get variable names in the nn weight for whom to sync the grads
@@ -336,7 +342,8 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             bn_stats_names,
             sync_config,
             loss_record,
-            step_count: 0
+            step_count: 0,
+            _marker: PhantomData
         })
     }
 
@@ -435,7 +442,7 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             let ptr = self as *mut Self;
             // SAFETY: We ensure exclusive access for mutation here.
             for i in 0..replicas_len {
-                let vs = unsafe { &mut (*ptr).shelf.get_group_mut(0).unwrap()[i].1 };
+                let vs = unsafe { &mut (*ptr).shelf.borrow_mut().get_group_mut(0).unwrap()[i].1 };
                 let value = reduced_grad.to_device(vs.device());
                 vs.variables()
                     .get_mut(name)
@@ -453,7 +460,7 @@ impl<P: PVModel+ Send> NewTrainer<P> {
             return Ok(());
         }
         let ptr = &raw const *self.bn_stats_names;
-        let mut vss = self.shelf.get_group_mut(0).unwrap()
+        let mut vss = self.shelf.borrow_mut().get_group_mut(0).unwrap()
             .iter_mut()
             .map(|(_, vs)| vs)
             .collect::<Vec<_>>();

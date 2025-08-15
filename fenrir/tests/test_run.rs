@@ -71,12 +71,13 @@ fn test_run_wo_mpi_sequential() {
         dbg!("self play phase\n");
 
         let request_sender = request_senders.remove(0);
-        self_play_new::<P,D>(
+        self_play_new::<P,D, &str>(
             manager,
             request_sender,
             comp_config.fenrir_config.n_self_play_games,
             &comp_config.mcts_config,
-            &replay_buffer
+            &replay_buffer,
+            None
         ).unwrap();
 
         shelf = LockedShelf::<P>::convert_into_shelf(locked_shelf);
