@@ -1,3 +1,4 @@
+#![cfg(not(feature = "bench"))]
 use fenrir::model::{GeneralPVSepModel, PVModel};
 use fenrir::{load_comp_config, CompConfig};
 use fenrir::agent::{load_mcts_config, MCTSConfig};
@@ -7,7 +8,7 @@ use fenrir::self_play::{ModuleShelf, LockedShelf, Shelf, InferenceManager, self_
 use fenrir::setup::{setup_wo_mpi};
 use fenrir::train::{NewTrainer, ModelSyncConfig, self};
 use fenrir::node::{numel_for_model, print_now};
-use fenrir::duel::duel;
+use fenrir::duel::{duel, DuelResult};
 
 use game::game::{GameLogic};
 use game::board::{TaflBoard};
@@ -43,7 +44,7 @@ fn main() -> Result<()>{
     }
 
     if !Path::new(&argv[2]).exists() {
-    eprintln!("Config file not found: {}", argv[1]);
+    eprintln!("Config file not found: {}", argv[2]);
     std::process::exit(1);
     }
 
@@ -62,7 +63,13 @@ fn main() -> Result<()>{
         0
     };
 
-    sequential_run::<GeneralPVSepModel, SimpleGameSPR, _>(&config, duel_mcts_config, model_dir, data_dir, init_training_step_count, init_self_play_count)?;
+    sequential_run::<GeneralPVSepModel, SimpleGameSPR, _>(
+        &config,
+        duel_mcts_config,
+        model_dir,
+        data_dir,
+        init_training_step_count,
+        init_self_play_count)?;
     Ok(())
 }
 
@@ -72,7 +79,7 @@ fn sequential_run<P: PVModel + Send + 'static, D: BoardData, A: AsRef<Path>>(
     model_dir: A,
     data_dir: A,
     init_training_step_count: usize,
-    init_self_play_game_count: usize,
+    init_self_play_count: usize,
 ) -> Result<()> 
 where
 ReplayBuffer<D>: Sampler,
@@ -93,7 +100,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
     let mut storage = Vec::<u8>::with_capacity(capacity);
 
     let mut training_step_count: usize = init_training_step_count;
-    let mut self_play_game_count: usize = init_self_play_game_count;
+    let mut self_play_game_count: usize = init_self_play_count;
 
     // fs-related
     std::fs::create_dir_all(&model_dir)?;
@@ -198,11 +205,21 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
         let champion_rs = request_senders.remove(0);
         let challenger_rs = request_senders.remove(0);
 
-        let (chal_wr, draw_count) = duel::<P, D>(manager, champion_rs, challenger_rs, config.fenrir_config.n_games_per_tournament, &duel_mcts_config)?;
+        let duel_result: DuelResult = duel::<P, D>(manager, champion_rs, challenger_rs, config.fenrir_config.n_games_per_tournament, &duel_mcts_config, &duel_mcts_config)?;
+        let dr: (f32, f32, f32, f32, f32, f32) = (duel_result.0 as f32,duel_result.1 as f32,duel_result.2 as f32,duel_result.3 as f32,duel_result.4 as f32,duel_result.5 as f32);
 
-        print_now(&format!("evaluation of the new model has completed. Challenger's win-rate was {}, with {} draws", chal_wr, draw_count));
+        // win-rate for challenger when it is the attacker
+        let chal_wr_when_def = (dr.0 - dr.1 - 0.5 * dr.2) / dr.0; // This formula might need tweaking
+        // win-rate for challenger when defender
+        let chal_wr_when_att = (dr.3 - dr.4 - 0.5 * dr.5) / dr.3;
 
-        if chal_wr > config.fenrir_config.model_update_threshold {
+        let msg: String = "Evaluation of a checkpoint completed\n".to_string() + 
+        &format!("challenger's win rate | draw count as defender: {}|{}\n", chal_wr_when_def, dr.2) + 
+        &format!("challenger's win rate | draw count as attacker: {}|{}\n", chal_wr_when_att, duel_result.5);
+        print_now(&msg);
+
+        if chal_wr_when_att > config.fenrir_config.model_update_threshold 
+            && chal_wr_when_def > config.fenrir_config.model_update_threshold {
             print_now("Updating the model..");
             storage.clear();
             locked_shelf.write_to_stream(1, &mut storage)?;

@@ -28,7 +28,6 @@ pub mod visualization;
 pub mod statistics;
 pub mod utils;
 pub mod schedule;
-pub mod run;
 pub mod duel;
 
 use std::fs;
@@ -59,11 +58,12 @@ impl From<CompConfigWrapper> for CompConfig {
             fenrir_config: value.fenrir_config.into(),
             mcts_config: value.mcts_config,
             model_sync_config: value.model_sync_config,
-            setup_config: value.setup_config.into()
+            setup_config: ModelSetupConfig::from_wrapper(value.setup_config).unwrap()
         }
     }
 }
 
+/// parse the TOML file into CompConfig
 pub fn load_comp_config<P: AsRef<Path>>(filename: P) -> CompConfig {
     let data = fs::read_to_string(&filename).unwrap();
     let wrapper = toml::from_str::<CompConfigWrapper>(&data).unwrap();
@@ -75,10 +75,10 @@ use mpi::Rank;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MpiConfig {
-    root: Rank,
-    train: Rank,
-    test: Rank,
-    self_play: Vec<Rank>,
+    pub root: Rank,
+    pub train: Rank,
+    pub test: Rank,
+    pub self_play: Vec<Rank>,
 }
 
 pub fn load_mpi_config<P: AsRef<Path>>(filename: P) -> MpiConfig {

@@ -1,3 +1,4 @@
+#![cfg(not(feature = "bench"))]
 use crate::agent::{MCTSConfig, MCTSTree, Oracle, NewActor};
 use crate::duel::duel;
 use crate::model::{self, ModelConfig};
@@ -613,7 +614,7 @@ impl<P: PVModel + Send, D: BoardData + Encode> Node<ModuleShelf<P, P>> for Train
         // preallocate buffer
         let buffer: Vec<u8> = vec![0; 2 * capacity];
 
-        let trainer: NewTrainer<P, ModuleShelf<P, P>> = NewTrainer::new(
+        let mut trainer: NewTrainer<P, ModuleShelf<P, P>> = NewTrainer::new(
             shelf,
             tch::nn::sgd(config.fenrir_config.momentum, 0.0f64, config.fenrir_config.weight_decay, false),
             (config.fenrir_config.learning_rate_schedule)(0),
@@ -649,9 +650,11 @@ impl<P: PVModel + Send, D: BoardData + Encode> Node<ModuleShelf<P, P>> for Train
 impl<P: PVModel + Send, D: BoardData + Encode> TrainNode<P, D>
 where 
 ReplayBuffer<D>: Sampler{
-    pub fn run<A: AsRef<Path> + Send + Sync>(&mut self, mpi_config: &MpiConfig, data_store_dir: A) {
+    pub fn run<A: AsRef<Path> + Send + Sync>(&mut self, mpi_config: &MpiConfig, data_store_dir: A, init_training_step_count: usize) {
 
         use CommFlag::*;
+
+        self.trainer.step_count = init_training_step_count;
 
         // buffer to receive the incoming (encoded) replay data
         let mut data_buffer: Vec<u8> = vec![0; DATA_BUF_CAP];
@@ -1127,20 +1130,28 @@ D: Send + Sync,
                     let champion_rs = request_senders.remove(0);
 
 
-                    let (win_rate, draw_count) = duel::<P, D>(
+                    let duel_res = duel::<P, D>(
                         manager,
                         champion_rs,
                         challenger_rs,
                         self.config.fenrir_config.n_games_per_tournament,
+                        evaluation_mcts_config,
                         evaluation_mcts_config
                     ).unwrap();
 
+                    // win-rate for challenger when it is the attacker
+                    let chal_wr_when_def = (duel_res.0 - duel_res.1 - duel_res.2) as f32 / duel_res.0 as f32;
+                    // win-rate for challenger when defender
+                    let chal_wr_when_att = (duel_res.3 - duel_res.4 - duel_res.5) as f32 / duel_res.3 as f32;
 
                     // dbg!();
+                    let msg: String = "Evaluation of a checkpoint completed\n".to_string() + 
+                    &format!("challenger's win rate | draw count as defender: {}|{}\n", chal_wr_when_def, duel_res.2) + 
+                    &format!("challenger's win rate | draw count as attacker: {}|{}\n", chal_wr_when_att, duel_res.5);
+                    print_now(&msg);
 
-                    print_now(&format!("new model test has been completed. win rate against the current best was {}", win_rate));
-
-                    if win_rate > self.config.fenrir_config.model_update_threshold {
+                    if chal_wr_when_att > self.config.fenrir_config.model_update_threshold &&
+                        chal_wr_when_def > self.config.fenrir_config.model_update_threshold {
                         update = true;
                     }
 
@@ -1166,20 +1177,6 @@ D: Send + Sync,
 
 }
 
-pub fn setup_duel<G: GameLogic>(mcts_config: &MCTSConfig, champion_rs: Arc<Sender<Request>>, challenger_rs: Arc<Sender<Request>>)
--> (MCTSTree<G>, NewActor, NewActor)
-where
-TBoard<G>: ModelInput<G>,
-TAction<G::B>: ActionTensor,
-TaflBoard<G::B>: std::fmt::Display
-{
-    let game = <G as Default>::default();
-    let mut mcts_tree = MCTSTree::<G>::generate(game, mcts_config.clone());
-    let champion = NewActor::new(champion_rs);
-    let challenger = NewActor::new(challenger_rs);
-    (mcts_tree, champion, challenger)
-
-}
 
 fn write_now(msg: &str, w: &mut impl Write) {
     let datetime = chrono::Local::now();

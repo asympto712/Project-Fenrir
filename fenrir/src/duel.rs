@@ -16,11 +16,16 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 use std::thread;
 
+/// (#(agent1 is att), #(agent1 is att && win), #(agent1 is att && draw),
+///  #(agent1 is def), #(agent1 is def && win), #(agent1 is def && draw))
+pub type DuelResult = (u64, u64, u64, u64, u64, u64);
+
 /// Setup a duel between two models with separate trees for each player
 pub fn setup_duel_trees<G: GameLogic>(
-    mcts_config: &MCTSConfig,
-    champion_sender: &Arc<Sender<Request>>,
-    challenger_sender: &Arc<Sender<Request>>,
+    agent1_config: &MCTSConfig,
+    agent2_config: &MCTSConfig,
+    agent1_sender: &Arc<Sender<Request>>,
+    agent2_sender: &Arc<Sender<Request>>,
 ) -> (MCTSTree<G>, MCTSTree<G>, NewActor, NewActor)
 where
     TBoard<G>: ModelInput<G>,
@@ -28,103 +33,104 @@ where
     TaflBoard<G::B>: std::fmt::Display,
 {
     let game = <G as Default>::default();
-    let champion_tree = MCTSTree::<G>::generate(game.clone(), mcts_config.clone());
-    let challenger_tree = MCTSTree::<G>::generate(game, mcts_config.clone());
-    let champion = NewActor::new(champion_sender.clone());
-    let challenger = NewActor::new(challenger_sender.clone());
-    (champion_tree, challenger_tree, champion, challenger)
+    let agent1_tree = MCTSTree::<G>::generate(game.clone(), agent1_config.clone());
+    let agent2_tree = MCTSTree::<G>::generate(game, agent2_config.clone());
+    let agent1 = NewActor::new(agent1_sender.clone());
+    let agent2 = NewActor::new(agent2_sender.clone());
+    (agent1_tree, agent2_tree, agent1, agent2)
 }
 
-/// Conduct a duel between two models and return the win rate of the challenger
+/// Conduct a duel between two models and return the win rate of the agent2
 pub fn duel<'a, P: PVModel + Send, D: BoardData>(
     manager: InferenceManager<'a, P, &'a mut LockedShelf<P>>,
-    champion_sender: Sender<Request>,
-    challenger_sender: Sender<Request>,
+    agent1_sender: Sender<Request>,
+    agent2_sender: Sender<Request>,
     num_games: usize,
-    mcts_config: &MCTSConfig,
-) -> Result<(f32, usize)>
+    agent1_config: &MCTSConfig,
+    agent2_config: &MCTSConfig,
+) -> Result<DuelResult>
 where
     TBoard<D::G>: ModelInput<D::G>,
     TAction<<D::G as GameLogic>::B>: ActionTensor,
     TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
     <<D::G as GameLogic>::B as BitBoard>::Movement: PartialEq,
 {
-    let champion_sender = Arc::new(champion_sender);
-    let challenger_sender = Arc::new(challenger_sender);
+    let agent1_sender = Arc::new(agent1_sender);
+    let agent2_sender = Arc::new(agent2_sender);
 
-    let (win_rate, draw_count) = thread::scope::<'a>(|s| -> Result<(f32, usize)> {
+    let duel_res = thread::scope::<'a>(|s| -> Result<DuelResult> {
         // Start the inference manager in a separate thread
         let manager_handle = s.spawn(move || {
             println!("inference manager has started running");
             manager.consume_and_run()
         });
 
-        let (chal_win, draw) = (0..num_games).into_par_iter().map(|game_idx| {
-            let (mut champion_tree, mut challenger_tree, champion_actor, challenger_actor) = 
-                setup_duel_trees::<D::G>(mcts_config, &champion_sender, &challenger_sender);
+        let (a1a, a1d) = (0..num_games).into_par_iter().map(|game_idx| {
+            let (mut agent1_tree, mut agent2_tree, agent1_actor, agent2_actor) = 
+                setup_duel_trees::<D::G>(agent1_config, agent2_config, &agent1_sender, &agent2_sender);
 
             // dbg!();
 
             // Determine who plays as attacker/defender
-            let champion_is_attacker = game_idx % 2 == 0;
+            let agent1_is_attacker = game_idx % 2 == 0;
             
             // Progress the game with alternating players
-            while !champion_tree.root_is_terminal() && !challenger_tree.root_is_terminal() {
-                let current_side = champion_tree.get_current_game().current_side();
+            while !agent1_tree.root_is_terminal() && !agent2_tree.root_is_terminal() {
+                let current_side = agent1_tree.get_current_game().current_side();
                 
                 // Determine whose turn it is based on game state and who's the attacker
-                let champion_turn = if champion_is_attacker {
+                let agent1_turn = if agent1_is_attacker {
                     matches!(current_side, Side::Att)
                 } else {
                     matches!(current_side, Side::Def)
                 };
 
                 // dbg!();
-                if champion_turn {
-                    // Champion's turn - champion chooses action
-                    let (_game, action, _posterior) = champion_tree.get_policy_and_update::<NewActor>(&champion_actor)
-                        .expect("Failed to get policy and update champion tree");
+                if agent1_turn {
+                    // agent1's turn - agent1 chooses action
+                    let (_game, action, _posterior) = agent1_tree.get_policy_and_update::<NewActor>(&agent1_actor)
+                        .expect("Failed to get policy and update agent1 tree");
                     
-                    // Apply the chosen action to challenger's tree
-                    challenger_tree.apply_external_action(&action)
-                        .expect("Failed to apply action to challenger tree");
+                    // Apply the chosen action to agent2's tree
+                    agent2_tree.apply_external_action(&action)
+                        .expect("Failed to apply action to agent2 tree");
 
                 } else {
-                    // Challenger's turn - challenger chooses action
-                    let (_game, action, _posterior) = challenger_tree.get_policy_and_update::<NewActor>(&challenger_actor)
-                        .expect("Failed to get policy and update challenger tree");
+                    // agent2's turn - agent2 chooses action
+                    let (_game, action, _posterior) = agent2_tree.get_policy_and_update::<NewActor>(&agent2_actor)
+                        .expect("Failed to get policy and update agent2 tree");
                     
-                    // Apply the chosen action to champion's tree
-                    champion_tree.apply_external_action(&action)
-                        .expect("Failed to apply action to champion tree");
+                    // Apply the chosen action to agent1's tree
+                    agent1_tree.apply_external_action(&action)
+                        .expect("Failed to apply action to agent1 tree");
                 }
 
                 #[cfg(debug_assertions)]
                 {
-                    for action in champion_tree.root.actions.iter() {
-                        assert!(challenger_tree.root.actions.contains(&action));
+                    for action in agent1_tree.root.actions.iter() {
+                        assert!(agent2_tree.root.actions.contains(&action));
                     }
-                    assert!(champion_tree.root.game.get_board().equals(&challenger_tree.root.game.get_board()));
-                    assert_eq!(champion_tree.root.game.get_state(), challenger_tree.root.game.get_state());
+                    assert!(agent1_tree.root.game.get_board().equals(&agent2_tree.root.game.get_board()));
+                    assert_eq!(agent1_tree.root.game.get_state(), agent2_tree.root.game.get_state());
                 }
                 // dbg!();
             }
 
             // Both trees should have the same winner
-            let winner = champion_tree.get_winner();
+            let winner = agent1_tree.get_winner();
             
-            // Determine if challenger won
-            let challenger_won = match winner {
+            // Determine if agent2 won
+            let agent2_won = match winner {
                 Victor::Att => {
-                    // If challenger is attacker, they win on Att victory
-                    !champion_is_attacker
+                    // If agent2 is attacker, they win on Att victory
+                    !agent1_is_attacker
                 },
                 Victor::Def => {
-                    // If challenger is defender, they win on Def victory
-                    champion_is_attacker
+                    // If agent2 is defender, they win on Def victory
+                    agent1_is_attacker
                 },
                 Victor::Draw => {
-                    // Count draws as non-wins for challenger
+                    // Count draws as non-wins for agent2
                     false
                 }
             };
@@ -134,29 +140,37 @@ where
                 _ => false
             };
 
-            (challenger_won, draw)
-        }).unzip::<bool, bool, Vec<bool>, Vec<bool>>();
+            (
+                (agent1_is_attacker, agent1_is_attacker && matches!(winner, Victor::Att), agent1_is_attacker && matches!(winner, Victor::Draw)),
+                (!agent1_is_attacker, !agent1_is_attacker && matches!(winner, Victor::Def), !agent1_is_attacker && matches!(winner, Victor::Draw)) 
+            )
+        }).unzip::<(bool, bool, bool), (bool, bool, bool), Vec<(bool, bool, bool)>, Vec<(bool, bool, bool)>>();
 
-        // dbg!(&chal_win);
-        // dbg!(&draw);
+        let (a1at, a1aw, a1ad) = (
+            a1a.iter().filter(|x| x.0).count(),
+            a1a.iter().filter(|x| x.1).count(),
+            a1a.iter().filter(|x| x.2).count()
+        );
 
-        let win_count = chal_win.into_iter().filter(|b| *b).count();
-        let draw_count = draw.into_iter().filter(|b| *b).count();
+        let (a1dt, a1dw, a1dd) = (
+            a1d.iter().filter(|x| x.0).count(),
+            a1d.iter().filter(|x| x.1).count(),
+            a1d.iter().filter(|x| x.2).count()
+        );
 
         // Drop the senders to signal the inference manager to stop
-        drop(champion_sender);
-        drop(challenger_sender);
+        drop(agent1_sender);
+        drop(agent2_sender);
 
         // Wait for the inference manager to finish
         manager_handle.join()
             .map_err(|_| eyre!("Manager thread panicked"))??;
 
-        // Calculate win rate
-        let win_rate = (win_count as f32) / (num_games as f32);
-        Ok((win_rate, draw_count))
+        let duel_res = (a1at as u64, a1aw as u64, a1ad as u64, a1dt as u64, a1dw as u64, a1dd as u64);
+        Ok(duel_res)
     })?;
 
-    Ok((win_rate, draw_count))
+    Ok(duel_res)
 }
 
 
@@ -179,24 +193,24 @@ mod tests {
         let mcts_config = MCTSConfig::default();
 
         // Create mock channels
-        let (champion_sender, _champion_receiver) = unbounded::<Request>();
-        let (challenger_sender, _challenger_receiver) = unbounded::<Request>();
+        let (agent1_sender, _agent1_receiver) = unbounded::<Request>();
+        let (agent2_sender, _agent2_receiver) = unbounded::<Request>();
 
-        let champion_sender = Arc::new(champion_sender);
-        let challenger_sender = Arc::new(challenger_sender);
+        let agent1_sender = Arc::new(agent1_sender);
+        let agent2_sender = Arc::new(agent2_sender);
 
         // Test that we can setup duel trees
-        let (champion_tree, challenger_tree, champion_actor, challenger_actor) =
-            setup_duel_trees::<SimpleGame>(&mcts_config, &champion_sender, &challenger_sender);
+        let (agent1_tree, agent2_tree, agent1_actor, agent2_actor) =
+            setup_duel_trees::<SimpleGame>(&mcts_config, &mcts_config.clone(), &agent1_sender, &agent2_sender);
 
         // Verify trees are independent
-        assert!(!champion_tree.root_is_terminal());
-        assert!(!challenger_tree.root_is_terminal());
+        assert!(!agent1_tree.root_is_terminal());
+        assert!(!agent2_tree.root_is_terminal());
         
         // Verify they start with the same game state
         assert_eq!(
-            champion_tree.get_current_game().get_state(),
-            challenger_tree.get_current_game().get_state()
+            agent1_tree.get_current_game().get_state(),
+            agent2_tree.get_current_game().get_state()
         );
     }
 
@@ -211,10 +225,10 @@ mod tests {
     #[test]
     fn test_duel_win_rate_calculation() {
         let num_games = 100;
-        let challenger_wins = 45;
+        let agent2_wins = 45;
         let expected_win_rate = 0.45f32;
         
-        let calculated_win_rate = (challenger_wins as f32) / (num_games as f32);
+        let calculated_win_rate = (agent2_wins as f32) / (num_games as f32);
         assert_eq!(calculated_win_rate, expected_win_rate);
         
         // Test edge cases
@@ -226,12 +240,12 @@ mod tests {
     #[test]
     fn test_player_alternation_logic() {
         for game_idx in 0..10 {
-            let champion_is_attacker = game_idx % 2 == 0;
+            let agent1_is_attacker = game_idx % 2 == 0;
             
             if game_idx % 2 == 0 {
-                assert!(champion_is_attacker, "Even games: champion should be attacker");
+                assert!(agent1_is_attacker, "Even games: agent1 should be attacker");
             } else {
-                assert!(!champion_is_attacker, "Odd games: champion should be defender");
+                assert!(!agent1_is_attacker, "Odd games: agent1 should be defender");
             }
         }
     }
@@ -239,35 +253,35 @@ mod tests {
     /// Test victor determination logic
     #[test]
     fn test_victor_determination() {
-        // Test case 1: Champion is attacker, Attacker wins
-        let champion_is_attacker = true;
+        // Test case 1: agent1 is attacker, Attacker wins
+        let agent1_is_attacker = true;
         let victor = Victor::Att;
-        let challenger_won = match victor {
-            Victor::Att => !champion_is_attacker,
-            Victor::Def => champion_is_attacker,
+        let agent2_won = match victor {
+            Victor::Att => !agent1_is_attacker,
+            Victor::Def => agent1_is_attacker,
             Victor::Draw => false,
         };
-        assert!(!challenger_won, "Champion wins when champion is attacker and attacker wins");
+        assert!(!agent2_won, "agent1 wins when agent1 is attacker and attacker wins");
 
-        // Test case 2: Champion is defender, Attacker wins  
-        let champion_is_attacker = false;
+        // Test case 2: agent1 is defender, Attacker wins  
+        let agent1_is_attacker = false;
         let victor = Victor::Att;
-        let challenger_won = match victor {
-            Victor::Att => !champion_is_attacker,
-            Victor::Def => champion_is_attacker,
+        let agent2_won = match victor {
+            Victor::Att => !agent1_is_attacker,
+            Victor::Def => agent1_is_attacker,
             Victor::Draw => false,
         };
-        assert!(challenger_won, "Challenger wins when champion is defender and attacker wins");
+        assert!(agent2_won, "agent2 wins when agent1 is defender and attacker wins");
 
         // Test case 3: Draw scenario
-        let champion_is_attacker = true;
+        let agent1_is_attacker = true;
         let victor = Victor::Draw;
-        let challenger_won = match victor {
-            Victor::Att => !champion_is_attacker,
-            Victor::Def => champion_is_attacker,
+        let agent2_won = match victor {
+            Victor::Att => !agent1_is_attacker,
+            Victor::Def => agent1_is_attacker,
             Victor::Draw => false,
         };
-        assert!(!challenger_won, "Draws count as non-wins for challenger");
+        assert!(!agent2_won, "Draws count as non-wins for challenger");
     }
 
     /// Helper function to create test MCTS configuration

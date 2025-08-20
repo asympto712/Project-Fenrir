@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::io::{Read, Seek, Cursor};
 use std::convert::AsRef;
 
@@ -17,20 +17,24 @@ use crate::model::{self, ModelConfig};
 use crate::model::PVModel;
 use crate::replay_buffer::{BoardData, GameSPR, ReplayBuffer, SimpleGameSPR, Sampler};
 use crate::schedule::lr_sch_initialize;
-use crate::self_play::{self, self_play_new, InferenceManager, LockedShelf, ModuleShelf};
+#[cfg(feature = "bench")]
+use crate::self_play::self_play_bench;
+#[cfg(not(feature = "bench"))]
+use crate::self_play::self_play_new;
+
+use crate::self_play::{self, InferenceManager, LockedShelf, ModuleShelf};
 use crate::self_play::self_play;
 use crate::train::{self, ModelSyncConfig, Trainer};
 use crate::self_play::Shelf;
 use crate::utils::{ActionTensor, BoardTensor, ModelInput, TAction, TBoard};
 
-use color_eyre::eyre::{eyre, EyreHandler, OptionExt};
+use color_eyre::eyre::{eyre, EyreHandler, OptionExt, Result};
 use mpi::{point_to_point::*, Tag};
 use mpi::topology::SimpleCommunicator;
 use mpi::traits::Communicator;
 use mpi::MpiError;
 use mpi::datatype::{DynBufferMut, Equivalence};
 
-use color_eyre::eyre::Result;
 use rand::prelude::*;
 use rv::traits::Mode;
 use tch::nn::ModuleT;
@@ -104,39 +108,43 @@ const fn agz_lr_schedule(n_steps: usize) -> f64 {
     }
 }
 
-// Set up related stuff
+/// Config used for loading the models
 #[derive(Debug)]
 pub struct ModelSetupConfig{
     pub use_mpi: bool,
     pub module_load_infos: Vec<ModuleLoadInfo>,
 }
 
+/// Wrapper for ModelSetupConfig to enable the TOML parsing
 #[derive(Debug, Deserialize)]
 pub struct ModelSetupConfigWrapper {
+    dir: String,
     use_mpi: bool,
     module_load_infos: Vec<ModuleLoadInfoWrapper>,
 }
 
-impl From<ModelSetupConfigWrapper> for ModelSetupConfig {
-    fn from(value: ModelSetupConfigWrapper) -> Self {
-        let use_mpi = value.use_mpi;
-        let module_load_infos: Vec<ModuleLoadInfo> = value.module_load_infos.into_iter().map(|x| x.into()).collect::<Vec<_>>();
-        Self {
-            use_mpi,
-            module_load_infos
-        }
-    }
-}
 
 impl ModelSetupConfig {
+    /// convert from wrapper
+    pub fn from_wrapper(wrapper: ModelSetupConfigWrapper) -> Result<Self> {
+        let dir = wrapper.dir.clone();
+        let module_load_infos: Vec<ModuleLoadInfo> = wrapper.module_load_infos.into_iter()
+            .map(|x| ModuleLoadInfo::from_wrapper(dir.clone(), x)).collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            use_mpi: wrapper.use_mpi,
+            module_load_infos
+        })
+    }
+
     pub fn model_setup_config(use_mpi: bool, module_load_infos: Vec<ModuleLoadInfo>) -> Self {
         Self {
             use_mpi,
             module_load_infos
         }
     }
-    // This takes the output of the setup function (loaded models along with their var stores and their path names), and create correspondence between their names and their group id.
-    // This function operates locally (inside each mpi node)
+
+    /// Take the output of the setup function (loaded models along with their var stores and their path names), and create correspondence between their names and their group id.
+    /// operates locally (inside each mpi node)
     pub fn create_lookup_table<P: PVModel>(&self, rank: Option<i32>, loaded_modules: Vec<(OsString, P, VarStore)>) -> 
     Result<(Vec<Vec<(P, VarStore)>>, Vec<OsString>)> {
         
@@ -179,31 +187,33 @@ impl ModelSetupConfig {
         Ok((table, name_lookup))
     }
 
-    pub fn parse_toml<P: AsRef<Path>>(filename: P) -> Self {
+    /// parse a TOML file into ModelSetupConfig
+    pub fn parse_toml<P: AsRef<Path>>(filename: P) -> Result<Self> {
         let data = fs::read_to_string(filename).unwrap();
         let wrapper = toml::from_str::<ModelSetupConfigWrapper>(data.as_str()).unwrap();
-        Self::from(wrapper)
+        Self::from_wrapper(wrapper)
     }
 }
 
+/// determines how each model should be loaded
 #[derive(Debug)]
 pub struct ModuleLoadInfo {
-    // Either: 1.path to the file that stores the model weight, or, 2. "new", which indicates the creation of new model
+    /// path to the file that stores the model weight
     pub path: OsString,
-    // only specify when using mpi
+    /// which rank in the Comm should load this model. Only specify when using mpi
     pub rank: Option<i32>,
-    // device to load the model onto.
+    /// device to load the model onto.
     pub device: Device,
-    // model config
     pub config: ModelConfig,
 }
 
+/// Wrapper for ModuleLoadInfo that can be parsed from a .toml file
 #[derive(Debug, Deserialize)]
 pub struct ModuleLoadInfoWrapper {
-    path: String,
+    name: String,
     rank: Option<i32>,
     device: DeviceWrapper,
-    config: ModelConfig,
+    config_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,25 +223,29 @@ enum DeviceWrapper {
     Cuda(usize),
 }
 
-impl From<ModuleLoadInfoWrapper> for ModuleLoadInfo {
-    fn from(value: ModuleLoadInfoWrapper) -> Self {
-        let path: OsString = value.path.into();
-        let rank = value.rank;
-        let device: Device = match value.device {
+impl ModuleLoadInfo {
+    pub fn from_wrapper<A: AsRef<Path>>(dir: A, wrapper: ModuleLoadInfoWrapper) -> Result<Self> {
+        let mut file_path = PathBuf::from(dir.as_ref()).join(wrapper.name);
+        let _ = file_path.set_extension("pv");
+        let path: OsString = file_path.as_os_str().to_os_string();
+        let mut file_path = PathBuf::from(dir.as_ref()).join(wrapper.config_name);
+        let _ = file_path.set_extension("toml");
+
+        println!("{:?}", file_path);
+
+        let config: ModelConfig = ModelConfig::load_from_toml(file_path)?;
+        let device: Device = match wrapper.device {
             DeviceWrapper::Cpu => Device::Cpu,
             DeviceWrapper::Cuda(i) => Device::Cuda(i)
         };
-        let config = value.config;
-        Self {
+        Ok(Self {
             path,
-            rank,
+            rank: wrapper.rank,
             device,
             config
-        }
+        })
     }
-}
 
-impl ModuleLoadInfo {
     pub fn module_load_info(path: OsString, rank: Option<i32>, device: Device, config: ModelConfig) -> Self {
         Self{
             path,
@@ -241,13 +255,14 @@ impl ModuleLoadInfo {
         }
     }
 
-    pub fn parse_toml<P: AsRef<Path>>(filename: P) -> Self {
+    pub fn parse_toml<P: AsRef<Path>>(dir: P, filename: P) -> Result<Self> {
         let data = std::fs::read_to_string(filename).unwrap();
         let wrapper = toml::from_str::<ModuleLoadInfoWrapper>(data.as_str()).unwrap();
-        Self::from(wrapper)
+        Self::from_wrapper(dir, wrapper)
     }
 }
 
+/// load a model from a file if it exists, create a new model at the location if the file does not exist
 pub fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> Result<(OsString, P, VarStore)> {
 
     let path = Path::new(&info.path);
@@ -269,7 +284,7 @@ pub fn load_module<P: PVModel>(info: &ModuleLoadInfo) -> Result<(OsString, P, Va
     }
 }
 
-// This creates a brand-new model and save its variables into the specified file
+/// creates a brand-new model and save its variables into the specified file
 pub fn new_module<P: PVModel>(device: Device, model_config: &ModelConfig, filename: &OsString) -> Result<(OsString, P, VarStore)> {
 
     let vs = VarStore::new(device);
@@ -287,6 +302,7 @@ pub fn load_module_from_stream<P: PVModel, S: Read + Seek>(info: &ModuleLoadInfo
 
 }
 
+/// load the models based on the instructions given by config, returns the information on the loaded modules
 pub fn setup<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>>{
 
     #[cfg(not(feature = "mpi"))]
@@ -315,6 +331,7 @@ pub fn setup<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, 
 
 }
 
+/// load or create a model from the loadinfo, then extend the list
 fn add_module_to_list<P: PVModel>(info: &ModuleLoadInfo, list: &mut Vec<(OsString, P, VarStore)>, available_cuda: &mut Vec<Device>) -> Result<()> {
 
     match info.device {
@@ -373,7 +390,7 @@ fn add_module_from_stream_to_list<P: PVModel, S: Seek + Read>(
     }
 }
 
-// This function loads the models, ignoring the mpi options. It is intended to be used inside the 'setup' function
+/// load the models, ignoring the mpi options. It is intended to be used inside the 'setup' function
 pub fn setup_wo_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
 
     let mut loaded_models: Vec<(OsString, P, VarStore)> = vec![];
@@ -388,7 +405,8 @@ pub fn setup_wo_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsStri
     Ok(loaded_models)
 }
 
-// Only call this after the mpi is initialized
+/// Only call this after the mpi is initialized
+/// load the models, respecting the mpi options. It is intended to be used inside the 'setup' function
 #[cfg(feature = "mpi")]
 pub fn setup_w_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsString, P, VarStore)>> {
 
@@ -515,6 +533,7 @@ pub fn now_into_filename() -> OsString {
     filename.into()
 }
 
+/// prototype for sequential_run.rs. Don't use in production run
 fn run_wo_mpi_sequential<P: PVModel + Send + 'static, D: BoardData>(
     config: &FenrirConfig,
     model_config: ModelConfig,
@@ -561,6 +580,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display {
 
         let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.inference_bs);
 
+        #[cfg(not(feature = "bench"))]
         self_play_new::<P,D, std::fs::File>(
             manager,
             request_senders[0].clone(),
@@ -569,6 +589,9 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display {
             &replay_buffer,
             None
         )?;
+
+        #[cfg(feature = "bench")]
+        todo!();
 
         shelf = LockedShelf::<P>::convert_into_shelf(locked_shelf);
         let mut trainer = Trainer::<P>::new::<tch::nn::Sgd>(

@@ -68,14 +68,16 @@ fn main() -> eyre::Result<()> {
     let sender2 = req_senders.remove(1);
     let sender1 = req_senders.remove(0);
 
-    let result = duel::<P, D>(
+    let duel_res = duel::<P, D>(
         manager,
         sender1,
         sender2,
         comp_config.fenrir_config.n_games_per_tournament,
-        &comp_config.mcts_config);
+        &comp_config.mcts_config,
+    &comp_config.mcts_config
+    )?;
 
-    println!("{:?}", result);
+    println!("{:?}", duel_res);
 
     Ok(())
 }

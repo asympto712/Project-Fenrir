@@ -31,6 +31,7 @@ bincode = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 svg = "0.18"
+itertools = "0.14" 
 
 [dev-dependencies]
 tempfile = "3.0"
@@ -44,7 +45,30 @@ libffi = { version = "3.2.0", features = []}
 name = "mpi-test"
 path = "./tests/mpi-test.rs"
 test = true
+required-features = ["default"]
+
+[[bin]]
+name = "cnt_fenrir"
+path = "./src/bin/run.rs"
+required-features = ["default"]
 
 [[bin]]
 name = "seq_fenrir"
-path = "./src/sequential_run.rs"
+path = "./src/bin/sequential_run.rs"
+required-features = ["default"]
+
+[[bin]]
+name = "inference_speed"
+required-features = ["bench"]
+
+[[bin]]
+name = "sp_wr_measure"
+required-features = ["default"]
+
+[[bin]]
+name = "duel_wr_measure"
+required-features = ["default"]
+
+[[bin]]
+name = "mcts_depth_wr_measure"
+required-features = ["default"]

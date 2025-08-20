@@ -55,12 +55,12 @@ pub type PosteriorDist<B> = Vec<(<B as BitBoard>::Movement, f32)>;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MCTSConfig {
-    c_puct: f32,
-    n_sim: usize,
-    dirichlet_alpha: f64,
-    dirichlet_epsilon: f32,
-    temp_schedule_target_policy: String,
-    temp_schedule_move_selection: String,
+    pub c_puct: f32,
+    pub n_sim: usize,
+    pub dirichlet_alpha: f64,
+    pub dirichlet_epsilon: f32,
+    pub temp_schedule_target_policy: String,
+    pub temp_schedule_move_selection: String,
 }
 
 impl Default for MCTSConfig {

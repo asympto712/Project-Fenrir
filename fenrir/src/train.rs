@@ -386,9 +386,9 @@ impl<P: PVModel+ Send, M: BorrowMut<ModuleShelf<P,P>>> NewTrainer<P, M> {
             mse_loss += mse.double_value(&[]);
             total_loss += loss.double_value(&[]);
             
-            self.step_count += 1;
         }
 
+        self.step_count += 1;
         let denominator: f64 = self.replicas().len() as f64;
         return LossValue::loss_value( total_loss / denominator, cross_entropy_loss / denominator, mse_loss / denominator)
     }

@@ -6,3 +6,4 @@ target/
 fenrir/*.svg
 fenrir/graphs
 fenrir/test_data/
+fenrir/.cargo
