@@ -14,20 +14,26 @@ use game::board::{TaflBoard};
 use bitboard::{BitBoard};
 
 use color_eyre::eyre::{eyre, Context, Result};
+use tch;
 
 use std::fs::File;
 use std::io::{Cursor, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 use std::time::{Duration, Instant};
 
 const SYNC_BN_STATS_EVERY: usize = 10;
 
 fn main() -> Result<()>{
 
+    // might be needed to correctly link cuda-related shared objects.
+    let _ = tch::Cuda::cudnn_is_available();
+
     let argv = std::env::args().collect::<Vec<_>>();
 
-    if argv.len() != 5 {
-        eprintln!("Usage: {} <config_file> <mcts_config_file> <model_dir> <data_dir>", argv[0]);
+    if argv.len() < 5 {
+        eprintln!(
+            "Usage: {} <config_file> <mcts_config_file> <model_dir> <data_dir>, (<initial self play game count>, <initial training step count>)",
+        argv[0]);
         std::process::exit(1);
     }
 
@@ -45,7 +51,18 @@ fn main() -> Result<()>{
     let duel_mcts_config = load_mcts_config(&argv[2]);
     let model_dir = &argv[3];
     let data_dir = &argv[4];
-    sequential_run::<GeneralPVSepModel, SimpleGameSPR, _>(&config, duel_mcts_config, model_dir, data_dir)?;
+    let init_self_play_count: usize = if let Some(i) = argv.get(5) {
+        i.parse().unwrap()
+    } else {
+        0
+    };
+    let init_training_step_count: usize = if let Some(i) = argv.get(6) {
+        i.parse().unwrap()
+    } else {
+        0
+    };
+
+    sequential_run::<GeneralPVSepModel, SimpleGameSPR, _>(&config, duel_mcts_config, model_dir, data_dir, init_training_step_count, init_self_play_count)?;
     Ok(())
 }
 
@@ -54,6 +71,8 @@ fn sequential_run<P: PVModel + Send + 'static, D: BoardData, A: AsRef<Path>>(
     duel_mcts_config: MCTSConfig,
     model_dir: A,
     data_dir: A,
+    init_training_step_count: usize,
+    init_self_play_game_count: usize,
 ) -> Result<()> 
 where
 ReplayBuffer<D>: Sampler,
@@ -73,7 +92,8 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
     let (_numel, capacity) = numel_for_model(&shelf.get_group(0).unwrap().get(0).unwrap().1);
     let mut storage = Vec::<u8>::with_capacity(capacity);
 
-    let mut training_step_count: usize = 0;
+    let mut training_step_count: usize = init_training_step_count;
+    let mut self_play_game_count: usize = init_self_play_game_count;
 
     // fs-related
     std::fs::create_dir_all(&model_dir)?;
@@ -82,10 +102,12 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
     let self_play_data_path = data_dir.as_ref().to_path_buf().join(format!("{}-self-play.dat", config.name));
     let mut self_play_file = std::fs::File::create(&self_play_data_path).wrap_err("Could not create file for self-play data storage")?;
     writeln!(self_play_file, "attacker defender draw")?;
-    drop(self_play_file);
+    // drop(self_play_file);
     let model_store_path = model_dir.as_ref().to_path_buf().join(format!("{}.pv", config.name));
-    let mut loss_data_file = std::fs::File::create(loss_data_path).wrap_err("Could not create file for loss data storage")?;
+    let mut loss_data_file = std::fs::File::create(&loss_data_path).wrap_err("Could not create file for loss data storage")?;
     writeln!(loss_data_file, "cross-entropy mse total")?;
+
+    let checkpoint_path = model_dir.as_ref().to_path_buf().join("tmp.pv");
 
     fn check_shutdown<P: PVModel + Send, A: AsRef<Path>>(shelf: &ModuleShelf<P, P>, start: &Instant, model_store_path: A, config: &CompConfig) -> bool {
         let elapsed = start.elapsed();
@@ -108,18 +130,25 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
 
         let mut locked_shelf = LockedShelf::<P>::convert_from_shelf(shelf);
 
-        let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.fenrir_config.inference_bs);
+        let (manager, mut request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.fenrir_config.inference_bs);
+        let request_sender = request_senders.remove(0);
 
         // data-generation
-        self_play_new::<P,D, &PathBuf>(
+        self_play_new::<P,D, &mut std::fs::File>(
             manager,
-            request_senders[0].clone(),
+            request_sender,
             config.fenrir_config.n_self_play_games,
             &config.mcts_config,
             &replay_buffer,
-            Some(&self_play_data_path)
+            Some(&mut self_play_file)
         )?;
 
+        self_play_game_count += config.fenrir_config.n_self_play_games;
+        print_now(&format!("Data generation phase complete. Total of {} games have been played", self_play_game_count));
+
+        // keep the pre-training state so that later we can use for evaluation
+        storage.clear();
+        locked_shelf.write_to_stream(0, &mut storage)?;
 
         shelf = LockedShelf::<P>::convert_into_shelf(locked_shelf);
 
@@ -134,11 +163,14 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
         )?;
 
         trainer.train(config.fenrir_config.n_training_step_per_cycle, SYNC_BN_STATS_EVERY, &replay_buffer, &mut rand::thread_rng())?;
-        storage.clear();
-        trainer.save_to_stream(&mut storage)?;
         trainer.flush_loss_record(&mut loss_data_file);
         training_step_count += trainer.step_count;
         drop(trainer);
+
+        print_now(&format!("Training phase complete: total of {} steps", training_step_count));
+        
+        let mut f = File::create(&checkpoint_path).unwrap();
+        shelf.write_to_stream(0, &mut f).unwrap();
 
         if check_shutdown(&shelf, &start, &model_store_path, config) {
             break;
@@ -158,7 +190,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
         shelf.table = vec![tmp, splitted];
         assert_eq!(shelf.table.len(), 2);
         let mut cursor = Cursor::new(&mut storage);
-        shelf.update_modules_from_stream(1, &mut cursor)?;
+        shelf.update_modules_from_stream(0, &mut cursor)?;
         let mut locked_shelf = LockedShelf::<P>::convert_from_shelf(shelf);
         let (manager, mut request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.fenrir_config.inference_bs);
         assert_eq!(request_senders.len(), 2);
@@ -178,6 +210,12 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display,
             locked_shelf.update_modules_from_stream(0, &mut cursor)?;
         } else {
             print_now("Skipping the update..");
+            
+            // revert the change
+            storage.clear();
+            locked_shelf.write_to_stream(0, &mut storage)?;
+            let mut cursor = Cursor::new(&mut storage);
+            locked_shelf.update_modules_from_stream(1, &mut cursor)?;
         }
 
         shelf = locked_shelf.convert_into_shelf();

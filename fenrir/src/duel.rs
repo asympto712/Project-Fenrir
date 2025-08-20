@@ -59,12 +59,11 @@ where
             manager.consume_and_run()
         });
 
-        // Run games in parallel using rayon
         let (chal_win, draw) = (0..num_games).into_par_iter().map(|game_idx| {
             let (mut champion_tree, mut challenger_tree, champion_actor, challenger_actor) = 
                 setup_duel_trees::<D::G>(mcts_config, &champion_sender, &challenger_sender);
 
-            dbg!();
+            // dbg!();
 
             // Determine who plays as attacker/defender
             let champion_is_attacker = game_idx % 2 == 0;
@@ -80,7 +79,7 @@ where
                     matches!(current_side, Side::Def)
                 };
 
-                dbg!();
+                // dbg!();
                 if champion_turn {
                     // Champion's turn - champion chooses action
                     let (_game, action, _posterior) = champion_tree.get_policy_and_update::<NewActor>(&champion_actor)
@@ -108,7 +107,7 @@ where
                     assert!(champion_tree.root.game.get_board().equals(&challenger_tree.root.game.get_board()));
                     assert_eq!(champion_tree.root.game.get_state(), challenger_tree.root.game.get_state());
                 }
-                dbg!();
+                // dbg!();
             }
 
             // Both trees should have the same winner

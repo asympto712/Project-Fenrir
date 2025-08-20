@@ -71,7 +71,7 @@ fn test_run_wo_mpi_sequential() {
         dbg!("self play phase\n");
 
         let request_sender = request_senders.remove(0);
-        self_play_new::<P,D, &str>(
+        self_play_new::<P,D, std::fs::File>(
             manager,
             request_sender,
             comp_config.fenrir_config.n_self_play_games,

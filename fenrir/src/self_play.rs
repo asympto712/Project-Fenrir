@@ -30,6 +30,8 @@ use rayon::{iter::{IntoParallelIterator, ParallelIterator}};
 use tokio::task::JoinSet;
 use mpi::datatype::MutView;
 
+#[cfg(not(feature = "bench"))]
+use std::fmt::Write;
 // std
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -47,7 +49,6 @@ use std::borrow::Borrow;
 use std::io::{Read, Seek};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::Ordering;
-use std::io::Write;
 
 #[cfg(feature = "bench")]
 use crate::statistics::*;
@@ -1039,13 +1040,13 @@ pub fn setup_mcts<G: GameLogic>(stat_sender: &Arc<Sender<RunningStat>>, mcts_con
 
 // play the game for the specified amount using the specified model, create the replay buffer
 #[cfg(not(feature = "bench"))]
-pub fn self_play_new<'a, P: PVModel + Send, D: BoardData, A: AsRef<Path>>(
+pub fn self_play_new<'a, P: PVModel + Send, D: BoardData, W: std::io::Write>(
     manager: InferenceManager<'a, P, &'a mut LockedShelf<P>>,
     request_sender: Sender<Request>,
     num_games: usize,
     mcts_config: &MCTSConfig,
     replay_buffer: &ReplayBuffer<D>,
-    record_path: Option<A>,
+    record_stream: Option<W>,
 ) -> Result<()>
 where TBoard<D::G>: ModelInput<D::G>,
 TAction<<D::G as GameLogic>::B>: ActionTensor,
@@ -1056,10 +1057,10 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 
     let request_sender = Arc::new(request_sender);
     let model_id = 0; // self-play only uses one model
-    let mut file: Option<File> = if let Some(a) = record_path {
-        let f = std::fs::File::create(a.as_ref())?;
-        Some(f)
-    } else { None };
+    // let mut file: Option<File> = if let Some(a) = record_path {
+    //     let f = std::fs::File::create(a.as_ref())?;
+    //     Some(f)
+    // } else { None };
 
     let att_win_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let def_win_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -1129,8 +1130,8 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display
 
     });
 
-    if let Some(mut f) = file {
-        writeln!(f, "{} {} {}", att_win_count.load(Ordering::Relaxed), def_win_count.load(Ordering::Relaxed), draw_count.load(Ordering::Relaxed));
+    if let Some(mut f) = record_stream {
+        writeln!(&mut f, "{} {} {}", att_win_count.load(Ordering::Relaxed), def_win_count.load(Ordering::Relaxed), draw_count.load(Ordering::Relaxed));
     }
 
     ts

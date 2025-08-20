@@ -380,6 +380,7 @@ pub fn setup_wo_mpi<P: PVModel>(config: &ModelSetupConfig) -> Result<Vec<(OsStri
 
     let n_cuda = tch::Cuda::device_count();
     let mut available_cuda: Vec<Device>  = (0..n_cuda).map(|i| Device::Cuda(i as usize)).collect();
+    println!("{:?}", available_cuda);
 
     for module_info in config.module_load_infos.iter() {
         add_module_to_list(module_info, &mut loaded_models, &mut available_cuda)?;
@@ -560,7 +561,7 @@ TaflBoard<<D::G as GameLogic>::B>: std::fmt::Display {
 
         let (manager, request_senders) = InferenceManager::<'_, P, &'_ mut LockedShelf<P>>::new(&mut locked_shelf, config.inference_bs);
 
-        self_play_new::<P,D, &str>(
+        self_play_new::<P,D, std::fs::File>(
             manager,
             request_senders[0].clone(),
             config.n_self_play_games,
